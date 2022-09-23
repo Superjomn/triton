@@ -7,4 +7,5 @@ add_mlir_library(TritonAnalysis
 
   DEPENDS
   TritonGPUAttrDefsIncGen
+  LLVMSupport
 )
