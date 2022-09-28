@@ -2469,7 +2469,8 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
     bool needTrans = kOrder != order[0];
 
     // (a, b) is the coordinate.
-    auto load = [&, loader, ptrs, offs, needTrans](int a, int b) {
+    auto load = [&vals, &helper, &ld2, kOrder, loader, ptrs, offs,
+                 needTrans](int a, int b) {
       auto [ha0, ha1, ha2, ha3] = loader.loadX4(
           (kOrder == 1) ? a : b /*mat0*/, (kOrder == 1) ? b : a /*mat1*/, offs,
           ptrs, helper.getMatType(), helper.getShemPtrTy());
@@ -2512,7 +2513,9 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
   }
 
   const unsigned mStride = numRepN * 2;
-  SmallVector<Value> fc(numRepM * mStride + numRepN * 2);
+  const int fcSize =
+      ((2 * (numRepM - 1)) + 1) * mStride + 2 * (numRepN - 1) + 1 + 1;
+  SmallVector<Value> fc(fcSize);
   auto callMma = [&](unsigned m, unsigned n, unsigned k) {
     PTXBuilder builder;
 
