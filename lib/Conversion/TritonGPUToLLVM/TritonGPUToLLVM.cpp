@@ -67,7 +67,54 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
                                           builder.getIntegerAttr(ty, value));
 }
 
-// Add other specification if needed...
+void print(ConversionPatternRewriter &rewriter, const std::string &str,
+           Location loc) {
+  auto *ctx = rewriter.getContext();
+  // This PTX code snippet is dumped from a compiler.
+  std::string ptx = R"ROC(
+  .reg .b64 rd5;
+  mov.u64 %rd5, $0;
+  cvta.global.u64 %rd6, %rd5;
+  mov.u64 %rd7, 0;
+  {
+  .reg .b32 temp_param_reg;
+  .param .b64 param0;
+  .param .b64 param1;
+  .param .b32 retval0;
+  st.param.b64 [param0+0], %rd6;
+  st.param.b64 [param1+0], %rd7;
+  call.uni (retval0), vprintf, (param0, param1);
+  ld.param.b32 %r1, [retval0+0];
+  })ROC";
+
+  Value global = rewriter.create<LLVM::GlobalOp>(
+      loc, type::i8Ty(rewriter.getContext()), /*isConstant=*/true,
+      LLVM::Linkage::Internal, "str", /*value=*/Attribute(),
+      /*alignment=*/0, mlir::gpu::GPUDialect::getWorkgroupAddressSpace())
+                     ->getResult(0);
+
+  /*
+  int numElems = str.size() + 1;
+  Type stringTy = LLVM::LLVMArrayType::get(type::i8Ty(ctx), numElems);
+  auto attr = rewriter.getStringAttr(str.c_str());
+  Value val = rewriter.create<LLVM::ConstantOp>(
+      loc, stringTy, rewriter.getStringAttr(str.c_str()));
+      */
+
+  Type voidTy = LLVM::LLVMVoidType::get(ctx);
+
+  SmallVector<Value> oprs({global});
+  auto inlineAsm = rewriter.create<LLVM::InlineAsmOp>(
+      loc, voidTy, oprs, // operands
+      ptx,                // asm_string
+      "l",                // constraints
+      true,               // has_side_effects
+      false,              // is_align_stack
+      LLVM::AsmDialectAttr::get(ctx,
+                                LLVM::AsmDialect::AD_ATT), // asm_dialect
+      ArrayAttr::get(ctx, {})                              // operand_attrs
+  );
+}
 
 } // namespace
 
@@ -91,6 +138,7 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
 #define address_of(...) rewriter.create<LLVM::AddressOfOp>(loc, __VA_ARGS__)
 #define i32_ty rewriter.getIntegerType(32)
 #define vec_ty(type, num) VectorType::get(num, type)
+#define void_ty LLVM::LLVMVoidType::get(ctx)
 
 // Creator for constant
 #define i32_val(...) LLVM::createConstantI32(loc, rewriter, __VA_ARGS__)
@@ -1060,6 +1108,7 @@ struct LoadOpConversion
   LogicalResult
   matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    LLVM::print(rewriter, "hello world\n", op->getLoc());
 
     Value ptr = op.ptr();
     Value mask = op.mask();
