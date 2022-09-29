@@ -87,11 +87,14 @@ void print(ConversionPatternRewriter &rewriter, const std::string &str,
   ld.param.b32 %r1, [retval0+0];
   })ROC";
 
-  Value global = rewriter.create<LLVM::GlobalOp>(
-      loc, type::i8Ty(rewriter.getContext()), /*isConstant=*/true,
-      LLVM::Linkage::Internal, "str", /*value=*/Attribute(),
-      /*alignment=*/0, mlir::gpu::GPUDialect::getWorkgroupAddressSpace())
-                     ->getResult(0);
+  Value global =
+      rewriter
+          .create<LLVM::GlobalOp>(
+              loc, type::i8Ty(rewriter.getContext()), /*isConstant=*/true,
+              LLVM::Linkage::Internal, "str", /*value=*/Attribute(),
+              /*alignment=*/0,
+              mlir::gpu::GPUDialect::getWorkgroupAddressSpace())
+          ->getResult(0);
 
   /*
   int numElems = str.size() + 1;
@@ -106,10 +109,10 @@ void print(ConversionPatternRewriter &rewriter, const std::string &str,
   SmallVector<Value> oprs({global});
   auto inlineAsm = rewriter.create<LLVM::InlineAsmOp>(
       loc, voidTy, oprs, // operands
-      ptx,                // asm_string
-      "l",                // constraints
-      true,               // has_side_effects
-      false,              // is_align_stack
+      ptx,               // asm_string
+      "l",               // constraints
+      true,              // has_side_effects
+      false,             // is_align_stack
       LLVM::AsmDialectAttr::get(ctx,
                                 LLVM::AsmDialect::AD_ATT), // asm_dialect
       ArrayAttr::get(ctx, {})                              // operand_attrs
