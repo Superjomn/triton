@@ -25,6 +25,8 @@
 #include <numeric>
 #include <string>
 
+#define DEBUG_D
+
 using namespace mlir;
 using namespace mlir::triton;
 using ::mlir::triton::gpu::BlockedEncodingAttr;
@@ -349,6 +351,13 @@ public:
       : ConvertOpToLLVMPattern<SourceOp>(typeConverter, benefit),
         allocation(allocation), smem(smem) {}
 
+  explicit ConvertTritonGPUOpToLLVMPattern(LLVMTypeConverter &typeConverter,
+                                           const Allocation *allocation,
+                                           Value smem, Value debugPtr,
+                                           PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern<SourceOp>(typeConverter, benefit),
+        allocation(allocation), smem(smem), debugPtr(debugPtr) {}
+
   Value getThreadId(ConversionPatternRewriter &rewriter, Location loc) const {
     auto llvmIndexTy = this->getTypeConverter()->getIndexType();
     auto cast = rewriter.create<UnrealizedConversionCastOp>(
@@ -601,6 +610,7 @@ public:
 protected:
   const Allocation *allocation;
   Value smem;
+  Value debugPtr;
 };
 
 // Convert SplatOp or arith::ConstantOp with SplatElementsAttr to a
@@ -816,6 +826,7 @@ struct StoreOpConversion
     const size_t valueElemNbits = dtsize * 8;
 
     const int numVecs = numElems / vec;
+#ifndef DEBUG_D
     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
       // TODO: optimization when ptr is AddPtr with constant offset
       size_t in_off = 0;
@@ -865,7 +876,7 @@ struct StoreOpConversion
         asmArgList->listAppend(ptxBuilder.newOperand(llWord, constraint));
       }
 
-      // TODO(Superjomn) Need to check masks before vectorize the load for all
+      // TODO(Superjomn) Need to check masks before vectorize the load for
       // the values share one predicate? Here assume all the mask values are
       // the same.
       Value maskVal = llMask ? maskElems[vecStart] : int_val(1, 1);
@@ -884,6 +895,7 @@ struct StoreOpConversion
 
       ptxBuilder.launch(rewriter, loc, ASMReturnTy);
     }
+#endif
     rewriter.eraseOp(op);
     return success();
   }
@@ -1660,6 +1672,10 @@ private:
     auto elemTy = srcTy.getElementType();
     auto wordTy = VectorType::get(minVec, elemTy);
 
+    // debug only, to be removed
+    Value zeroIdx = createIndexAttrConstant(
+        rewriter, loc, getTypeConverter()->getIndexType(), 0);
+
     // TODO: [goostavz] We should make a cache for the calculation of
     // emitBaseIndexForBlockedLayout in case backend compiler not being able to
     // optimize that
@@ -1765,6 +1781,27 @@ private:
               loc, LLVM::LLVMPointerType::get(wordTy, 3), smemAddr);
           rewriter.create<LLVM::StoreOp>(loc, wordVecs[linearWordIdx],
                                          smemAddr);
+
+          // bonus: store to debugPtr for debug purpose only
+          // wordTy is actually 1xf16 in the current case
+
+          // if is A
+          // if (srcShape[0] == 128 && srcShape[1] == 32) {
+          //   // if is B
+          //   // if (srcShape[0] == 32 && srcShape[1] == 256) {
+          //   Value dbgVal =
+          //       extract_element(getTypeConverter()->convertType(elemTy),
+          //                       wordVecs[linearWordIdx], zeroIdx);
+          //   dbgValource = rewriter.create<LLVM::FPExtOp>(
+          //       loc, getTypeConverter()->convertType(rewriter.getF32Type()),
+          //       dbgVal);
+          //   auto F32PtrTy = LLVM::LLVMPointerType::get(
+          //       getTypeConverter()->convertType(rewriter.getF32Type()), 1);
+          //   Value dbgAddr =
+          //       rewriter.create<LLVM::GEPOp>(loc, F32PtrTy, debugPtr,
+          //       offset);
+          //   rewriter.create<LLVM::StoreOp>(loc, dbgVal, dbgAddr);
+          // }
         }
       }
     }
@@ -2744,6 +2781,7 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
   const unsigned mStride = numRepN * 2;
   const int fcSize =
       ((2 * (numRepM - 1)) + 1) * mStride + 2 * (numRepN - 1) + 1 + 1;
+  std::cout << "fcSize: " << fcSize << std::endl;
   SmallVector<Value> fc(fcSize);
 
   // Currently, we only support a SplatLike C. For the other cases, e.g., C in
@@ -2801,7 +2839,6 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
 
   // Main program
   printf("rep M,N,K: %d,%d,%d\n", numRepM, numRepN, numRepK);
-
   for (unsigned k = 0; k < numRepK; ++k) {
     for (unsigned m = 0; m < numRepM; ++m)
       loadA(2 * m, 2 * k);
@@ -2817,6 +2854,20 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
   Type structTy = LLVM::LLVMStructType::getLiteral(
       ctx, SmallVector<Type>(fc.size(), type::f32Ty(ctx)));
   Value res = getStructFromElements(loc, fc, rewriter, structTy);
+
+  // bonus: for debug only, to be removed
+#ifdef DEBUG_D
+  auto F32PtrTy = LLVM::LLVMPointerType::get(
+      getTypeConverter()->convertType(rewriter.getF32Type()), 1);
+  for (unsigned fcIdx = 0; fcIdx < fcSize; ++fcIdx) {
+    Value offset = mul(thread, createIndexConst(rewriter, loc, fcSize));
+    offset = add(offset, createIndexConst(rewriter, loc, fcIdx));
+    Value dbgAddr =
+        rewriter.create<LLVM::GEPOp>(loc, F32PtrTy, debugPtr, offset);
+    rewriter.create<LLVM::StoreOp>(loc, fc[fcIdx], dbgAddr);
+  }
+#endif
+
   rewriter.replaceOp(op, res);
 
   return success();
@@ -2866,7 +2917,7 @@ void populateTritonToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
                                   RewritePatternSet &patterns, int numWarps,
                                   AxisInfoAnalysis &axisInfoAnalysis,
                                   const Allocation *allocation, Value smem,
-                                  PatternBenefit benefit = 1) {
+                                  Value debugPtr, PatternBenefit benefit = 1) {
   patterns.add<AddPtrOpConversion>(typeConverter, benefit);
   patterns.add<AllocTensorOpConversion>(typeConverter, allocation, smem,
                                         benefit);
@@ -2881,7 +2932,7 @@ void populateTritonToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
                                                                 benefit);
   patterns.add<BroadcastOpConversion>(typeConverter, benefit);
   patterns.add<ConvertLayoutOpConversion>(typeConverter, allocation, smem,
-                                          benefit);
+                                          debugPtr, benefit);
   patterns.add<ExtractSliceOpConversion>(typeConverter, allocation, smem,
                                          benefit);
   patterns.add<GetProgramIdOpConversion>(typeConverter, benefit);
@@ -2893,7 +2944,8 @@ void populateTritonToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
   patterns.add<ViewLikeOpConversion<triton::ViewOp>>(typeConverter, benefit);
   patterns.add<ViewLikeOpConversion<triton::ExpandDimsOp>>(typeConverter,
                                                            benefit);
-  patterns.add<DotOpConversion>(typeConverter, allocation, smem, benefit);
+  patterns.add<DotOpConversion>(typeConverter, allocation, smem, debugPtr,
+                                benefit);
 }
 
 class ConvertTritonGPUToLLVM
@@ -2930,12 +2982,15 @@ public:
     auto axisAnalysis = runAxisAnalysis(mod);
     initSharedMemory(allocation.getSharedMemorySize(), typeConverter);
 
+    // hardcode the third argument as debugPtr
+    Value debugPtr = nullptr;
+    mod.walk([&](LLVM::LLVMFuncOp func) { debugPtr = func.getArgument(2); });
     // We set a higher benefit here to ensure triton's patterns runs before
     // arith patterns for some encoding not supported by the community
     // patterns.
     RewritePatternSet patterns(context);
     populateTritonToLLVMPatterns(typeConverter, patterns, numWarps,
-                                 *axisAnalysis, &allocation, smem,
+                                 *axisAnalysis, &allocation, smem, debugPtr,
                                  10 /*benefit*/);
 
     // Add arith/math's patterns to help convert scalar expression to LLVM.
