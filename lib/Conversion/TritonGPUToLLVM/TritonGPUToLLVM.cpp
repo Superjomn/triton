@@ -67,58 +67,6 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
                                           builder.getIntegerAttr(ty, value));
 }
 
-void print(ConversionPatternRewriter &rewriter, const std::string &str,
-           Location loc) {
-  auto *ctx = rewriter.getContext();
-  // This PTX code snippet is dumped from a compiler.
-  std::string ptx = R"ROC(
-  .reg .b64 rd5;
-  mov.u64 %rd5, $0;
-  cvta.global.u64 %rd6, %rd5;
-  mov.u64 %rd7, 0;
-  {
-  .reg .b32 temp_param_reg;
-  .param .b64 param0;
-  .param .b64 param1;
-  .param .b32 retval0;
-  st.param.b64 [param0+0], %rd6;
-  st.param.b64 [param1+0], %rd7;
-  call.uni (retval0), vprintf, (param0, param1);
-  ld.param.b32 %r1, [retval0+0];
-  })ROC";
-
-  Value global =
-      rewriter
-          .create<LLVM::GlobalOp>(
-              loc, type::i8Ty(rewriter.getContext()), /*isConstant=*/true,
-              LLVM::Linkage::Internal, "str", /*value=*/Attribute(),
-              /*alignment=*/0,
-              mlir::gpu::GPUDialect::getWorkgroupAddressSpace())
-          ->getResult(0);
-
-  /*
-  int numElems = str.size() + 1;
-  Type stringTy = LLVM::LLVMArrayType::get(type::i8Ty(ctx), numElems);
-  auto attr = rewriter.getStringAttr(str.c_str());
-  Value val = rewriter.create<LLVM::ConstantOp>(
-      loc, stringTy, rewriter.getStringAttr(str.c_str()));
-      */
-
-  Type voidTy = LLVM::LLVMVoidType::get(ctx);
-
-  SmallVector<Value> oprs({global});
-  auto inlineAsm = rewriter.create<LLVM::InlineAsmOp>(
-      loc, voidTy, oprs, // operands
-      ptx,               // asm_string
-      "l",               // constraints
-      true,              // has_side_effects
-      false,             // is_align_stack
-      LLVM::AsmDialectAttr::get(ctx,
-                                LLVM::AsmDialect::AD_ATT), // asm_dialect
-      ArrayAttr::get(ctx, {})                              // operand_attrs
-  );
-}
-
 } // namespace
 
 // Shortcuts for some commonly used LLVM ops to keep code simple and intuitive
@@ -409,6 +357,13 @@ public:
             loc, rewriter.getIndexType(), ::mlir::gpu::Dimension::x)});
     Value threadId = cast.getResult(0);
     return threadId;
+  }
+
+  Value createIndexConst(ConversionPatternRewriter &rewriter, Location loc,
+                         int64_t value) const {
+    return rewriter.create<LLVM::ConstantOp>(
+        loc, this->getTypeConverter()->getIndexType(),
+        rewriter.getIntegerAttr(rewriter.getIndexType(), value));
   }
 
   // Convert an \param index to a multi-dim coordinate given \param shape and
@@ -1111,8 +1066,6 @@ struct LoadOpConversion
   LogicalResult
   matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    LLVM::print(rewriter, "hello world\n", op->getLoc());
-
     Value ptr = op.ptr();
     Value mask = op.mask();
     Value other = op.other();
@@ -1472,12 +1425,15 @@ public:
     auto dstTy = dst.getType().cast<RankedTensorType>();
     Attribute srcLayout = srcTy.getEncoding();
     Attribute dstLayout = dstTy.getEncoding();
+    if (srcLayout.isa<BlockedEncodingAttr>() &&
+        dstLayout.isa<SharedEncodingAttr>()) {
+      return lowerBlockedToShared(op, adaptor, rewriter);
+    }
     if ((!srcLayout.isa<BlockedEncodingAttr>() &&
          !srcLayout.isa<MmaEncodingAttr>()) ||
         (!dstLayout.isa<BlockedEncodingAttr>() &&
          !dstLayout.isa<MmaEncodingAttr>())) {
       // TODO: to be implemented
-      llvm::errs() << "Unsupported ConvertLayout found";
       return failure();
     }
     auto llvmElemTy = getTypeConverter()->convertType(dstTy.getElementType());
@@ -1674,9 +1630,163 @@ private:
       }
     }
   }
+
+  LogicalResult
+  lowerBlockedToShared(triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
+                       ConversionPatternRewriter &rewriter) const {
+    op.dump();
+    auto loc = op.getLoc();
+    Value src = op.src();
+    Value dst = op.result();
+    auto srcTy = src.getType().cast<RankedTensorType>();
+    auto dstTy = dst.getType().cast<RankedTensorType>();
+    auto srcShape = srcTy.getShape();
+    assert(srcShape.size() == 2 &&
+           "Unexpected rank of ConvertLayout(blocked->shared)");
+    auto srcBlockedLayout = srcTy.getEncoding().cast<BlockedEncodingAttr>();
+    auto dstSharedLayout = dstTy.getEncoding().cast<SharedEncodingAttr>();
+    auto inOrd = srcBlockedLayout.getOrder();
+    auto outOrd = dstSharedLayout.getOrder();
+    unsigned inVec =
+        inOrd == outOrd ? srcBlockedLayout.getSizePerThread()[inOrd[0]] : 1;
+    unsigned outVec = dstSharedLayout.getVec();
+    unsigned minVec = std::min(outVec, inVec);
+    unsigned perPhase = dstSharedLayout.getPerPhase();
+    unsigned maxPhase = dstSharedLayout.getMaxPhase();
+    unsigned numElems = getElemsPerThread(srcBlockedLayout, srcShape);
+    auto inVals = getElementsFromStruct(loc, adaptor.src(), numElems, rewriter);
+    unsigned srcAccumSizeInThreads =
+        product<unsigned>(srcBlockedLayout.getSizePerThread());
+    auto elemTy = srcTy.getElementType();
+    auto wordTy = VectorType::get(minVec, elemTy);
+
+    // TODO: [goostavz] We should make a cache for the calculation of
+    // emitBaseIndexForBlockedLayout in case backend compiler not being able to
+    // optimize that
+    SmallVector<Value> multiDimOffsetFirstElem = emitBaseIndexForBlockedLayout(
+        loc, rewriter, srcBlockedLayout, srcShape);
+    SmallVector<unsigned> srcShapePerCTA = getShapePerCTA(srcBlockedLayout);
+    SmallVector<unsigned> reps{ceil<unsigned>(srcShape[0], srcShapePerCTA[0]),
+                               ceil<unsigned>(srcShape[1], srcShapePerCTA[1])};
+
+    // Visit each input value in the order they are placed in inVals
+    //
+    // Please note that the order was not awaring of blockLayout.getOrder(),
+    // thus the adjacent elems may not belong to a same word. This could be
+    // improved if we update the elements order by emitIndicesForBlockedLayout()
+    SmallVector<unsigned> wordsInEachRep(2);
+    wordsInEachRep[0] = inOrd[0] == 0
+                            ? srcBlockedLayout.getSizePerThread()[0] / minVec
+                            : srcBlockedLayout.getSizePerThread()[0];
+    wordsInEachRep[1] = inOrd[0] == 0
+                            ? srcBlockedLayout.getSizePerThread()[1]
+                            : srcBlockedLayout.getSizePerThread()[1] / minVec;
+    Value outVecVal = createIndexConst(rewriter, loc, outVec);
+    Value minVecVal = createIndexConst(rewriter, loc, minVec);
+    Value smemBase = getSharedMemoryBase(loc, rewriter, dst);
+    auto elemPtrTy =
+        LLVM::LLVMPointerType::get(getTypeConverter()->convertType(elemTy), 3);
+    smemBase = rewriter.create<LLVM::BitcastOp>(loc, elemPtrTy, smemBase);
+    unsigned numWordsEachRep = product<unsigned>(wordsInEachRep);
+    SmallVector<Value> wordVecs(numWordsEachRep);
+    for (unsigned i = 0; i < numElems; ++i) {
+      if (i % srcAccumSizeInThreads == 0) {
+        // start of a replication
+        for (unsigned w = 0; w < numWordsEachRep; ++w) {
+          wordVecs[w] = rewriter.create<LLVM::UndefOp>(loc, wordTy);
+        }
+      }
+      unsigned linearIdxInNanoTile = i % srcAccumSizeInThreads;
+      auto multiDimIdxInNanoTile = getMultiDimIndex<unsigned>(
+          linearIdxInNanoTile, srcBlockedLayout.getSizePerThread());
+      multiDimIdxInNanoTile[inOrd[0]] /= minVec;
+      unsigned pos = multiDimIdxInNanoTile[inOrd[0]] % minVec;
+      unsigned wordVecIdx =
+          getLinearIndex<unsigned>(multiDimIdxInNanoTile, wordsInEachRep);
+      wordVecs[wordVecIdx] = rewriter.create<LLVM::InsertElementOp>(
+          loc, wordTy, wordVecs[wordVecIdx], inVals[i],
+          createIndexConst(rewriter, loc, pos));
+
+      if (i % srcAccumSizeInThreads == srcAccumSizeInThreads - 1) {
+        // end of replication, store the vectors into shared memory
+        unsigned linearRepIdx = i / srcAccumSizeInThreads;
+        auto multiDimRepIdx = getMultiDimIndex<unsigned>(linearRepIdx, reps);
+        for (unsigned linearWordIdx = 0; linearWordIdx < numWordsEachRep;
+             ++linearWordIdx) {
+          // step 1: recover the multidim_index from the index of input_elements
+          // row = multiDimOffsetFirstElem[0] +
+          //       multiDimRepIdx[0] * shapePerCTA[0] + multiDimWordIdx[0] *
+          //       (inOrd[0] == 0) ? minVec : 1
+          // col = multiDimOffsetFirstElem[1] +
+          //       multiDimRepIdx[1] * shapePerCTA[1] + multiDimWordIdx[1] *
+          //       (inOrd[0] == 1) ? minVec : 1
+          auto multiDimWordIdx =
+              getMultiDimIndex<unsigned>(linearWordIdx, wordsInEachRep);
+          SmallVector<Value> multiDimIdx(2);
+          multiDimIdx[0] = rewriter.create<LLVM::AddOp>(
+              loc, multiDimOffsetFirstElem[0],
+              createIndexConst(rewriter, loc,
+                               multiDimRepIdx[0] * srcShapePerCTA[0] +
+                                   multiDimWordIdx[0] *
+                                       (inOrd[0] == 0 ? minVec : 1)));
+          multiDimIdx[1] = rewriter.create<LLVM::AddOp>(
+              loc, multiDimOffsetFirstElem[1],
+              createIndexConst(rewriter, loc,
+                               multiDimRepIdx[1] * srcShapePerCTA[1] +
+                                   multiDimWordIdx[1] *
+                                       (inOrd[0] == 1 ? minVec : 1)));
+
+          // step 2: do swizzling
+          Value remained = rewriter.create<LLVM::URemOp>(
+              loc, multiDimIdx[inOrd[0]], outVecVal);
+          multiDimIdx[inOrd[0]] = rewriter.create<LLVM::UDivOp>(
+              loc, multiDimIdx[inOrd[0]], outVecVal);
+          Value off_1 = rewriter.create<LLVM::MulOp>(
+              loc, multiDimIdx[inOrd[1]],
+              createIndexConst(rewriter, loc, srcShape[inOrd[0]]));
+          Value phaseId = rewriter.create<LLVM::UDivOp>(
+              loc, multiDimIdx[inOrd[1]],
+              createIndexConst(rewriter, loc, perPhase));
+          phaseId = rewriter.create<LLVM::URemOp>(
+              loc, phaseId, createIndexConst(rewriter, loc, maxPhase));
+          Value off_0 =
+              rewriter.create<LLVM::XOrOp>(loc, multiDimIdx[inOrd[0]], phaseId);
+          off_0 = rewriter.create<LLVM::MulOp>(loc, off_0, outVecVal);
+          remained = rewriter.create<LLVM::UDivOp>(loc, remained, minVecVal);
+          off_0 = rewriter.create<LLVM::AddOp>(
+              loc, off_0,
+              rewriter.create<LLVM::MulOp>(loc, remained, minVecVal));
+          Value offset = rewriter.create<LLVM::AddOp>(loc, off_1, off_0);
+
+          // step 3: store
+          Value smemAddr =
+              rewriter.create<LLVM::GEPOp>(loc, elemPtrTy, smemBase, offset);
+          smemAddr = rewriter.create<LLVM::BitcastOp>(
+              loc, LLVM::LLVMPointerType::get(wordTy, 3), smemAddr);
+          rewriter.create<LLVM::StoreOp>(loc, wordVecs[linearWordIdx],
+                                         smemAddr);
+        }
+      }
+    }
+    // TODO: double confirm if the Barrier is necessary here
+    rewriter.create<mlir::gpu::BarrierOp>(loc);
+    rewriter.replaceOp(op, smemBase);
+    return success();
+  }
 };
 
 /// ====================== dot codegen begin ==========================
+
+template <typename T>
+void print_array(ArrayRef<T> array, const std::string &str) {
+  std::cout << str << ": ";
+  for (const T &e : array)
+    std::cout << e << ",";
+  std::cout << std::endl;
+}
+template <typename T> void print_scalar(const T &e, const std::string &str) {
+  std::cout << str << ": " << e << std::endl;
+}
 
 // Data loader for mma.16816 instruction.
 class MMA16816SmemLoader {
@@ -1893,13 +2003,13 @@ public:
 
     int ptrIdx{-1};
 
-    if (canUseLdmatrix)
+    if (canUseLdmatrix) {
       ptrIdx = matIdx[order[0]] / (instrShape[order[0]] / matShape[order[0]]);
-    else if (elemBytes == 4 && needTrans) // tf32 & trans
+    } else if (elemBytes == 4 && needTrans) { // tf32 & trans
       ptrIdx = matIdx[order[0]];
-    else if (elemBytes == 1 && needTrans)
+    } else if (elemBytes == 1 && needTrans) {
       ptrIdx = matIdx[order[0]] * 4;
-    else
+    } else
       llvm::report_fatal_error("unsupported mma type found");
 
     // The main difference with the original triton code is we removed the
@@ -2796,6 +2906,9 @@ void ConvertTritonGPUToLLVM::initSharedMemory(
          "Inliner pass is expected before TritonGPUToLLVM");
   b.setInsertionPointToStart(&funcs[0].getBody().front());
   smem = b.create<LLVM::AddressOfOp>(loc, global);
+  auto ptrTy =
+      LLVM::LLVMPointerType::get(typeConverter.convertType(b.getI8Type()), 3);
+  smem = b.create<LLVM::BitcastOp>(loc, ptrTy, smem);
 }
 
 } // namespace

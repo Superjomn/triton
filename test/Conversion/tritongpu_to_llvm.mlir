@@ -515,3 +515,20 @@ module attributes {"triton_gpu.num-warps" = 1 : i32} {
     return
   }
 }
+
+// -----
+
+#blocked0 = #triton_gpu.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [8, 1], order = [1, 0]}>
+#shared0 = #triton_gpu.shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+module attributes {"triton_gpu.num-warps" = 1 : i32} {
+  // CHECK: llvm.mlir.global internal @global_smem() {addr_space = 3 : i32} : !llvm.array<16384 x i8>
+  // CHECK-LABEL: convert_layout_blocked_shared
+  func @convert_layout_blocked_shared(%arg0: tensor<128x32xf32, #blocked0>) {
+    // CHECK: llvm.store
+    // CHECK-SAME: !llvm.ptr<vector<8xf32>, 3>
+    // CHECK: llvm.store
+    // CHECK-SAME: !llvm.ptr<vector<8xf32>, 3>
+    %0 = triton_gpu.convert_layout %arg0 : (tensor<128x32xf32, #blocked0>) -> tensor<128x32xf32, #shared0>
+    return
+  }
+}

@@ -910,7 +910,7 @@ def ptx_get_version(cuda_version) -> int:
 
 
 def path_to_ptxas():
-    prefixes = [os.environ.get("TRITON_PTXAS_PATH", ""), "", "/usr/local/cuda/"]
+    prefixes = [os.environ.get("TRITON_PTXAS_PATH", ""), "", os.environ.get('CUDA_PATH', default_cuda_dir())]
     for prefix in prefixes:
         ptxas = os.path.join(prefix, "bin", "ptxas")
         if os.path.exists(ptxas):
@@ -952,6 +952,7 @@ def _compile(fn, signature: str, device: int = -1, constants=dict(), specializat
     compute_capability = compute_capability[0] * 10 + compute_capability[1]
     ptx_version = ptx_get_version(cuda_version)
     ptx = make_ptx(llvm_ir, compute_capability, ptx_version)
+    print(ptx)
     shem_size = _triton.get_shared_memory_size(module)
     kernel_name = ptx_get_kernel_name(ptx)
     if output == "ptx":
