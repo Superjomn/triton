@@ -1827,6 +1827,8 @@ public:
     if (!canUseLdmatrix && elemBytes == 1)
       numPtr *= 4;
 
+    printf("numPtr: %d\n", numPtr);
+
     int loadStrideInMat[2];
     loadStrideInMat[kOrder] =
         2; // instrShape[kOrder] / matShape[kOrder], always 2
@@ -1840,6 +1842,15 @@ public:
     // Each matArr contains warpOffStride matrices.
     matArrStride = kOrder == 1 ? 1 : wpt;
     warpOffStride = instrShape[kOrder ^ 1] / matShape[kOrder ^ 1];
+
+    printf("{\n");
+    printf("wpt: %d\n", wpt);
+    printf("loadStrideInMat: %d,%d\n", loadStrideInMat[0], loadStrideInMat[1]);
+    printf("sMatStride: %d\n", sMatStride);
+    printf("pLoadStrideInMat: %d\n", pLoadStrideInMat);
+    printf("matArrStride: %d\n", matArrStride);
+    printf("warpOffStride: %d\n", warpOffStride);
+    printf("}\n");
   }
 
   // lane = thread % 32
@@ -2012,6 +2023,8 @@ public:
     } else
       llvm::report_fatal_error("unsupported mma type found");
 
+    printf("ptrIdx:%d\n", ptrIdx);
+
     // The main difference with the original triton code is we removed the
     // prefetch-related logic here for the upstream optimizer phase should take
     // care with it, and that is transparent in dot conversion.
@@ -2025,6 +2038,7 @@ public:
           matIdx[order[1]] * sMatStride * sMatShape * sTileStride * elemBytes;
       PTXBuilder builder;
 
+      printf("s_offset: %d\n", sOffset);
       // ldmatrix.m8n8.x4 returns 4x2xfp16(that is 4xb32) elements for a thread.
       auto resArgs = builder.newListOperand(4, "=r");
       auto addrArg = builder.newAddrOperand(ptr, "r", sOffset);
@@ -2293,6 +2307,46 @@ struct DotOpConversionHelper {
     ATensorTy = A.getType().cast<RankedTensorType>();
     BTensorTy = B.getType().cast<RankedTensorType>();
     DTensorTy = D.getType().cast<RankedTensorType>();
+
+    auto ALayout = ATensorTy.getEncoding().cast<SharedEncodingAttr>();
+    auto BLayout = BTensorTy.getEncoding().cast<SharedEncodingAttr>();
+
+    auto AShape = ATensorTy.getShape();
+    auto BShape = BTensorTy.getShape();
+
+    auto AOrder = ALayout.getOrder();
+    auto BOrder = BLayout.getOrder();
+
+    printf("a_order: %d,%d\n", AOrder[0], AOrder[1]);
+    printf("b_order: %d,%d\n", BOrder[0], BOrder[1]);
+    printf("a_shape: %d,%d\n", AShape[0], AShape[1]);
+    printf("b_shape: %d,%d\n", BShape[0], BShape[1]);
+
+    bool isARow = AOrder[0] != 0;
+    bool isBRow = BOrder[0] != 0;
+
+    if (mmaLayout.getVersion() < 2) {
+      fpw = {2, 2, 1};
+      bool isAVec4 = !isARow && ATensorTy.getShape()[AOrder[0]] <= 16;
+      bool isBVec4 = isBRow && BTensorTy.getShape()[BOrder[0]] <= 16;
+      int packSize0 = (isARow || isAVec4) ? 1 : 2;
+      int packSize1 = (isBRow && !isBVec4) ? 2 : 1;
+      rep = {2 * packSize0, 2 * packSize1, 1};
+      spw = {fpw[0] * 4 * rep[0], fpw[1] * 4 * rep[1], 1};
+      contigPerThread = {1, 1};
+    } else {
+      auto data = getMmaInstrShape();
+      spw.assign(data.begin(), data.end());
+      contigPerThread = {1, 2};
+    }
+
+    auto wpt = mmaLayout.getWarpsPerCTA();
+    printf("wpt: %d,%d,%d\n", wpt[0], wpt[1]);
+
+    shapePerCTA = {static_cast<int>(spw[0] * wpt[0]),
+                   static_cast<int>(spw[1] * wpt[1]), 1};
+    printf("mma.shape_per_cta: %d,%d,%d\n", shapePerCTA[0], shapePerCTA[1],
+           shapePerCTA[2]);
   }
 
   // Load SplatLike C which contains a constVal. It simply returns 4 fp32
@@ -2468,6 +2522,13 @@ struct DotOpConversionHelper {
   }
 
 private:
+  SmallVector<int> fpw; // fragment per warp
+  SmallVector<int> contigPerThread;
+  SmallVector<int> rep;
+  SmallVector<int> spw; // shape per warp
+  SmallVector<int> wpt; // warps per tile
+  SmallVector<int> shapePerCTA;
+
   TensorCoreType mmaType;
 
   // Used on nvidia GPUs mma layout .version == 2
@@ -2569,6 +2630,7 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
   const int mmaInstrM = mmaInstrShape[0];
   const int mmaInstrN = mmaInstrShape[1];
   const int mmaInstrK = mmaInstrShape[2];
+  printf("mma_instr.shape: %d, %d, %d\n", mmaInstrM, mmaInstrN, mmaInstrK);
 
   auto matShape = helper.getMmaMatShape();
   const int matShapeM = matShape[0];
@@ -2579,6 +2641,7 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
   const int numRepM = std::max<int>(dShape[0] / (wpt[0] * mmaInstrM), 1);
   const int numRepN = std::max<int>(dShape[1] / (wpt[1] * mmaInstrN), 1);
   const int numRepK = std::max<int>(NK / mmaInstrK, 1);
+  printf("num_rep m,n,k: %d,%d,%d\n", numRepM, numRepN, numRepK);
 
   Value _32 = i32_val(32);
   Value thread = getThreadId(rewriter, loc);
@@ -2590,6 +2653,7 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
 
   size_t aElemBytes = aTensorTy.getElementTypeBitWidth() / 8;
   size_t bElemBytes = bTensorTy.getElementTypeBitWidth() / 8;
+  printf("a,b bits: %d, %d\n", aElemBytes, bElemBytes);
 
   std::map<std::pair<unsigned, unsigned>, Value> ha;
   std::map<std::pair<unsigned, unsigned>, Value> hb;
@@ -2633,6 +2697,7 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
     // (a, b) is the coordinate.
     auto load = [&vals, &helper, &ld2, kOrder, loader, ptrs, offs,
                  needTrans](int a, int b) {
+      printf("-- needTrans: %d\n", needTrans);
       auto [ha0, ha1, ha2, ha3] = loader.loadX4(
           (kOrder == 1) ? a : b /*mat0*/, (kOrder == 1) ? b : a /*mat1*/, offs,
           ptrs, helper.getMatType(), helper.getShemPtrTy());
@@ -2641,11 +2706,13 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
         ld2(vals, a + 1, b, ha1);
         ld2(vals, a, b + 1, ha2);
         ld2(vals, a + 1, b + 1, ha3);
+        printf("end loading a\n");
       } else {
         ld2(vals, a, b, ha0);
         ld2(vals, a + 1, b, ha2);
         ld2(vals, a, b + 1, ha1);
         ld2(vals, a + 1, b + 1, ha3);
+        printf("end loading b\n");
       }
     };
 
@@ -2653,11 +2720,6 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
   };
 
   std::function<void(int, int)> loadA;
-  std::function<void(int, int)> loadB = getLoadMatrixFn(
-      B, adapter.b() /*llTensor*/, mmaLayout.getWarpsPerCTA()[1] /*wpt*/,
-      0 /*kOrder*/, {mmaInstrK, mmaInstrN} /*instrShpae*/,
-      {matShapeK, matShapeN} /*matShape*/, warpN /*warpId*/, hb /*vals*/);
-
   if (aTensorTy.getEncoding()
           .dyn_cast<SharedEncodingAttr>()) { // load from smem
     loadA = getLoadMatrixFn(
@@ -2667,18 +2729,38 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
   } else if (auto blockedLayout =
                  aTensorTy.getEncoding()
                      .dyn_cast<BlockedEncodingAttr>()) { // load from registers,
-                                                         // used in gemm fuse
+    // used in gemm fuse
     // TODO(Superjomn) Port the logic.
     assert(false && "Loading A from register is not supported yet.");
   } else {
     assert(false && "A's layout is not supported.");
   }
 
+  std::function<void(int, int)> loadB = getLoadMatrixFn(
+      B, adapter.b() /*llTensor*/, mmaLayout.getWarpsPerCTA()[1] /*wpt*/,
+      0 /*kOrder*/, {mmaInstrK, mmaInstrN} /*instrShpae*/,
+      {matShapeK, matShapeN} /*matShape*/, warpN /*warpId*/, hb /*vals*/);
+
   const unsigned mStride = numRepN * 2;
   const int fcSize =
       ((2 * (numRepM - 1)) + 1) * mStride + 2 * (numRepN - 1) + 1 + 1;
   SmallVector<Value> fc(fcSize);
+
+  // Currently, we only support a SplatLike C. For the other cases, e.g., C in
+  // shared layout or blocked layout, we will support them by expanding
+  // convert_layout.
+  auto hc = helper.loadSplatLikeC(C, loc, rewriter);
+  assert(hc.size() == 4UL && "Only splat-like C is supported now");
+  for (int i = 0; i < fc.size(); i++)
+    fc[i] = hc[0];
+
   auto callMma = [&](unsigned m, unsigned n, unsigned k) {
+    unsigned colsPerThread = numRepN * 2;
+    SmallVector<size_t> idx({(m + 0) * colsPerThread + (n * 2 + 0),
+                             (m + 0) * colsPerThread + (n * 2 + 1),
+                             (m + 1) * colsPerThread + (n * 2 + 0),
+                             (m + 1) * colsPerThread + (n * 2 + 1)});
+
     PTXBuilder builder;
 
     auto &mma = *builder.create(helper.getMmaInstr().str());
@@ -2695,37 +2777,30 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
     auto bArgs =
         builder.newListOperand({{hb[{n, k}], "r"}, {hb[{n, k + 1}], "r"}});
 
-    // Currently, we only support a SplatLike C. For the other cases, e.g., C in
-    // shared layout or blocked layout, we will support them by expanding
-    // convert_layout.
-    auto hc = helper.loadSplatLikeC(C, loc, rewriter);
-    assert(hc.size() == 4UL && "Only splat-like C is supported now");
-
     auto cArgs = builder.newListOperand();
-    for (int i = 0; i < hc.size(); ++i) {
+    for (int i = 0; i < 4; ++i) {
       cArgs->listAppend(builder.newOperand(
-          hc[i], std::to_string(i))); // reuse the output registers
+          fc[idx[i]], std::to_string(i))); // reuse the output registers
     }
 
     mma(retArgs, aArgs, bArgs, cArgs);
 
+    llvm::outs() << builder.dump() << "\n";
+    llvm::outs() << builder.getConstraints() << "\n";
     Value mmaOut = builder.launch(rewriter, loc, helper.getMmaRetType());
 
     auto getIntAttr = [&](int v) {
       return ArrayAttr::get(ctx, {IntegerAttr::get(i32_ty, v)});
     };
 
-    fc[(m + 0) * mStride + (n * 2 + 0)] =
-        extract_val(type::f32Ty(ctx), mmaOut, getIntAttr(0));
-    fc[(m + 0) * mStride + (n * 2 + 1)] =
-        extract_val(type::f32Ty(ctx), mmaOut, getIntAttr(1));
-    fc[(m + 1) * mStride + (n * 2 + 0)] =
-        extract_val(type::f32Ty(ctx), mmaOut, getIntAttr(2));
-    fc[(m + 1) * mStride + (n * 2 + 1)] =
-        extract_val(type::f32Ty(ctx), mmaOut, getIntAttr(3));
+    for (int i = 0; i < 4; i++)
+      fc[idx[i]] = extract_val(type::f32Ty(ctx), mmaOut, getIntAttr(i));
   };
 
+  printf("fc.size: %d\n", fc.size());
+
   // Main program
+  printf("rep M,N,K: %d,%d,%d\n", numRepM, numRepN, numRepK);
 
   for (unsigned k = 0; k < numRepK; ++k) {
     for (unsigned m = 0; m < numRepM; ++m)
