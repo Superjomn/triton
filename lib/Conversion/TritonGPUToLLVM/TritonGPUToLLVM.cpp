@@ -25,7 +25,7 @@
 #include <numeric>
 #include <string>
 
-#define DEBUG_D
+// #define DEBUG_D
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -109,6 +109,18 @@ namespace {
 namespace type = mlir::triton::type;
 
 class TritonGPUToLLVMTypeConverter;
+
+template <typename T>
+void print_array(ArrayRef<T> array, const std::string &str) {
+  std::cout << str << ": ";
+  for (const T &e : array)
+    std::cout << e << ",";
+  std::cout << std::endl;
+}
+
+template <typename T> void print_scalar(const T &e, const std::string &str) {
+  std::cout << str << ": " << e << std::endl;
+}
 
 // FuncOpConversion/FuncOpConversionBase is borrowed from
 // https://github.com/llvm/llvm-project/blob/fae656b2dd80246c3c6f01e9c77c49560368752c/mlir/lib/Conversion/FuncToLLVM/FuncToLLVM.cpp#L276
@@ -1469,7 +1481,6 @@ public:
       numReplicates[d] = ceil<unsigned>(shape[d], maxPerCTA);
       inNumCTAsEachRep[d] = maxPerCTA / inPerCTA;
       outNumCTAsEachRep[d] = maxPerCTA / outPerCTA;
-      // TODO: confirm this
       assert(maxPerCTA % inPerCTA == 0 && maxPerCTA % outPerCTA == 0);
       inNumCTAs[d] = ceil<unsigned>(shape[d], inPerCTA);
       outNumCTAs[d] = ceil<unsigned>(shape[d], outPerCTA);
@@ -1485,6 +1496,11 @@ public:
     unsigned outElems = getElemsPerThread(dstLayout, shape);
     auto outOrd = getOrder(dstLayout);
     SmallVector<Value> outVals(outElems);
+
+    print_scalar<unsigned>(inVec, "inVec");
+    print_scalar<unsigned>(outVec, "outVec");
+    print_array<unsigned>(paddedRepShape, "paddedRepShape");
+
     for (unsigned repId = 0; repId < accumNumReplicates; ++repId) {
       auto multiDimRepId = getMultiDimIndex<unsigned>(repId, numReplicates);
       rewriter.create<mlir::gpu::BarrierOp>(loc);
@@ -1551,32 +1567,34 @@ private:
     }
     auto llvmElemTy = getTypeConverter()->convertType(type.getElementType());
     SmallVector<Value> multiDimOffsetFirstElem;
-    Value mmaGrpId;
-    Value mmaGrpIdP8;
-    Value mmaThreadIdInGrpM2;
-    Value mmaThreadIdInGrpM2P1;
+    SmallVector<Value> mmaColIdx(2);
+    SmallVector<Value> mmaRowIdx(2);
     if (blockedLayout) {
       multiDimOffsetFirstElem = emitBaseIndexForBlockedLayout(
           loc, rewriter, blockedLayout, type.getShape());
     } else if (mmaLayout) {
-      // TODO: simplify these
-      auto cast = rewriter.create<UnrealizedConversionCastOp>(
-          loc, TypeRange{llvmIndexTy},
-          ValueRange{rewriter.create<::mlir::gpu::ThreadIdOp>(
-              loc, rewriter.getIndexType(), ::mlir::gpu::Dimension::x)});
-      Value threadId = cast.getResult(0);
-      Value warpSize = createIndexAttrConstant(
-          rewriter, loc, this->getTypeConverter()->getIndexType(), 32);
-      Value laneId = rewriter.create<LLVM::URemOp>(loc, threadId, warpSize);
-      Value fourVal = idx_val(4);
-      mmaGrpId = rewriter.create<LLVM::UDivOp>(loc, laneId, fourVal);
-      mmaGrpIdP8 = rewriter.create<LLVM::AddOp>(loc, mmaGrpId, idx_val(8));
-      Value mmaThreadIdInGrp =
-          rewriter.create<LLVM::URemOp>(loc, laneId, fourVal);
-      mmaThreadIdInGrpM2 =
-          rewriter.create<LLVM::MulOp>(loc, mmaThreadIdInGrp, idx_val(2));
-      mmaThreadIdInGrpM2P1 =
-          rewriter.create<LLVM::AddOp>(loc, mmaThreadIdInGrpM2, idx_val(1));
+      Value threadId = getThreadId(rewriter, loc);
+      Value warpSize = idx_val(32);
+      Value laneId = urem(threadId, warpSize);
+      Value warpId = udiv(threadId, warpSize);
+      // auto multiDimWarpId =
+      //     delinearize(rewriter, loc, warpId, mmaLayout.getWarpsPerCTA());
+      // TODO: double confirm if its document bug or DotConversion's Bug
+      SmallVector<Value> multiDimWarpId(2);
+      multiDimWarpId[0] = urem(warpId, idx_val(mmaLayout.getWarpsPerCTA()[0]));
+      multiDimWarpId[1] = udiv(warpId, idx_val(mmaLayout.getWarpsPerCTA()[0]));
+      Value four = idx_val(4);
+      Value mmaGrpId = udiv(laneId, four);
+      Value mmaGrpIdP8 = add(mmaGrpId, idx_val(8));
+      Value mmaThreadIdInGrp = urem(laneId, four);
+      Value mmaThreadIdInGrpM2 = mul(mmaThreadIdInGrp, idx_val(2));
+      Value mmaThreadIdInGrpM2P1 = add(mmaThreadIdInGrpM2, idx_val(1));
+      Value colWarpOffset = mul(multiDimWarpId[0], idx_val(16));
+      mmaColIdx[0] = add(mmaGrpId, colWarpOffset);
+      mmaColIdx[1] = add(mmaGrpIdP8, colWarpOffset);
+      Value rowWarpOffset = mul(multiDimWarpId[1], idx_val(8));
+      mmaRowIdx[0] = add(mmaThreadIdInGrpM2, rowWarpOffset);
+      mmaRowIdx[1] = add(mmaThreadIdInGrpM2P1, rowWarpOffset);
     }
     for (unsigned ctaId = 0; ctaId < accumNumCTAsEachRep; ++ctaId) {
       auto multiDimCTAInRepId =
@@ -1607,9 +1625,14 @@ private:
           assert(rank == 2);
           assert(mmaLayout.getVersion() == 2 &&
                  "mmaLayout ver1 not implemented yet");
-          multiDimOffset[0] = elemId < 2 ? mmaGrpId : mmaGrpIdP8;
+          multiDimOffset[0] = elemId < 2 ? mmaColIdx[0] : mmaColIdx[1];
+          multiDimOffset[1] = elemId % 2 == 0 ? mmaRowIdx[0] : mmaRowIdx[1];
+          multiDimOffset[0] =
+              add(multiDimOffset[0],
+                  idx_val(multiDimCTAInRepId[0] * shapePerCTA[0]));
           multiDimOffset[1] =
-              elemId % 2 == 0 ? mmaThreadIdInGrpM2 : mmaThreadIdInGrpM2P1;
+              add(multiDimOffset[1],
+                  idx_val(multiDimCTAInRepId[1] * shapePerCTA[1]));
         } else {
           assert(0 && "unexpected layout in processReplica");
         }
@@ -1813,17 +1836,6 @@ private:
 };
 
 /// ====================== dot codegen begin ==========================
-
-template <typename T>
-void print_array(ArrayRef<T> array, const std::string &str) {
-  std::cout << str << ": ";
-  for (const T &e : array)
-    std::cout << e << ",";
-  std::cout << std::endl;
-}
-template <typename T> void print_scalar(const T &e, const std::string &str) {
-  std::cout << str << ": " << e << std::endl;
-}
 
 // Data loader for mma.16816 instruction.
 class MMA16816SmemLoader {
@@ -2778,9 +2790,10 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
       0 /*kOrder*/, {mmaInstrK, mmaInstrN} /*instrShpae*/,
       {matShapeK, matShapeN} /*matShape*/, warpN /*warpId*/, hb /*vals*/);
 
-  const unsigned mStride = numRepN * 2;
-  const int fcSize =
-      ((2 * (numRepM - 1)) + 1) * mStride + 2 * (numRepN - 1) + 1 + 1;
+  // const unsigned mStride = numRepN * 2;
+  // const int fcSize =
+  //     ((2 * (numRepM - 1)) + 1) * mStride + 2 * (numRepN - 1) + 1 + 1;
+  const int fcSize = 4 * numRepM * numRepN;
   std::cout << "fcSize: " << fcSize << std::endl;
   SmallVector<Value> fc(fcSize);
 
@@ -2794,10 +2807,13 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adapter,
 
   auto callMma = [&](unsigned m, unsigned n, unsigned k) {
     unsigned colsPerThread = numRepN * 2;
-    SmallVector<size_t> idx({(m + 0) * colsPerThread + (n * 2 + 0),
-                             (m + 0) * colsPerThread + (n * 2 + 1),
-                             (m + 1) * colsPerThread + (n * 2 + 0),
-                             (m + 1) * colsPerThread + (n * 2 + 1)});
+    // SmallVector<size_t> idx({(m + 0) * colsPerThread + (n * 2 + 0),
+    //                          (m + 0) * colsPerThread + (n * 2 + 1),
+    //                          (m + 1) * colsPerThread + (n * 2 + 0),
+    //                          (m + 1) * colsPerThread + (n * 2 + 1)});
+    SmallVector<size_t> idx(
+        {m * colsPerThread + 4 * n, m * colsPerThread + 4 * n + 1,
+         m * colsPerThread + 4 * n + 2, m * colsPerThread + 4 * n + 3});
 
     PTXBuilder builder;
 

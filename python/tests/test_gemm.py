@@ -32,28 +32,8 @@ def matmul_kernel(
     [128, 256, 32, 4],
 ])
 def test_gemm_impl(SIZE_M, SIZE_N, SIZE_K, NUM_WARPS):
-    # a_np = np.zeros((SIZE_M, SIZE_K), dtype=np.float16)
-    # for i in range(SIZE_M):
-    #     for j in range(SIZE_K):
-    #         a_np[i, j] = i + j/1000.0
-    # b_np = np.zeros((SIZE_K, SIZE_N), dtype=np.float16)
-    # for i in range(SIZE_K):
-    #     for j in range(SIZE_N):
-    #         b_np[i, j] = i + j/1000.0
-
-    # print("a_np:")
-    # print(a_np)
-    # print("b_np:")
-    # print(b_np)
-    #a = torch.from_numpy(a_np).cuda()
-    #b = torch.from_numpy(b_np).cuda()
-
     a = torch.randn((SIZE_M, SIZE_K), device='cuda', dtype=torch.float16)
     b = torch.randn((SIZE_K, SIZE_N), device='cuda', dtype=torch.float16)
-    print("\na:\n")
-    print(a)
-    print("\nb:\n")
-    print(b)
     c = torch.empty((SIZE_M, SIZE_N), device=a.device, dtype=torch.float32)
     grid = lambda META: (1, )
     matmul_kernel[grid](a_ptr=a, b_ptr=b, c_ptr=c,
@@ -62,13 +42,13 @@ def test_gemm_impl(SIZE_M, SIZE_N, SIZE_K, NUM_WARPS):
                         stride_cm=c.stride(0), stride_cn=c.stride(1),
                         M=SIZE_M, N=SIZE_N, K=SIZE_K,
                         num_warps=NUM_WARPS)
-    #golden_result = torch.matmul(a, b)
+    golden = torch.matmul(a, b)
     torch.set_printoptions(profile="full")
-    print("\ntriton (D of tt.dot, in the format of [threadId, fcIdx]):")
+    print("\ntriton: \n")
     print(c)
-    # 128 * 256
-    #print(c.view(128*8, 32))
-
-    #print("\ngolden:")
-    #print(golden_result)
+    print("\ngolden: \n")
+    print(golden)
+    print("\ndelta: \n")
+    print(c - golden)
+    assert_allclose(c, golden, rtol=1e-3, atol=1e-3)
 
