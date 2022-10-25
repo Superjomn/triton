@@ -40,7 +40,8 @@ AxisInfo AxisInfo::getPessimisticValueState(Value value) {
   if (TensorType ty = value.getType().dyn_cast<TensorType>())
     rank = ty.getRank();
   int divHint = 1;
-  if (BlockArgument blockArg = value.dyn_cast<BlockArgument>()) {
+  BlockArgument blockArg = value.dyn_cast<BlockArgument>();
+  if (blockArg && blockArg.getOwner()->isEntryBlock()) {
     Operation *op = blockArg.getOwner()->getParentOp();
     if (FuncOp fun = dyn_cast<FuncOp>(op)) {
       Attribute attr =
@@ -65,7 +66,7 @@ AxisInfo AxisInfo::join(const AxisInfo &lhs, const AxisInfo &rhs) {
   DimVectorT retContiguity;
   DimVectorT retDivisibility;
   DimVectorT retConstancy;
-  for (size_t d = 0; d < lhs.getRank(); d++) {
+  for (size_t d = 0; d < lhs.getRank(); ++d) {
     retContiguity.push_back(gcd(lhs.getContiguity(d), rhs.getContiguity(d)));
     retDivisibility.push_back(
         gcd(lhs.getDivisibility(d), rhs.getDivisibility(d)));
@@ -87,7 +88,7 @@ AxisInfo AxisInfoAnalysis::visitBinaryOp(
   AxisInfo::DimVectorT newContiguity;
   AxisInfo::DimVectorT newDivisibility;
   AxisInfo::DimVectorT newConstancy;
-  for (size_t d = 0; d < rank; d++) {
+  for (size_t d = 0; d < rank; ++d) {
     newContiguity.push_back(getContiguity(lhsInfo, rhsInfo, d));
     newDivisibility.push_back(getDivisibility(lhsInfo, rhsInfo, d));
     newConstancy.push_back(getConstancy(lhsInfo, rhsInfo, d));
@@ -166,7 +167,7 @@ ChangeResult AxisInfoAnalysis::visitOperation(
     AxisInfo::DimVectorT contiguity;
     AxisInfo::DimVectorT divisibility;
     AxisInfo::DimVectorT constancy;
-    for (size_t d = 0; d < retTy.getRank(); d++) {
+    for (size_t d = 0; d < retTy.getRank(); ++d) {
       contiguity.push_back(1);
       divisibility.push_back(opInfo.getDivisibility(0));
       constancy.push_back(retTy.getShape()[d]);
@@ -202,13 +203,40 @@ ChangeResult AxisInfoAnalysis::visitOperation(
     AxisInfo::DimVectorT contiguity;
     AxisInfo::DimVectorT divisibility;
     AxisInfo::DimVectorT constancy;
-    for (size_t d = 0; d < retTy.getRank(); d++) {
+    for (size_t d = 0; d < retTy.getRank(); ++d) {
       contiguity.push_back(opShape[d] == 1 ? 1 : opInfo.getContiguity(d));
       divisibility.push_back(opInfo.getDivisibility(d));
       constancy.push_back(opShape[d] == 1 ? retShape[d] : 1);
     }
     curr = AxisInfo(contiguity, divisibility, constancy);
   }
+
+  // CmpI
+  if ((llvm::dyn_cast<arith::CmpIOp>(op) ||
+       llvm::dyn_cast<triton::gpu::CmpIOp>(op)) &&
+      op->getResult(0).getType().dyn_cast<TensorType>()) {
+    auto resTy = op->getResult(0).getType().cast<TensorType>();
+    short rank = resTy.getRank();
+    auto lhsInfo = operands[0]->getValue();
+    auto rhsInfo = operands[1]->getValue();
+    auto shape = resTy.getShape();
+
+    AxisInfo::DimVectorT contiguity, divisibility, constancy;
+    for (short d = 0; d < rank; ++d) {
+      if (rhsInfo.getConstancy(d) % lhsInfo.getContiguity(d) == 0 ||
+          rhsInfo.getConstancy(d) % lhsInfo.getConstancy(d))
+        constancy.push_back(
+            gcd(lhsInfo.getDivisibility(d), rhsInfo.getDivisibility(d)));
+      else
+        constancy.push_back(1);
+
+      divisibility.push_back(shape[d]);
+      contiguity.push_back(1);
+    }
+
+    curr = AxisInfo(contiguity, divisibility, constancy);
+  }
+
   // UnrealizedConversionCast
   // This is needed by TritonGPUToLLVM, to get AxisInfo when the graph is
   // in the process of a PartialConversion, where UnrealizedConversionCast
@@ -219,7 +247,8 @@ ChangeResult AxisInfoAnalysis::visitOperation(
   if (curr.getRank() == 0) {
     return markAllPessimisticFixpoint(op->getResults());
   }
-  // join all latice elements
+
+  // join all lattice elements
   ChangeResult result = ChangeResult::NoChange;
   for (Value value : op->getResults()) {
     result |= getLatticeElement(value).join(curr);
