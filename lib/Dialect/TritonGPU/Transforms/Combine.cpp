@@ -87,7 +87,6 @@ public:
     if (!llvm::isa<triton::gpu::ConvertLayoutOp>(op))
       return mlir::failure();
     auto convert = llvm::cast<triton::gpu::ConvertLayoutOp>(op);
-    auto srcType = convert.getOperand().getType().cast<RankedTensorType>();
     auto dstType = convert.getType().cast<RankedTensorType>();
     // we don't handle conversions to DotOperandEncodingAttr
     // this is a heuristics to accomodate fused attention
@@ -103,16 +102,21 @@ public:
     if (!arg)
       return mlir::failure();
     // cvt(alloc_tensor(x), type2) -> alloc_tensor(x, type2)
-    // cvt(insert_slice(x), type2) -> extract_slice(cvt(x, type2))
     auto alloc_tensor = dyn_cast<triton::gpu::AllocTensorOp>(arg);
     if (alloc_tensor) {
       rewriter.replaceOpWithNewOp<triton::gpu::AllocTensorOp>(
           op, op->getResult(0).getType());
       return mlir::success();
     }
+    // cvt(insert_slice(x), type2) -> insert_slice(cvt(x, type2))
     auto insert_slice = dyn_cast<triton::gpu::InsertSliceAsyncOp>(arg);
     if (insert_slice) {
       auto newType = op->getResult(0).getType();
+      // Ensure that the new insert_slice op is placed in the same place as the
+      // old insert_slice op. Otherwise, the new insert_slice op may be placed
+      // after the async_wait op, which is not allowed.
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(insert_slice);
       auto new_arg = rewriter.create<triton::gpu::ConvertLayoutOp>(
           op->getLoc(), newType, insert_slice.dst());
       rewriter.replaceOpWithNewOp<triton::gpu::InsertSliceAsyncOp>(
@@ -126,6 +130,11 @@ public:
     auto extract_slice = dyn_cast<triton::gpu::ExtractSliceOp>(arg);
     if (extract_slice) {
       auto origType = extract_slice.src().getType().cast<RankedTensorType>();
+      // Ensure that the new extract_slice op is placed in the same place as the
+      // old extract_slice op. Otherwise, the new extract_slice op may be placed
+      // after the async_wait op, which is not allowed.
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(extract_slice);
       auto newType = RankedTensorType::get(
           origType.getShape(), origType.getElementType(),
           op->getResult(0).getType().cast<RankedTensorType>().getEncoding());
@@ -209,10 +218,10 @@ Operation *cloneWithInferType(mlir::PatternRewriter &rewriter, Operation *op,
   auto typeInfer = dyn_cast<InferTypeOpInterface>(newOp);
   if (typeInfer) {
     SmallVector<Type, 1> newType;
-    auto sucess = typeInfer.inferReturnTypes(
+    auto success = typeInfer.inferReturnTypes(
         newOp->getContext(), newOp->getLoc(), newOp->getOperands(),
         newOp->getAttrDictionary(), newOp->getRegions(), newType);
-    if (success)
+    if (succeeded(success))
       newOp->getResult(0).setType(newType.front());
   }
   return newOp;
@@ -354,10 +363,6 @@ public:
   rematerializeForLoop(mlir::PatternRewriter &rewriter, scf::ForOp &forOp,
                        size_t i, RankedTensorType newType,
                        triton::gpu::ConvertLayoutOp origConversion) const {
-
-    auto newEncoding = newType.cast<RankedTensorType>().getEncoding();
-    auto ctx = forOp.getContext();
-    auto isInLoop = [&](Operation *op) { return op->getParentOp() == forOp; };
     // Rewrite init argument
     Type origType = forOp.getInitArgs()[i].getType();
     SmallVector<Value, 4> newInitArgs = forOp.getInitArgs();
@@ -408,11 +413,10 @@ public:
     return newResults;
   }
 
-  mlir::LogicalResult matchAndRewrite(mlir::Operation *op,
-                                      mlir::PatternRewriter &rewriter) const {
-
+  mlir::LogicalResult
+  matchAndRewrite(mlir::Operation *op,
+                  mlir::PatternRewriter &rewriter) const override {
     auto forOp = cast<scf::ForOp>(op);
-    auto isInLoop = [&](Operation *op) { return op->getParentOp() == forOp; };
     auto iterArgs = forOp.getRegionIterArgs();
     for (auto iterArg : llvm::enumerate(iterArgs)) {
       // if (iterArg.index() != 1)
@@ -470,7 +474,6 @@ public:
     auto forOp = dyn_cast<scf::ForOp>(cvt->getParentOp());
     if (!forOp)
       return mlir::failure();
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     auto isInLoop = [&](Operation *op) { return op->getParentOp() == forOp; };
 
     SetVector<Operation *> cvtSlices;
