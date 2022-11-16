@@ -35,7 +35,7 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
   });
 
   //
-  // materailizations
+  // Materializations
   //
   // This will be called when (newArgType != origArgType)
   // This will create newArg, and map(origArg, newArg)
@@ -73,7 +73,7 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
 //
 TritonGPUConversionTarget::TritonGPUConversionTarget(
     MLIRContext &context, TritonGPUTypeConverter &typeConverter)
-    : ConversionTarget(context), typeConverter(typeConverter) {
+    : ConversionTarget(context) {
   // TODO: we should also verify ops of TritonGPUDialect
   addLegalDialect<triton::gpu::TritonGPUDialect>();
 
@@ -90,13 +90,13 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   });
 
   // We have requirements for the data layouts
-  addDynamicallyLegalOp<triton::DotOp>([this](triton::DotOp dotOp) -> bool {
+  addDynamicallyLegalOp<triton::DotOp>([](triton::DotOp dotOp) -> bool {
     Attribute aEncoding =
         dotOp.a().getType().cast<RankedTensorType>().getEncoding();
     Attribute bEncoding =
         dotOp.b().getType().cast<RankedTensorType>().getEncoding();
-    if (aEncoding && aEncoding.isa<triton::gpu::SharedEncodingAttr>() &&
-        bEncoding && bEncoding.isa<triton::gpu::SharedEncodingAttr>())
+    if (aEncoding && aEncoding.isa<triton::gpu::DotOperandEncodingAttr>() &&
+        bEncoding && bEncoding.isa<triton::gpu::DotOperandEncodingAttr>())
       return true;
     return false;
   });

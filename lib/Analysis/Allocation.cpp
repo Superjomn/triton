@@ -1,6 +1,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "triton/Analysis/Alias.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -11,9 +12,13 @@
 #include <numeric>
 
 using ::mlir::triton::gpu::BlockedEncodingAttr;
+using ::mlir::triton::gpu::DotOperandEncodingAttr;
+using ::mlir::triton::gpu::getOrder;
 using ::mlir::triton::gpu::getShapePerCTA;
+using ::mlir::triton::gpu::getSizePerThread;
 using ::mlir::triton::gpu::MmaEncodingAttr;
 using ::mlir::triton::gpu::SharedEncodingAttr;
+using ::mlir::triton::gpu::SliceEncodingAttr;
 
 namespace mlir {
 
@@ -21,6 +26,28 @@ namespace mlir {
 // Shared Memory Allocation Analysis
 //===----------------------------------------------------------------------===//
 namespace triton {
+
+constexpr int c_PtrBitWidth = 64; 
+
+static std::pair<SmallVector<unsigned>, SmallVector<unsigned>>
+getCvtOrder(const Attribute &srcLayout, const Attribute &dstLayout) {
+  auto srcBlockedLayout = srcLayout.dyn_cast<BlockedEncodingAttr>();
+  auto srcMmaLayout = srcLayout.dyn_cast<MmaEncodingAttr>();
+  auto srcDotLayout = srcLayout.dyn_cast<DotOperandEncodingAttr>();
+  auto dstBlockedLayout = dstLayout.dyn_cast<BlockedEncodingAttr>();
+  auto dstMmaLayout = dstLayout.dyn_cast<MmaEncodingAttr>();
+  auto dstDotLayout = dstLayout.dyn_cast<DotOperandEncodingAttr>();
+  assert(!(srcMmaLayout && dstMmaLayout) &&
+         "Unexpected mma -> mma layout conversion");
+  // mma or dot layout does not have an order, so the order depends on the
+  // layout of the other operand.
+  auto inOrd = (srcMmaLayout || srcDotLayout) ? getOrder(dstLayout)
+                                              : getOrder(srcLayout);
+  auto outOrd = (dstMmaLayout || dstDotLayout) ? getOrder(srcLayout)
+                                               : getOrder(dstLayout);
+
+  return {inOrd, outOrd};
+}
 
 SmallVector<unsigned>
 getScratchConfigForCvtLayout(triton::gpu::ConvertLayoutOp op, unsigned &inVec,
@@ -31,26 +58,9 @@ getScratchConfigForCvtLayout(triton::gpu::ConvertLayoutOp op, unsigned &inVec,
   Attribute dstLayout = dstTy.getEncoding();
   assert(srcLayout && dstLayout &&
          "Unexpect layout in getScratchConfigForCvtLayout()");
-  unsigned rank = dstTy.getRank();
-  SmallVector<unsigned> paddedRepShape(rank);
-  auto srcBlockedLayout = srcLayout.dyn_cast<BlockedEncodingAttr>();
-  auto srcMmaLayout = srcLayout.dyn_cast<MmaEncodingAttr>();
-  auto dstBlockedLayout = dstLayout.dyn_cast<BlockedEncodingAttr>();
-  auto dstMmaLayout = dstLayout.dyn_cast<MmaEncodingAttr>();
-  assert((srcBlockedLayout || srcMmaLayout) &&
-         "Unexpected srcLayout in getScratchConfigForCvtLayout");
-  assert((dstBlockedLayout || dstMmaLayout) &&
-         "Unexpected dstLayout in getScratchConfigForCvtLayout");
-  assert(!(srcMmaLayout && dstMmaLayout) &&
-         "Unexpected mma -> mma layout conversion");
-  auto inOrd =
-      srcMmaLayout ? dstBlockedLayout.getOrder() : srcBlockedLayout.getOrder();
-  auto outOrd =
-      dstMmaLayout ? srcBlockedLayout.getOrder() : dstBlockedLayout.getOrder();
-  unsigned srcContigPerThread =
-      srcBlockedLayout ? srcBlockedLayout.getSizePerThread()[inOrd[0]] : 2;
-  unsigned dstContigPerThread =
-      dstBlockedLayout ? dstBlockedLayout.getSizePerThread()[outOrd[0]] : 2;
+  auto [inOrd, outOrd] = getCvtOrder(srcLayout, dstLayout);
+  unsigned srcContigPerThread = getSizePerThread(srcLayout)[inOrd[0]];
+  unsigned dstContigPerThread = getSizePerThread(dstLayout)[outOrd[0]];
   // TODO: Fix the legacy issue that ourOrd[0] == 0 always means
   //       that we cannot do vectorization.
   inVec = outOrd[0] == 0 ? 1 : inOrd[0] == 0 ? 1 : srcContigPerThread;
@@ -59,18 +69,46 @@ getScratchConfigForCvtLayout(triton::gpu::ConvertLayoutOp op, unsigned &inVec,
   auto srcShapePerCTA = getShapePerCTA(srcLayout);
   auto dstShapePerCTA = getShapePerCTA(dstLayout);
 
+  unsigned rank = dstTy.getRank();
+  SmallVector<unsigned> paddedRepShape(rank);
   unsigned pad = std::max(inVec, outVec);
   for (unsigned d = 0; d < rank; ++d) {
     paddedRepShape[d] =
         std::max(std::min<unsigned>(srcTy.getShape()[d], srcShapePerCTA[d]),
                  std::min<unsigned>(dstTy.getShape()[d], dstShapePerCTA[d]));
   }
+  if (rank == 1)
+    return paddedRepShape;
   unsigned paddedDim = 1;
   if (auto dstBlockedLayout = dstLayout.dyn_cast<BlockedEncodingAttr>()) {
     paddedDim = dstBlockedLayout.getOrder()[0];
   }
   paddedRepShape[paddedDim] += pad;
   return paddedRepShape;
+}
+
+SmallVector<unsigned> getScratchConfigForReduce(triton::ReduceOp op) {
+  auto srcTy = op.operand().getType().cast<RankedTensorType>();
+  auto srcLayout = srcTy.getEncoding();
+  auto srcShape = srcTy.getShape();
+  auto axis = op.axis();
+
+  bool fastReduce = axis == getOrder(srcLayout)[0];
+
+  SmallVector<unsigned> smemShape;
+  for (auto d : srcShape)
+    smemShape.push_back(d);
+
+  if (fastReduce) {
+    unsigned sizeInterWarps = gpu::getWarpsPerCTA(srcLayout)[axis];
+    smemShape[axis] = sizeInterWarps;
+  } else {
+    unsigned threadsPerCTAAxis = gpu::getThreadsPerWarp(srcLayout)[axis] *
+                                 gpu::getWarpsPerCTA(srcLayout)[axis];
+    smemShape[axis] = threadsPerCTAAxis;
+  }
+
+  return smemShape;
 }
 
 class AllocationAnalysis {
@@ -102,7 +140,7 @@ private:
     // For example: %a = scf.if -> yield
     // %a must be allocated elsewhere by other operations.
     // FIXME(Keren): extract and insert are always alias for now
-    if (!maybeSharedAllocationOp(op) || isa<triton::gpu::ExtractSliceOp>(op) ||
+    if (!maybeSharedAllocationOp(op) || isa<tensor::ExtractSliceOp>(op) ||
         isa<triton::gpu::InsertSliceAsyncOp>(op)) {
       return;
     }
@@ -121,14 +159,21 @@ private:
 
   /// Initializes temporary shared memory for a given operation.
   void getScratchValueSize(Operation *op) {
-    // TODO(Keren): Add atomic ops
-    // TODO(Keren): Add convert ops
     if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
       // TODO(Keren): Reduce with index is not supported yet.
       auto value = op->getOperand(0);
       if (auto tensorType = value.getType().dyn_cast<RankedTensorType>()) {
-        auto bytes = tensorType.getNumElements() *
-                     tensorType.getElementTypeBitWidth() / 8;
+        auto srcLayout = tensorType.getEncoding();
+        bool fastReduce = reduceOp.axis() == getOrder(srcLayout)[0];
+        auto smemShape = getScratchConfigForReduce(reduceOp);
+        unsigned elems = std::accumulate(smemShape.begin(), smemShape.end(), 1,
+                                         std::multiplies{});
+        if (fastReduce) {
+          auto mod = op->getParentOfType<ModuleOp>();
+          unsigned numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
+          elems = std::max<unsigned>(elems, numWarps * 32);
+        }
+        auto bytes = elems * tensorType.getElementTypeBitWidth() / 8;
         allocation->addBuffer<BufferT::BufferKind::Scratch>(op, bytes);
       }
     } else if (auto cvtLayout = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
@@ -138,7 +183,7 @@ private:
       auto dstEncoding = dstTy.getEncoding();
       if (srcEncoding.isa<SharedEncodingAttr>() ||
           dstEncoding.isa<SharedEncodingAttr>()) {
-        // Only blocked -> blocked conversion requires for scratch allocation
+        // Conversions from/to shared memory do not need scratch memory.
         return;
       }
       // ConvertLayoutOp with both input/output non-shared_layout
@@ -150,7 +195,9 @@ private:
       auto smemShape = getScratchConfigForCvtLayout(cvtLayout, inVec, outVec);
       unsigned elems = std::accumulate(smemShape.begin(), smemShape.end(), 1,
                                        std::multiplies{});
-      auto bytes = elems * srcTy.getElementTypeBitWidth() / 8;
+      auto bytes = srcTy.getElementType().isa<triton::PointerType>()? 
+                   elems * c_PtrBitWidth / 8 :
+                   elems * srcTy.getElementTypeBitWidth() / 8;
       allocation->addBuffer<BufferT::BufferKind::Scratch>(op, bytes);
     }
   }
@@ -199,7 +246,7 @@ private:
     }
   }
 
-  /// Extends the liveness range by unioning the liveness range of the aliased
+  /// Extends the liveness range by unionizing the liveness range of the aliased
   /// values because each allocated buffer could be an alias of others, if block
   /// arguments are involved.
   void resolveAliasBufferLiveness(

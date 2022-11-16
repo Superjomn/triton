@@ -48,6 +48,8 @@ class dtype:
     SINT_TYPES = ['int1', 'int8', 'int16', 'int32', 'int64']
     UINT_TYPES = ['uint8', 'uint16', 'uint32', 'uint64']
     FP_TYPES = ['fp8', 'fp16', 'bf16', 'fp32', 'fp64']
+    CUSTOMIZED_FP_TYPES = ['fp8']
+    STANDARD_FP_TYPES = ['fp16', 'bf16', 'fp32', 'fp64']
     OTHER_TYPES = ['void']
 
     class SIGNEDNESS(Enum):
@@ -129,8 +131,17 @@ class dtype:
     def is_floating(self):
         return self.name in dtype.FP_TYPES
 
+    def is_customized_floating(self):
+        return self.name in dtype.CUSTOMIZED_FP_TYPES
+
+    def is_standard_floating(self):
+        return self.name in dtype.STANDARD_FP_TYPES
+
     def is_int_signed(self):
         return self.name in dtype.SINT_TYPES
+
+    def is_int_unsigned(self):
+        return self.name in dtype.UINT_TYPES
 
     def is_int(self):
         return self.name in dtype.SINT_TYPES + dtype.UINT_TYPES
@@ -461,9 +472,19 @@ class tensor:
         return semantic.floordiv(self, other, _builder)
 
     @builtin
+    def __rfloordiv__(self, other, _builder=None):
+        other = _to_tensor(other, _builder)
+        return semantic.floordiv(other, self, _builder)
+
+    @builtin
     def __mod__(self, other, _builder=None):
         other = _to_tensor(other, _builder)
         return semantic.mod(self, other, _builder)
+
+    @builtin
+    def __rmod__(self, other, _builder=None):
+        other = _to_tensor(other, _builder)
+        return semantic.mod(other, self, _builder)
 
     # unary operators
     @builtin
@@ -533,6 +554,7 @@ class tensor:
 
     @builtin
     def __rlt__(self, other, _builder=None):
+        other = _to_tensor(other, _builder)
         return semantic.less_than(other, self, _builder)
 
     # <=
@@ -721,9 +743,10 @@ def cat(input, other, _builder=None):
 
 
 @builtin
-def reshape(input, shape, _builder=None):
+def view(input, shape, _builder=None):
     """
-    Tries to reshape the given tensor to a new shape.
+    Returns a tensor with the same elements as `input` but a different shape.
+    The order of the elements may not be preserved.
 
     :param input: The input tensor.
     :type input:
@@ -732,7 +755,7 @@ def reshape(input, shape, _builder=None):
 
     """
     shape = [x.value for x in shape]
-    return semantic.reshape(input, shape, _builder)
+    return semantic.view(input, shape, _builder)
 
 
 # -----------------------
@@ -745,7 +768,7 @@ def dot(input, other, allow_tf32=True, trans_a=False, trans_b=False, _builder=No
     """
     Returns the matrix product of two blocks.
 
-    The two blocks must be two dimensionals and have compatible inner dimensions.
+    The two blocks must be two-dimensional and have compatible inner dimensions.
 
     :param input: The first tensor to be multiplied.
     :type input: 2D tensor of scalar-type in {:code:`float16`, :code:`bfloat16`, :code:`float32`}
@@ -1041,21 +1064,35 @@ def debug_barrier(_builder=None):
 
 
 @builtin
-def multiple_of(input, value, _builder=None):
+def multiple_of(input, values, _builder=None):
     """
     Let the compiler knows that the values in :code:`input` are all multiples of :code:`value`.
     """
-    value = _constexpr_to_value(value)
-    return semantic.multiple_of(input, value)
+    if isinstance(values, constexpr):
+        values = [values]
+    for i, d in enumerate(values):
+        if not isinstance(d, constexpr):
+            raise TypeError(f"values element {i} must have type `constexpr`")
+        if not isinstance(d.value, int):
+            raise TypeError(f"values element {i} must have type `constexpr[int]`, got `constexpr[{type(d.value)}]")
+    values = [x.value for x in values]
+    return semantic.multiple_of(input, values)
 
 
 @builtin
-def max_contiguous(input, value, _builder=None):
+def max_contiguous(input, values, _builder=None):
     """
     Let the compiler knows that the `value` first values in :code:`input` are contiguous.
     """
-    value = _constexpr_to_value(value)
-    return semantic.max_contiguous(input, value)
+    if isinstance(values, constexpr):
+        values = [values]
+    for i, d in enumerate(values):
+        if not isinstance(d, constexpr):
+            raise TypeError(f"values element {i} must have type `constexpr`")
+        if not isinstance(d.value, int):
+            raise TypeError(f"values element {i} must have type `constexpr[int]`, got `constexpr[{type(d.value)}]")
+    values = [x.value for x in values]
+    return semantic.max_contiguous(input, values)
 
 
 # -----------------------
@@ -1129,13 +1166,13 @@ def ravel(x):
     :param x: the input tensor
     :type x: Block
     """
-    return triton.language.reshape(x, [x.numel])
+    return triton.language.view(x, [x.numel])
 
 
 @triton.jit
 def swizzle2d(i, j, size_i, size_j, size_g):
     """
-    transformes indices of a row-major size_i*size_j matrix into those
+    Transforms indices of a row-major size_i*size_j matrix into those
     of one where indices are row major for each group of size_j rows.
     For example, for size_i = size_j = 4 and size_g = 2, it will transform
     [[0 , 1 , 2 , 3 ],
@@ -1168,3 +1205,22 @@ def swizzle2d(i, j, size_i, size_j, size_g):
 @triton.jit
 def zeros_like(input):
     return zeros(input.shape, input.dtype)
+
+
+@builtin
+def printf(prefix, *args, _builder=None):
+    import string
+    new_prefix = prefix
+    if isinstance(prefix, constexpr):
+        new_prefix = prefix.value
+    assert isinstance(new_prefix, str), f"{new_prefix} is not string"
+    b_ascii = True
+    for ch in new_prefix:
+        if ch not in string.printable:
+            b_ascii = False
+            break
+    assert b_ascii, f"{new_prefix} is not an ascii string"
+    new_args = []
+    for arg in args:
+        new_args.append(_to_tensor(arg, _builder))
+    return semantic.printf(new_prefix, new_args, _builder)

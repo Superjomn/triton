@@ -15,15 +15,15 @@ class Location;
 namespace triton {
 using llvm::StringRef;
 
-class PTXInstr;
-class PTXInstrCommon;
-class PTXInstrExecution;
+struct PTXInstr;
+struct PTXInstrCommon;
+struct PTXInstrExecution;
 
 // PTXBuilder helps to manage a PTX asm program consists of one or multiple
 // instructions.
 //
-// A helper for building a ASM program, the objective of PTXBuilder is to give a
-// thin encapsulation and make the ASM code for MLIR LLVM Dialect more clear.
+// A helper for building an ASM program, the objective of PTXBuilder is to give
+// a thin encapsulation and make the ASM code for MLIR LLVM Dialect more clear.
 // Currently, several factors are introduced to reduce the need for mixing
 // string and C++ if-else code.
 //
@@ -83,7 +83,7 @@ struct PTXBuilder {
     Operand() = default;
     Operand(const Operation &) = delete;
     Operand(Value value, StringRef constraint)
-        : value(value), constraint(constraint) {}
+        : constraint(constraint), value(value) {}
 
     bool isList() const { return !value && constraint.empty(); }
 
@@ -120,7 +120,7 @@ struct PTXBuilder {
   Operand *newListOperand(unsigned count, mlir::Value val,
                           const std::string &constraint) {
     auto *list = newOperand();
-    for (int i = 0; i < count; ++i) {
+    for (unsigned i = 0; i < count; ++i) {
       list->listAppend(newOperand(val, constraint));
     }
     return list;
@@ -128,7 +128,7 @@ struct PTXBuilder {
 
   Operand *newListOperand(unsigned count, const std::string &constraint) {
     auto *list = newOperand();
-    for (int i = 0; i < count; ++i) {
+    for (unsigned i = 0; i < count; ++i) {
       list->listAppend(newOperand(constraint));
     }
     return list;
@@ -147,7 +147,7 @@ struct PTXBuilder {
   Operand *newOperand(StringRef constraint);
 
   // Create a constant integer operand.
-  Operand *newConstantOperand(int v);
+  Operand *newConstantOperand(int64_t v);
   // Create a constant operand with explicit code specified.
   Operand *newConstantOperand(const std::string &v);
 
@@ -172,8 +172,24 @@ private:
     return argArchive.back().get();
   }
 
-  friend class PTXInstr;
-  friend class PTXInstrCommon;
+  // Make the oprands in argArchive follow the provided \param order.
+  void reorderArgArchive(ArrayRef<Operand *> order) {
+    assert(order.size() == argArchive.size());
+    // The order in argArchive is unnecessary when onlyAttachMLIRArgs=false, but
+    // it do necessary when onlyAttachMLIRArgs is true for the $0,$1.. are
+    // determined by PTX code snippet passed from external.
+    sort(argArchive.begin(), argArchive.end(),
+         [&](std::unique_ptr<Operand> &a, std::unique_ptr<Operand> &b) {
+           auto ida = std::find(order.begin(), order.end(), a.get());
+           auto idb = std::find(order.begin(), order.end(), b.get());
+           assert(ida != order.end());
+           assert(idb != order.end());
+           return ida < idb;
+         });
+  }
+
+  friend struct PTXInstr;
+  friend struct PTXInstrCommon;
 
 protected:
   llvm::SmallVector<std::unique_ptr<Operand>, 6> argArchive;
@@ -201,15 +217,22 @@ struct PTXInstrCommon {
   // clang-format on
 
   // Set operands of this instruction.
-  PTXInstrExecution &operator()(llvm::ArrayRef<Operand *> oprs);
+  PTXInstrExecution &operator()(llvm::ArrayRef<Operand *> oprs,
+                                bool onlyAttachMLIRArgs = false);
 
 protected:
-  PTXInstrExecution &call(llvm::ArrayRef<Operand *> oprs);
+  // "Call" the instruction with operands.
+  // \param oprs The operands of this instruction.
+  // \param onlyAttachMLIRArgs Indicate that it simply attach the MLIR Arguments
+  // to the inline Asm without generating the operand ids(such as $0, $1) in PTX
+  // code.
+  PTXInstrExecution &call(llvm::ArrayRef<Operand *> oprs,
+                          bool onlyAttachMLIRArgs = false);
 
   PTXBuilder *builder{};
   llvm::SmallVector<std::string, 4> instrParts;
 
-  friend class PTXInstrExecution;
+  friend struct PTXInstrExecution;
 };
 
 template <class ConcreteT> struct PTXInstrBase : public PTXInstrCommon {
@@ -234,66 +257,18 @@ template <class ConcreteT> struct PTXInstrBase : public PTXInstrCommon {
 
 struct PTXInstr : public PTXInstrBase<PTXInstr> {
   using PTXInstrBase<PTXInstr>::PTXInstrBase;
-};
 
-// A helper for PTX ld/st instruction.
-// Usage:
-// PtxIOInstr store("st");
-// store.predicate(pValue).global().v(32).b(1); // @%0 st.global.v32.b1
-// store.addAddr(addrValue, "l", off);
-struct PTXIOInstr : public PTXInstrBase<PTXIOInstr> {
-  using PTXInstrBase<PTXIOInstr>::PTXInstrBase;
+  // Append a ".global" to the instruction.
+  PTXInstr &global();
 
-  // Add ".global" suffix to instruction
-  PTXIOInstr &global(bool predicate = true) {
-    o("global", predicate);
-    return *this;
-  }
+  // Append a ".shared" to the instruction.
+  PTXInstr &shared();
 
-  // Add ".v" suffix to instruction
-  PTXIOInstr &v(int vecWidth, bool predicate = true) {
-    if (vecWidth > 1) {
-      o("v" + std::to_string(vecWidth), predicate);
-    }
-    return *this;
-  }
+  // Append a ".v[0-9]+" to the instruction
+  PTXInstr &v(int vecWidth, bool predicate = true);
 
-  // Add ".b" suffix to instruction
-  PTXIOInstr &b(int width) {
-    o("b" + std::to_string(width));
-    return *this;
-  }
-};
-
-struct PTXCpAsyncInstrBase : public PTXInstrBase<PTXCpAsyncInstrBase> {
-  explicit PTXCpAsyncInstrBase(PTXBuilder *builder)
-      : PTXInstrBase(builder, "cp.async") {}
-};
-
-struct PTXCpAsyncCommitGroupInstr : public PTXCpAsyncInstrBase {
-  explicit PTXCpAsyncCommitGroupInstr(PTXBuilder *builder)
-      : PTXCpAsyncInstrBase(builder) {
-    o("commit_group");
-  }
-};
-
-struct PTXCpAsyncWaitGroupInstr : public PTXCpAsyncInstrBase {
-  explicit PTXCpAsyncWaitGroupInstr(PTXBuilder *builder)
-      : PTXCpAsyncInstrBase(builder) {
-    o("wait_group");
-  }
-};
-
-struct PTXCpAsyncLoadInstr : public PTXCpAsyncInstrBase {
-  explicit PTXCpAsyncLoadInstr(PTXBuilder *builder,
-                               triton::CacheModifier modifier,
-                               triton::EvictionPolicy policy)
-      : PTXCpAsyncInstrBase(builder) {
-    o(triton::stringifyCacheModifier(modifier).str());
-    o("shared");
-    o("global");
-    o("L2::" + triton::stringifyEvictionPolicy(policy).str());
-  }
+  // Append a".b[0-9]+" to the instruction
+  PTXInstr &b(int width);
 };
 
 // Record the operands and context for "launching" a PtxInstr.
@@ -304,8 +279,10 @@ struct PTXInstrExecution {
 
   PTXInstrExecution() = default;
   explicit PTXInstrExecution(PTXInstrCommon *instr,
-                             llvm::ArrayRef<Operand *> oprs)
-      : instr(instr), argsInOrder(oprs.begin(), oprs.end()) {}
+                             llvm::ArrayRef<Operand *> oprs,
+                             bool onlyAttachMLIRArgs)
+      : argsInOrder(oprs.begin(), oprs.end()), instr(instr),
+        onlyAttachMLIRArgs(onlyAttachMLIRArgs) {}
 
   // Prefix a predicate to the instruction.
   PTXInstrExecution &predicate(mlir::Value value, StringRef constraint = "b") {
@@ -316,7 +293,7 @@ struct PTXInstrExecution {
   // Prefix a !predicate to the instruction.
   PTXInstrExecution &predicateNot(mlir::Value value, StringRef constraint) {
     pred = instr->builder->newOperand(value, constraint);
-    pred->repr = [](int idx) { return "@!%" + std::to_string(idx); };
+    pred->repr = [](int idx) { return "@!$" + std::to_string(idx); };
     return *this;
   }
 
@@ -326,6 +303,22 @@ struct PTXInstrExecution {
 
   PTXInstrCommon *instr{};
   Operand *pred{};
+  bool onlyAttachMLIRArgs{};
+};
+
+//// =============================== Some instruction wrappers
+///===============================
+// We add the wrappers to make the usage more intuitive by avoiding mixing the
+// PTX code with some trivial C++ code.
+
+struct PTXCpAsyncLoadInstr : PTXInstrBase<PTXCpAsyncLoadInstr> {
+  explicit PTXCpAsyncLoadInstr(PTXBuilder *builder,
+                               triton::CacheModifier modifier)
+      : PTXInstrBase(builder, "cp.async") {
+    o(triton::stringifyCacheModifier(modifier).str());
+    o("shared");
+    o("global");
+  }
 };
 
 } // namespace triton

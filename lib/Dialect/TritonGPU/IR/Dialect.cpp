@@ -42,9 +42,11 @@ static Type getPointeeType(Type type) {
 
 namespace gpu {
 
-// TODO: Inheritation of layout attributes
+// TODO: Inheritance of layout attributes
+// so that all distributed layouts implement
+// these utilities
+
 unsigned getElemsPerThread(Attribute layout, ArrayRef<int64_t> shape) {
-  size_t rank = shape.size();
   if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
     return blockedLayout.getElemsPerThread(shape);
   } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
@@ -53,20 +55,85 @@ unsigned getElemsPerThread(Attribute layout, ArrayRef<int64_t> shape) {
     return mmaLayout.getElemsPerThread(shape);
   } else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>()) {
     return sharedLayout.getElemsPerThread(shape);
+  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
+    return dotLayout.getElemsPerThread(shape);
   } else {
     assert(0 && "getElemsPerThread not implemented");
     return 0;
   }
 }
 
+unsigned getElemsPerThread(Type type) {
+  if (type.isIntOrIndexOrFloat() || type.isa<triton::Float8Type>() ||
+      type.isa<triton::PointerType>())
+    return 1;
+  auto tensorType = type.cast<RankedTensorType>();
+  return getElemsPerThread(tensorType.getEncoding(), tensorType.getShape());
+}
+
+SmallVector<unsigned> getThreadsPerWarp(Attribute layout) {
+  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
+    return SmallVector<unsigned>(blockedLayout.getThreadsPerWarp().begin(),
+                                 blockedLayout.getThreadsPerWarp().end());
+  }
+  if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
+    if (mmaLayout.getVersion() == 1)
+      return SmallVector<unsigned>{4, 8};
+    if (mmaLayout.getVersion() == 2)
+      return SmallVector<unsigned>{8, 4};
+  }
+  assert(0 && "getThreadsPerWarp not implemented");
+  return {};
+}
+
+SmallVector<unsigned> getWarpsPerCTA(Attribute layout) {
+  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
+    return SmallVector<unsigned>(blockedLayout.getWarpsPerCTA().begin(),
+                                 blockedLayout.getWarpsPerCTA().end());
+  }
+  if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
+    return SmallVector<unsigned>(mmaLayout.getWarpsPerCTA().begin(),
+                                 mmaLayout.getWarpsPerCTA().end());
+  }
+  assert(0 && "getWarpsPerCTA not implemented");
+  return {};
+}
+
 SmallVector<unsigned> getSizePerThread(Attribute layout) {
   if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
     return SmallVector<unsigned>(blockedLayout.getSizePerThread().begin(),
                                  blockedLayout.getSizePerThread().end());
+  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
+    return getSizePerThread(sliceLayout.getParent());
   } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    assert(mmaLayout.getVersion() == 2 &&
-           "mmaLayout version = 1 is not implemented yet");
-    return SmallVector<unsigned>{2, 2};
+    if (mmaLayout.getVersion() == 2) {
+      return SmallVector<unsigned>{2, 2};
+    } else if (mmaLayout.getVersion() == 1) {
+      return SmallVector<unsigned>{2, 4};
+    } else {
+      llvm_unreachable("Unexpected mma version");
+    }
+  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
+    auto parentLayout = dotLayout.getParent();
+    assert(parentLayout && "DotOperandEncodingAttr must have a parent");
+    if (auto parentMmaLayout = parentLayout.dyn_cast<MmaEncodingAttr>()) {
+      assert(parentMmaLayout.getVersion() == 2 &&
+             "mmaLayout version = 1 is not implemented yet");
+      auto parentShapePerCTA = getShapePerCTA(parentLayout);
+      auto opIdx = dotLayout.getOpIdx();
+      if (opIdx == 0) {
+        return {2, 4};
+      } else if (opIdx == 1) {
+        return {4, 1};
+      } else {
+        assert(0 && "DotOperandEncodingAttr opIdx must be 0 or 1");
+        return {};
+      }
+    } else {
+      assert(0 && "DotOperandEncodingAttr non-MmaEncodingAttr parent not "
+                  "supported yet");
+      return {};
+    }
   } else {
     assert(0 && "getSizePerThread not implemented");
     return {};
@@ -91,15 +158,56 @@ SmallVector<unsigned> getThreadsPerCTA(const Attribute &layout) {
 SmallVector<unsigned> getShapePerCTA(const Attribute &layout) {
   SmallVector<unsigned> shape;
   if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    for (int d = 0, n = blockedLayout.getOrder().size(); d < n; ++d)
+    for (unsigned d = 0, n = blockedLayout.getOrder().size(); d < n; ++d)
       shape.push_back(blockedLayout.getSizePerThread()[d] *
                       blockedLayout.getThreadsPerWarp()[d] *
                       blockedLayout.getWarpsPerCTA()[d]);
+  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
+    unsigned dim = sliceLayout.getDim();
+    auto parent = sliceLayout.getParent();
+    for (unsigned d = 0, n = getOrder(parent).size(); d < n; ++d) {
+      if (d == dim)
+        continue;
+      shape.push_back(getSizePerThread(parent)[d] *
+                      getThreadsPerWarp(parent)[d] * getWarpsPerCTA(parent)[d]);
+    }
   } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    assert(mmaLayout.getVersion() == 2 &&
-           "mmaLayout version = 1 is not implemented yet");
-    return {16 * mmaLayout.getWarpsPerCTA()[0],
-            8 * mmaLayout.getWarpsPerCTA()[1]};
+    if (mmaLayout.getVersion() == 2)
+      return {16 * mmaLayout.getWarpsPerCTA()[0],
+              8 * mmaLayout.getWarpsPerCTA()[1]};
+    if (mmaLayout.getVersion() == 1)
+      return {16 * mmaLayout.getWarpsPerCTA()[0],
+              16 * mmaLayout.getWarpsPerCTA()[1]};
+    assert(0 && "Unexpected MMA layout version found");
+  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
+    auto parentLayout = dotLayout.getParent();
+    assert(parentLayout && "DotOperandEncodingAttr must have a parent");
+    if (auto parentMmaLayout = parentLayout.dyn_cast<MmaEncodingAttr>()) {
+      assert(parentMmaLayout.getVersion() == 2 &&
+             "mmaLayout version = 1 is not implemented yet");
+      auto parentShapePerCTA = getShapePerCTA(parentLayout);
+      auto opIdx = dotLayout.getOpIdx();
+      if (opIdx == 0) {
+        return {parentShapePerCTA[0], 16};
+      } else if (opIdx == 1) {
+        return {16, parentShapePerCTA[1]};
+      } else {
+        assert(0 && "DotOperandEncodingAttr opIdx must be 0 or 1");
+      }
+    } else {
+      assert(0 && "DotOperandEncodingAttr non-MmaEncodingAttr parent not "
+                  "supported yet");
+    }
+  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
+    if (mmaLayout.getVersion() == 2) {
+      return {16 * mmaLayout.getWarpsPerCTA()[0],
+              8 * mmaLayout.getWarpsPerCTA()[1]};
+    } else if (mmaLayout.getVersion() == 1) {
+      return {16 * mmaLayout.getWarpsPerCTA()[0],
+              16 * mmaLayout.getWarpsPerCTA()[1]};
+    } else {
+      llvm_unreachable("Unexpected mma version");
+    }
   } else {
     assert(0 && "Unimplemented usage of getShapePerCTA");
   }
@@ -112,6 +220,21 @@ SmallVector<unsigned> getOrder(const Attribute &layout) {
                                  blockedLayout.getOrder().end());
   } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
     return SmallVector<unsigned>{1, 0};
+  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
+    return SmallVector<unsigned>{1, 0};
+  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
+    SmallVector<unsigned> parentOrder = getOrder(sliceLayout.getParent());
+    unsigned dim = sliceLayout.getDim();
+    SmallVector<unsigned> order;
+    for (unsigned d : parentOrder) {
+      if (d == dim)
+        continue;
+      else if (d > dim)
+        order.push_back(d - 1);
+      else
+        order.push_back(d);
+    }
+    return order;
   } else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>()) {
     return SmallVector<unsigned>(sharedLayout.getOrder().begin(),
                                  sharedLayout.getOrder().end());
@@ -206,41 +329,68 @@ unsigned BlockedEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape) const {
   return product<unsigned>(elemsPerThread);
 }
 
+template <class T>
+SmallVector<T> SliceEncodingAttr::paddedShape(ArrayRef<T> shape) const {
+  size_t rank = shape.size();
+  unsigned dim = getDim();
+  SmallVector<T> retShape(rank + 1);
+  for (unsigned d = 0; d < rank + 1; ++d) {
+    if (d < dim)
+      retShape[d] = shape[d];
+    else if (d == dim)
+      retShape[d] = 1;
+    else
+      retShape[d] = shape[d - 1];
+  }
+  return retShape;
+}
+template SmallVector<unsigned>
+SliceEncodingAttr::paddedShape<unsigned>(ArrayRef<unsigned> shape) const;
+template SmallVector<int64_t>
+SliceEncodingAttr::paddedShape<int64_t>(ArrayRef<int64_t> shape) const;
+
 unsigned SliceEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape) const {
   size_t rank = shape.size();
   auto parent = getParent();
-  unsigned dim = getDim();
-  if (auto blockedParent = parent.dyn_cast<BlockedEncodingAttr>()) {
-    assert(rank == blockedParent.getSizePerThread().size() - 1 &&
-           "unexpected rank in SliceEncodingAttr::getElemsPerThread");
-    SmallVector<int64_t> paddedShape(rank + 1);
-    for (unsigned d = 0; d < rank + 1; ++d) {
-      if (d < dim)
-        paddedShape[d] = shape[d];
-      else if (d == dim)
-        paddedShape[d] = 1;
-      else
-        paddedShape[d] = shape[d - 1];
-    }
-    return blockedParent.getElemsPerThread(paddedShape);
-  } else {
-    assert(0 && "getElemsPerThread not implemented");
-    return 0;
-  }
+  return ::getElemsPerThread(parent, paddedShape(shape));
 }
 
 unsigned MmaEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape) const {
   size_t rank = shape.size();
   assert(rank == 2 && "Unexpected rank of mma layout");
-  assert(getVersion() == 2 && "mmaLayout version = 1 is not implemented yet");
-  unsigned elemsCol = ceil<unsigned>(shape[0], 16 * getWarpsPerCTA()[0]) * 2;
-  unsigned elemsRow = ceil<unsigned>(shape[1], 8 * getWarpsPerCTA()[1]) * 2;
-  return elemsCol * elemsRow;
+  assert((getVersion() == 1 || getVersion() == 2) &&
+         "Only version 1 and 2 is supported");
+
+  int res = 0;
+  if (getVersion() == 1) {
+    unsigned mmasRow = ceil<unsigned>(shape[0], 16 * getWarpsPerCTA()[0]);
+    unsigned mmasCol = ceil<unsigned>(shape[1], 16 * getWarpsPerCTA()[1]);
+    // Each warp-level mma884 will perform a m16xn16xk4 mma, thus get a m16xn16
+    // matrix as result.
+    res = mmasRow * mmasCol * (16 * 16 / 32);
+  } else if (getVersion() == 2) {
+    unsigned elemsCol = ceil<unsigned>(shape[0], 16 * getWarpsPerCTA()[0]) * 2;
+    unsigned elemsRow = ceil<unsigned>(shape[1], 8 * getWarpsPerCTA()[1]) * 2;
+    res = elemsCol * elemsRow;
+  } else {
+    llvm_unreachable("Unexpected mma version");
+  }
+
+  return res;
 }
 
 unsigned SharedEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape) const {
   // TODO:
   assert(0 && "SharedEncodingAttr::getElemsPerThread not implemented");
+  return 0;
+}
+
+unsigned
+DotOperandEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape) const {
+  if (auto blockedLayout = getParent().dyn_cast<BlockedEncodingAttr>()) {
+    return blockedLayout.getElemsPerThread(shape);
+  }
+  assert(0 && "DotOperandEncodingAttr::getElemsPerThread not implemented");
   return 0;
 }
 
@@ -416,75 +566,6 @@ void SharedEncodingAttr::print(AsmPrinter &printer) const {
 }
 
 //===----------------------------------------------------------------------===//
-// InsertSliceAsyncOp
-//===----------------------------------------------------------------------===//
-
-ParseResult parseInsertSliceAsyncOp(OpAsmParser &parser,
-                                    OperationState &result) {
-  SmallVector<OpAsmParser::OperandType, 4> allOperands;
-  Type srcType, dstType;
-  SMLoc allOperandLoc = parser.getCurrentLocation();
-  if (parser.parseOperandList(allOperands) ||
-      parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
-      parser.parseCustomTypeWithFallback(srcType) || parser.parseArrow() ||
-      parser.parseCustomTypeWithFallback(dstType))
-    return failure();
-  result.addTypes(dstType);
-
-  SmallVector<Type> operandTypes;
-  operandTypes.push_back(srcType); // src
-  operandTypes.push_back(dstType); // dst
-  operandTypes.push_back(
-      IntegerType::get(parser.getBuilder().getContext(), 32)); // index
-  if (allOperands.size() >= 4)
-    operandTypes.push_back(triton::getI1SameShape(srcType)); // mask
-  if (allOperands.size() >= 5)
-    operandTypes.push_back(triton::getPointeeType(srcType)); // other
-
-  if (parser.resolveOperands(allOperands, operandTypes, allOperandLoc,
-                             result.operands))
-    return failure();
-  return success();
-}
-
-void printInsertSliceAsyncOp(OpAsmPrinter &printer,
-                             InsertSliceAsyncOp insertSliceAsyncOp) {
-  printer << " ";
-  printer << insertSliceAsyncOp.getOperation()->getOperands();
-  printer.printOptionalAttrDict(insertSliceAsyncOp->getAttrs(),
-                                /*elidedAttrs=*/{});
-  printer << " : ";
-  printer.printStrippedAttrOrType(insertSliceAsyncOp.src().getType());
-  printer << " -> ";
-  printer.printStrippedAttrOrType(insertSliceAsyncOp.result().getType());
-}
-
-//===----------------------------------------------------------------------===//
-// ExtractSliceOp
-//===----------------------------------------------------------------------===//
-
-mlir::LogicalResult ExtractSliceOp::inferReturnTypes(
-    ::mlir::MLIRContext *context, llvm::Optional<::mlir::Location> location,
-    ::mlir::ValueRange operands, mlir::DictionaryAttr attributes,
-    ::mlir::RegionRange regions,
-    llvm::SmallVectorImpl<::mlir::Type> &inferredReturnTypes) {
-  auto srcType = operands[0].getType().cast<RankedTensorType>();
-  auto encoding = srcType.getEncoding();
-  auto srcShape = srcType.getShape();
-  auto axis = attributes.get("axis").cast<IntegerAttr>().getInt();
-  if (axis < 0 || axis > srcShape.size())
-    return failure();
-  SmallVector<int64_t, 4> dstShape;
-  for (int i = 0; i < srcShape.size(); i++)
-    if (i != axis)
-      dstShape.push_back(srcShape[i]);
-  auto returnType =
-      RankedTensorType::get(dstShape, srcType.getElementType(), encoding);
-  inferredReturnTypes.assign({returnType});
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
 // DotOperand Encoding
 //===----------------------------------------------------------------------===//
 Attribute DotOperandEncodingAttr::parse(AsmParser &parser, Type type) {
@@ -506,6 +587,65 @@ void DotOperandEncodingAttr::print(mlir::AsmPrinter &printer) const {
   printer << "<{"
           << "opIdx = " << getOpIdx() << ", "
           << "parent = " << getParent() << "}>";
+}
+
+//===----------------------------------------------------------------------===//
+// InsertSliceAsyncOp
+//===----------------------------------------------------------------------===//
+
+ParseResult parseInsertSliceAsyncOp(OpAsmParser &parser,
+                                    OperationState &result) {
+  SmallVector<OpAsmParser::OperandType, 8> allOperands;
+  Type srcType, dstType;
+  SMLoc allOperandLoc = parser.getCurrentLocation();
+  if (parser.parseOperandList(allOperands) ||
+      parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
+      parser.parseCustomTypeWithFallback(srcType) || parser.parseArrow() ||
+      parser.parseCustomTypeWithFallback(dstType))
+    return failure();
+  result.addTypes(dstType);
+
+  SmallVector<Type> operandTypes;
+  operandTypes.push_back(srcType); // src
+  operandTypes.push_back(dstType); // dst
+  operandTypes.push_back(
+      IntegerType::get(parser.getBuilder().getContext(), 32)); // index
+
+  int hasMask = 0, hasOther = 0;
+  if (allOperands.size() >= 4) {
+    operandTypes.push_back(triton::getI1SameShape(srcType)); // mask
+    hasMask = 1;
+  }
+  if (allOperands.size() >= 5) {
+    operandTypes.push_back(triton::getPointeeType(srcType)); // other
+    hasOther = 1;
+  }
+
+  if (parser.resolveOperands(allOperands, operandTypes, allOperandLoc,
+                             result.operands))
+    return failure();
+
+  // Deduce operand_segment_sizes from the number of the operands.
+  auto operand_segment_sizesAttrName =
+      InsertSliceAsyncOp::operand_segment_sizesAttrName(result.name);
+  result.addAttribute(
+      operand_segment_sizesAttrName,
+      parser.getBuilder().getI32VectorAttr({1, 1, 1, hasMask, hasOther}));
+  return success();
+}
+
+void printInsertSliceAsyncOp(OpAsmPrinter &printer,
+                             InsertSliceAsyncOp insertSliceAsyncOp) {
+  printer << " ";
+  printer << insertSliceAsyncOp.getOperation()->getOperands();
+  // "operand_segment_sizes" can be deduced, so we don't print it.
+  printer.printOptionalAttrDict(
+      insertSliceAsyncOp->getAttrs(),
+      {insertSliceAsyncOp.operand_segment_sizesAttrName()});
+  printer << " : ";
+  printer.printStrippedAttrOrType(insertSliceAsyncOp.src().getType());
+  printer << " -> ";
+  printer.printStrippedAttrOrType(insertSliceAsyncOp.result().getType());
 }
 
 //===----------------------------------------------------------------------===//
@@ -538,27 +678,40 @@ struct TritonGPUInferLayoutInterface
     : public triton::DialectInferLayoutInterface {
   using DialectInferLayoutInterface::DialectInferLayoutInterface;
 
-  LogicalResult inferReduceOpEncoding(Attribute operandEncoding, int axis,
-                                      Attribute &resultEncoding) const {
+  LogicalResult
+  inferReduceOpEncoding(Attribute operandEncoding, unsigned axis,
+                        Attribute &resultEncoding) const override {
     resultEncoding = SliceEncodingAttr::get(getDialect()->getContext(), axis,
                                             operandEncoding);
     return success();
   }
 
-  LogicalResult inferExpandDimsOpEncoding(Attribute operandEncoding, int axis,
-                                          Attribute &resultEncoding) const {
+  LogicalResult
+  inferExpandDimsOpEncoding(Attribute operandEncoding, unsigned axis,
+                            Attribute &resultEncoding,
+                            Optional<Location> location) const override {
     auto sliceEncoding = operandEncoding.dyn_cast<SliceEncodingAttr>();
-    if (!sliceEncoding) {
-      llvm::report_fatal_error(
-          "ExpandDimsOp operand encoding must be SliceEncodingAttr");
-      return failure();
-    }
-    if (sliceEncoding.getDim() != axis) {
-      llvm::report_fatal_error(
-          "Incompatible slice dimension for ExpandDimsOp operand");
-      return failure();
-    }
+    if (!sliceEncoding)
+      return emitOptionalError(
+          location, "ExpandDimsOp operand encoding must be SliceEncodingAttr");
+    if (sliceEncoding.getDim() != axis)
+      return emitOptionalError(
+          location, "Incompatible slice dimension for ExpandDimsOp operand");
     resultEncoding = sliceEncoding.getParent();
+    return success();
+  }
+
+  LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
+                                   Attribute retEncoding,
+                                   Optional<Location> location) const override {
+    if (auto dotOpEnc = operandEncoding.dyn_cast<DotOperandEncodingAttr>()) {
+      if (opIdx != dotOpEnc.getOpIdx())
+        return emitOptionalError(location, "Wrong opIdx");
+      if (retEncoding != dotOpEnc.getParent())
+        return emitOptionalError(location, "Incompatible parent encoding");
+    } else
+      return emitOptionalError(
+          location, "Dot's a/b's encoding should be of DotOperandEncodingAttr");
     return success();
   }
 };
@@ -574,32 +727,6 @@ void TritonGPUDialect::initialize() {
       >();
   addInterfaces<TritonGPUOpAsmInterface>();
   addInterfaces<TritonGPUInferLayoutInterface>();
-}
-
-//===----------------------------------------------------------------------===//
-// Verification
-//===----------------------------------------------------------------------===//
-
-static LogicalResult verify(InsertSliceAsyncOp op) {
-  if (!isSharedEncoding(op.getResult())) {
-    return op.emitOpError(
-        "insert_slice_async should return a shared memory tensor");
-  }
-  return success();
-}
-
-static LogicalResult verify(ExtractSliceOp op) {
-  if (!isSharedEncoding(op.getResult())) {
-    return op.emitOpError("extract_slice should return a shared memory tensor");
-  }
-  return success();
-}
-
-static LogicalResult verify(AllocTensorOp op) {
-  if (!isSharedEncoding(op.getResult())) {
-    return op.emitOpError("alloc_tensor should return a shared memory tensor");
-  }
-  return success();
 }
 
 #define GET_OP_CLASSES
