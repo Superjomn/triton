@@ -465,6 +465,7 @@ void init_triton_codegen(py::module &&m) {
             }
             int version;
             std::string ptxas_path = drv::path_to_ptxas(version);
+            printf("ptxas: %s\n", ptxas_path.c_str());
             // Triton-IR -> NVPTX LLVM-IR
             triton::codegen::nvidia_cu_target target(cc);
             auto llvm = triton::codegen::add_passes_to_emit_bin(
@@ -472,6 +473,7 @@ void init_triton_codegen(py::module &&m) {
             llvm::raw_string_ostream llir(tmp);
             llir << *llvm;
             llir.flush();
+            printf("version: %d\n", version);
             // LLVM-IR -> PTX
             ptx = drv::llir_to_ptx(llvm.get(), cc, version);
             // PTX -> Binary

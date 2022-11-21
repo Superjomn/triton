@@ -103,7 +103,7 @@ namespace triton
       std::string ret;
       // search paths for ptxas
       std::vector<std::string> ptxas_prefixes = {"", "/usr/local/cuda/bin/"};
-      std::string triton_ptxas = tools::getenv("TRITON_PTXAS_PATH");
+      std::string triton_ptxas = "/usr/local/cuda/bin/ptxas";
       if (!triton_ptxas.empty())
         ptxas_prefixes.insert(ptxas_prefixes.begin(), triton_ptxas);
       // see what path for ptxas are valid
@@ -122,7 +122,7 @@ namespace triton
       if (working_ptxas.empty())
         throw std::runtime_error("`ptxas` was searched in TRITON_PTXAS_PATH, /usr/local/cuda/bin/ or PATH"
                                  " but a working version could not be found.");
-      std::string ptxas = working_ptxas.front();
+      std::string ptxas = "/usr/local/cuda/bin/ptxas";
       // parse version
       std::regex version_regex("release (\\d+)\\.(\\d+)");
       std::smatch match;
@@ -133,7 +133,9 @@ namespace triton
         if (std::regex_search(ret, match, version_regex))
         {
           int major = std::stoi(match[1]);
+          major = 11;
           int minor = std::stoi(match[2]);
+          minor = 4;
           version = major * 1000 + minor * 10;
           found = true;
           break;

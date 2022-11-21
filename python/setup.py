@@ -129,6 +129,7 @@ class CMakeBuild(build_ext):
             # '-DCMAKE_VERBOSE_MAKEFILE:BOOL=ON',
             "-DPYTHON_INCLUDE_DIRS=" + ";".join(python_include_dirs)
         ] + thirdparty_cmake_args
+        print('\n'.join(cmake_args))
         # configuration
         cfg = get_build_type()
         build_args = ["--config", cfg]

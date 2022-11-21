@@ -25,7 +25,99 @@
 namespace triton{
 namespace codegen{
 
+Value* gThreadId;
+
 using namespace llvm;
+
+llvm::Function *GetVprintfDeclaration(llvm::Module &M) {
+  llvm::Type *ArgTypes[] = {llvm::Type::getInt8PtrTy(M.getContext()),
+                            llvm::Type::getInt8PtrTy(M.getContext())};
+  llvm::FunctionType *VprintfFuncType = llvm::FunctionType::get(
+      llvm::Type::getInt32Ty(M.getContext()), ArgTypes, false);
+
+  if (auto *F = M.getFunction("vprintf")) {
+    // Our CUDA system header declares vprintf with the right signature, so
+    // nobody else should have been able to declare vprintf with a bogus
+    // signature.
+    assert(F->getFunctionType() == VprintfFuncType);
+    return F;
+  }
+
+  // vprintf doesn't already exist; create a declaration and insert it into the
+  // module.
+  return llvm::Function::Create(
+      VprintfFuncType, llvm::GlobalVariable::ExternalLinkage, "vprintf", &M);
+}
+
+std::pair<llvm::Value *, llvm::TypeSize>
+packArgsIntoNVPTXFormatBuffer(Builder* builder, ArrayRef<Value*> Args) {
+  auto* mod = builder->GetInsertBlock()->getModule();
+  const auto &DL = mod->getDataLayout();
+
+  llvm::LLVMContext &Ctx = builder->getContext();
+
+  // Construct and fill the args buffer that we'll pass to vprintf.
+  if (Args.size() <= 0) {
+    // If there are no args, pass a null pointer and size 0
+    llvm::Value * BufferPtr = llvm::ConstantPointerNull::get(llvm::Type::getInt8PtrTy(Ctx));
+    return {BufferPtr, llvm::TypeSize::Fixed(0)};
+  } else {
+    llvm::SmallVector<llvm::Type *, 8> ArgTypes;
+    for (unsigned I = 0, NumArgs = Args.size(); I < NumArgs; ++I) {
+      auto type = Args[I]->getType();
+      Type* newType;
+      if (type->isIntegerTy()) {
+        newType = builder->getInt32Ty();
+      } else if (type->isFloatingPointTy()) {
+        newType = builder->getDoubleTy();
+      } else {
+        newType = type;
+      }
+      ArgTypes.push_back(newType);
+    }
+
+    // Using llvm::StructType is correct only because printf doesn't accept
+    // aggregates.  If we had to handle aggregates here, we'd have to manually
+    // compute the offsets within the alloca -- we wouldn't be able to assume
+    // that the alignment of the llvm type was the same as the alignment of the
+    // clang type.
+    llvm::Type *AllocaTy = llvm::StructType::create(ArgTypes, "printf_args");
+    llvm::Value *Alloca = builder->CreateAlloca(AllocaTy);
+    int size = 0;
+
+    for (unsigned I = 0, NumArgs = Args.size(); I < NumArgs; ++I) {
+      llvm::Value *P = builder->CreateStructGEP(AllocaTy, Alloca, I);
+      llvm::Value *Arg = Args[I];
+      llvm::Value *newArg;
+      if (Arg->getType()->isFloatingPointTy()) {
+        newArg = builder->CreateFPExt(Arg, builder->getDoubleTy());
+        size += 64;
+      } else if (Arg->getType()->isIntegerTy()) {
+        newArg = builder->CreateSExt(Arg, builder->getInt32Ty());
+        size += 32;
+      } else {
+        newArg = Arg;
+      }
+      builder->CreateStore(newArg, P);
+    }
+    llvm::Value *BufferPtr =
+        builder->CreatePointerCast(Alloca, llvm::Type::getInt8PtrTy(Ctx));
+    return {BufferPtr, DL.getTypeAllocSize(AllocaTy)};
+  }
+}
+
+void vprintf( const char* fmt, ArrayRef<Value*> Args, Builder* builder) {
+  auto* mod = builder->GetInsertBlock()->getModule();
+
+  auto* funcType = GetVprintfDeclaration(*mod);
+
+  auto [buf, buf_size] = packArgsIntoNVPTXFormatBuffer(builder, Args);
+
+  Value *str = builder->CreateGlobalStringPtr(fmt);
+  Value* strPtr = builder->CreateGEP(str, builder->getInt32(0));
+  std::vector<Value*> opernds{strPtr, buf};
+  builder->CreateCall(funcType, opernds);
+}
 
 Value* adder::operator()(Value *x, Value *y, const std::string& name) {
   // (x + cst) + y -> (x + y) + cst
@@ -2654,7 +2746,34 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
                        {ha[{m, k}], ha[{m+1, k}], ha[{m, k+1}], ha[{m+1, k+1}],
                         hb[{n, k}], hb[{n, k+1}],
                         fc[idx[0]], fc[idx[1]], fc[idx[2]], fc[idx[3]]});
-      fc[idx[0]] = extract_val(nc, std::vector<unsigned>{0});
+
+      auto get_f16 = [&](Value* value, int idx) {
+        return extract_elt(value, idx);
+      };
+
+    vprintf("t-%d mma.A: (%f,%f) (%f,%f) (%f,%f) (%f,%f)\nmma.B: (%f,%f) (%f,%f)",
+                   {
+                       gThreadId,
+                       // A
+                       get_f16(ha[{m,k}], 0),
+                       get_f16(ha[{m,k}], 1),
+                       get_f16(ha[{m+1,k}], 0),
+                       get_f16(ha[{m+1,k}], 1),
+                       get_f16(ha[{m,k+1}], 0),
+                       get_f16(ha[{m,k+1}], 1),
+                       get_f16(ha[{m+1,k+1}], 0),
+                       get_f16(ha[{m+1,k+1}], 1),
+
+                       // B
+                       get_f16(hb[{n,k}], 0),
+                       get_f16(hb[{n,k}], 1),
+                       get_f16(hb[{n,k+1}], 0),
+                       get_f16(hb[{n,k+1}], 1)
+                   }, builder_);
+
+
+
+    fc[idx[0]] = extract_val(nc, std::vector<unsigned>{0});
       fc[idx[1]] = extract_val(nc, std::vector<unsigned>{1});
       fc[idx[2]] = extract_val(nc, std::vector<unsigned>{2});
       fc[idx[3]] = extract_val(nc, std::vector<unsigned>{3});
@@ -3826,6 +3945,7 @@ void generator::visit_layout_mma(analysis::mma_layout* layout) {
 
 void generator::visit_layout_scanline(analysis::scanline_layout* layout) {
   Value* thread_id = tgt_->get_local_id(mod_, *builder_, 0);
+  gThreadId = thread_id;
   auto order = layout->get_order();
   const auto& shape = layout->get_shape();
   // Delinearize
