@@ -46,6 +46,8 @@ using ::mlir::triton::gpu::SliceEncodingAttr;
 namespace mlir {
 namespace LLVM {
 
+bool isB = false;
+
 static StringRef getStructAttrsAttrName() { return "llvm.struct_attrs"; }
 
 Value gThreadId;
@@ -93,6 +95,24 @@ static Value createLLVMIntegerConstant(OpBuilder &builder, Location loc,
 // A helper function for using printf in LLVM conversion.
 void llPrintf(StringRef msg, ValueRange args,
               ConversionPatternRewriter &rewriter);
+
+void vprintf(StringRef msg, ValueRange args,
+              ConversionPatternRewriter &rewriter) {
+  llPrintf(msg, args, rewriter);
+}
+
+void vprintf_array(Value thread, ArrayRef<Value> arr, std::string info, std::string elem_repr, ConversionPatternRewriter& builder) {
+  std::string fmt = "t-%d " + info + ": ";
+  std::vector<Value> new_arr({thread});
+  for (auto v : arr) {
+    fmt += elem_repr + ", ";
+    new_arr.push_back(v);
+  }
+  fmt += "";
+
+  vprintf(fmt, arr, builder);
+}
+
 
 // Shortcuts for some commonly used LLVM ops to keep code simple and intuitive
 #define inttoptr(...) rewriter.create<LLVM::IntToPtrOp>(loc, __VA_ARGS__)
@@ -3358,11 +3378,33 @@ public:
         mul(nkMatArr, i32_val(matArrStride))); // matrix offset inside a warp
     matOff[kOrder] = kMatArr;
 
+    if (LLVM::isB) {
+      LLVM::vprintf("t-%d c, s, s0, s1, warp_off, warp_off_stride, mat_arr_stride: %d %d %d %d %d %d %d",
+              {LLVM::gThreadId, c, s, s0, s1, warpId, i32_val(warpOffStride),
+               i32_val(matArrStride)},
+              rewriter);
+  }
+
+    if (LLVM::isB) {
+      LLVM::vprintf("t-%d matOff: %d, %d", {LLVM::gThreadId, matOff[0], matOff[1]}, rewriter);
+    }
+
+
     // Physical offset (before swizzling)
     Value cMatOff = matOff[order[0]];
     Value sMatOff = matOff[order[1]];
+    Value cMatOff_copied = cMatOff;
     Value cSwizzleMatOff = udiv(cSwizzleOffset, i32_val(cMatShape));
     cMatOff = add(cMatOff, cSwizzleMatOff);
+
+#define SHOW_SC_MAT_OFF 0
+#if SHOW_SC_MAT_OFF
+    if (LLVM::isB) {
+      LLVM::vprintf("t-%d sMatOff,cMatOff,cMatOff_origin: %d,%d, %d", {LLVM::gThreadId,
+                                                           sMatOff, cMatOff, cMatOff_copied}, rewriter);
+
+    }
+#endif
 
     // row offset inside a matrix, each matrix has 8 rows.
     Value sOffInMat = c;
@@ -4184,6 +4226,8 @@ struct MMA16816ConversionHelper {
     warpMN = udiv(warp, i32_val(wpt[0]));
     warpM = urem(warp, i32_val(wpt[0]));
     warpN = urem(warpMN, i32_val(wpt[1]));
+
+    printf("wpt: %d,%d\n", wpt[0], wpt[1]);
   }
 
   // Get the mmaInstrShape from either $a or $b.
@@ -4320,6 +4364,25 @@ struct MMA16816ConversionHelper {
         loadFn(2 * n, 2 * k);
     }
 
+    printf("loaded B records: %lu\n", hb.size());
+
+    auto get_f16 = [&](Value val, int idx) {
+      return extract_element(f16_ty, val, i32_val(idx));
+    };
+
+    std::vector<Value> bvs({LLVM::gThreadId});
+    std::string fmt = "t-%d loaded.B: ";
+    for (auto& item : hb) {
+      bvs.push_back(get_f16(item.second, 0));
+      bvs.push_back(get_f16(item.second, 1));
+      fmt += "(%f %f) ";
+    }
+    LLVM::llPrintf(fmt, bvs, rewriter);
+
+    // check loaded value
+
+
+
     Value result = composeValuesToDotOperandLayoutStruct(
         hb, std::max(numRepN / 2, 1), numRepK);
     return result;
@@ -4366,6 +4429,26 @@ struct MMA16816ConversionHelper {
         getValuesFromDotOperandLayoutStruct(loadedA, numRepM, numRepK);
     ValueTable hb = getValuesFromDotOperandLayoutStruct(
         loadedB, std::max(numRepN / 2, 1), numRepK);
+
+#if 0
+    {
+
+      auto get_f16 = [&](Value val, int idx) {
+        return extract_element(f16_ty, val, i32_val(idx));
+      };
+
+      std::vector<Value> bvs({LLVM::gThreadId});
+      std::string fmt = "t-%d decompose.B: ";
+      for (auto& item : hb) {
+        bvs.push_back(get_f16(item.second, 0));
+        bvs.push_back(get_f16(item.second, 1));
+        fmt += "(%f %f) ";
+      }
+      LLVM::llPrintf(fmt, bvs, rewriter);
+
+    }
+#endif
+
     auto fc = ConvertTritonGPUOpToLLVMPatternBase::getElementsFromStruct(
         loc, loadedC, rewriter);
 
@@ -4387,9 +4470,44 @@ struct MMA16816ConversionHelper {
         return extract_element(f16_ty, val, i32_val(idx));
       };
 
-#define SHOW_MMA 1
+
+      auto cArgs = builder.newListOperand();
+      for (int i = 0; i < 4; ++i) {
+        cArgs->listAppend(builder.newOperand(fc[m * colsPerThread + 4 * n + i],
+                                             std::to_string(i)));
+        // reuse the output registers
+      }
+
+      mma(retArgs, aArgs, bArgs, cArgs);
+      Value mmaOut = builder.launch(rewriter, loc, helper.getMmaRetType());
+
+
+
+      auto getIntAttr = [&](int v) {
+        return ArrayAttr::get(ctx, {IntegerAttr::get(i32_ty, v)});
+      };
+
+      Type elemTy = mmaOut.getType().cast<LLVM::LLVMStructType>().getBody()[0];
+
+      std::vector<size_t> idx = {
+          (m + 0)*colsPerThread + (n*2 + 0),
+          (m + 0)*colsPerThread + (n*2 + 1),
+          (m + 1)*colsPerThread + (n*2 + 0),
+          (m + 1)*colsPerThread + (n*2 + 1)
+      };
+
+      for (int i = 0; i < 4; ++i)
+        fc[idx[i]] =
+            extract_val(elemTy, mmaOut, getIntAttr(i));
+      //for (int i = 0; i < 4; ++i)
+        //fc[m * colsPerThread + 4 * n + i] =
+            //extract_val(elemTy, mmaOut, getIntAttr(i));
+
+
+
+#define SHOW_MMA 0
 #if SHOW_MMA
-      LLVM::llPrintf("t-%d mma.A: (%f,%f) (%f,%f) (%f,%f) (%f,%f)\nmma.B: (%f,%f) (%f,%f)",
+      LLVM::llPrintf("t-%d mma.A: (%f,%f) (%f,%f) (%f,%f) (%f,%f) mma.B: (%f,%f) (%f,%f) mma.D (%f,%f,%f,%f)",
                      {
                          LLVM::gThreadId,
                          // A
@@ -4403,32 +4521,22 @@ struct MMA16816ConversionHelper {
                          get_f16(ha[{m+1,k+1}], 1),
 
                          // B
-                      get_f16(hb[{n,k}], 0),
-                     get_f16(hb[{n,k}], 1),
-                     get_f16(hb[{n,k+1}], 0),
-                     get_f16(hb[{n,k+1}], 1)
+                         get_f16(hb[{n,k}], 0),
+                         get_f16(hb[{n,k}], 1),
+                         get_f16(hb[{n,k+1}], 0),
+                         get_f16(hb[{n,k+1}], 1),
+
+                         // D
+
+                         extract_val(elemTy, mmaOut, getIntAttr(0)),
+                         extract_val(elemTy, mmaOut, getIntAttr(1)),
+                         extract_val(elemTy, mmaOut, getIntAttr(2)),
+                         extract_val(elemTy, mmaOut, getIntAttr(3)),
+
                      }, rewriter);
 
 #endif
 
-      auto cArgs = builder.newListOperand();
-      for (int i = 0; i < 4; ++i) {
-        cArgs->listAppend(builder.newOperand(fc[m * colsPerThread + 4 * n + i],
-                                             std::to_string(i)));
-        // reuse the output registers
-      }
-
-      mma(retArgs, aArgs, bArgs, cArgs);
-      Value mmaOut = builder.launch(rewriter, loc, helper.getMmaRetType());
-
-      auto getIntAttr = [&](int v) {
-        return ArrayAttr::get(ctx, {IntegerAttr::get(i32_ty, v)});
-      };
-
-      Type elemTy = mmaOut.getType().cast<LLVM::LLVMStructType>().getBody()[0];
-      for (int i = 0; i < 4; ++i)
-        fc[m * colsPerThread + 4 * n + i] =
-            extract_val(elemTy, mmaOut, getIntAttr(i));
     };
 
     for (int k = 0; k < numRepK; ++k)
@@ -4441,6 +4549,18 @@ struct MMA16816ConversionHelper {
     for (auto &elem : fc) {
       elem = bitcast(elem, resElemTy);
     }
+
+
+    {
+      std::string fmt = "t-%d C: ";
+      for (auto& v : fc) fmt += " %f ";
+      std::vector<Value> args(fc.begin(), fc.end());
+      args.insert(args.begin(), LLVM::gThreadId);
+      LLVM::llPrintf(fmt, args, rewriter);
+    }
+
+
+
 
     // replace with new packed result
     Type structTy = LLVM::LLVMStructType::getLiteral(
@@ -4478,8 +4598,19 @@ private:
           tensorTy.getShape() /*tileShape*/, instrShape, matShape, perPhase,
           maxPhase, elemBytes, rewriter, typeConverter, loc);
       Value cSwizzleOffset = smemObj.getCSwizzleOffset(order[0]);
+
+      LLVM::isB = !isA;
       SmallVector<Value> offs =
           loader.computeOffsets(warpId, lane, cSwizzleOffset);
+      LLVM::isB = false;
+
+#define SHOW_B_OFF 0
+#if SHOW_B_OFF
+      if (!isA) {
+        LLVM::vprintf_array(LLVM::gThreadId, offs, "off_b", "%d", rewriter);
+      }
+#endif
+
       const int numPtrs = loader.getNumPtrs();
       SmallVector<Value> ptrs(numPtrs);
 

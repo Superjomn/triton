@@ -619,7 +619,8 @@ public:
         RankedTensorType::get(retShape, oldRetType.getElementType(),
                               triton::gpu::MmaEncodingAttr::get(
                                   oldRetType.getContext(), 2,
-                                  getWarpsPerTile(retShape, 2, numWarps)));
+                                  {1,1}
+                                  /*getWarpsPerTile(retShape, 2, numWarps)*/));
     // convert accumulator
     auto oldAcc = dotOp.getOperand(2);
     auto newAcc = rewriter.create<triton::gpu::ConvertLayoutOp>(
