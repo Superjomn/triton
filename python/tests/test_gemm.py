@@ -185,12 +185,14 @@ def get_proper_err(a, b, golden):
     [128, 128, 256, 4, 128, 128, 64, False, False],
     [128, 256, 128, 4, 128, 256, 32, False, False],
     [256, 128, 64, 4, 256, 128, 16, False, False],
+    [16, 16, 128, 4, 16, 16, 16, False, False],
     [128, 64, 128, 4, 128, 64, 32, False, False],
     # TODO[goostavz]: fix these cases
     #[128, 64, 128, 4, 128, 64, 32, True, False],
     #[128, 64, 128, 4, 128, 64, 32, False, True],
 ])
 def test_gemm(SIZE_M, SIZE_N, SIZE_K, NUM_WARPS, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, TRANS_A, TRANS_B):
+    torch.manual_seed(0)
     if (TRANS_A):
         a = torch.randn((SIZE_K, SIZE_M), device='cuda', dtype=torch.float16).T
     else:
@@ -278,3 +280,6 @@ def test_gemm_fmadot(M, N, K, num_warps, block_M, block_N, block_K):
     golden = torch.matmul(a, b)
     golden_abs_err, golden_rel_err = get_proper_err(a, b, golden)
     torch.testing.assert_close(c, golden, rtol=max(1e-4, 1.5 * golden_rel_err), atol=max(1e-4, 1.5 * golden_abs_err))
+
+
+test_gemm(*[16, 16, 32, 4, 16, 16, 32, False, False])

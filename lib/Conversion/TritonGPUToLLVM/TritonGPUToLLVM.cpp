@@ -48,6 +48,8 @@ namespace LLVM {
 
 static StringRef getStructAttrsAttrName() { return "llvm.struct_attrs"; }
 
+Value gThreadId;
+
 namespace {
 
 // Create a 32-bit integer constant.
@@ -575,6 +577,8 @@ public:
         ValueRange{rewriter.create<::mlir::gpu::ThreadIdOp>(
             loc, rewriter.getIndexType(), ::mlir::gpu::Dimension::x)});
     Value threadId = cast.getResult(0);
+    mlir::LLVM::gThreadId = threadId;
+
     return threadId;
   }
 
@@ -4378,6 +4382,35 @@ struct MMA16816ConversionHelper {
       });
       auto bArgs =
           builder.newListOperand({{hb[{n, k}], "r"}, {hb[{n, k + 1}], "r"}});
+
+      auto get_f16 = [&](Value val, int idx) {
+        return extract_element(f16_ty, val, i32_val(idx));
+      };
+
+#define SHOW_MMA 1
+#if SHOW_MMA
+      LLVM::llPrintf("t-%d mma.A: (%f,%f) (%f,%f) (%f,%f) (%f,%f)\nmma.B: (%f,%f) (%f,%f)",
+                     {
+                         LLVM::gThreadId,
+                         // A
+                         get_f16(ha[{m,k}], 0),
+                         get_f16(ha[{m,k}], 1),
+                         get_f16(ha[{m+1,k}], 0),
+                         get_f16(ha[{m+1,k}], 1),
+                         get_f16(ha[{m,k+1}], 0),
+                         get_f16(ha[{m,k+1}], 1),
+                         get_f16(ha[{m+1,k+1}], 0),
+                         get_f16(ha[{m+1,k+1}], 1),
+
+                         // B
+                      get_f16(hb[{n,k}], 0),
+                     get_f16(hb[{n,k}], 1),
+                     get_f16(hb[{n,k+1}], 0),
+                     get_f16(hb[{n,k+1}], 1)
+                     }, rewriter);
+
+#endif
+
       auto cArgs = builder.newListOperand();
       for (int i = 0; i < 4; ++i) {
         cArgs->listAppend(builder.newOperand(fc[m * colsPerThread + 4 * n + i],

@@ -883,10 +883,10 @@ def ttir_to_ttgir(mod, num_warps, num_stages):
     # Convert blocked layout to mma layout for dot ops so that pipeline
     # can get shared memory swizzled correctly.
     pm.add_triton_gpu_combine_pass()
-    pm.add_tritongpu_pipeline_pass(num_stages)
+    #pm.add_tritongpu_pipeline_pass(num_stages)
     # Prefetch must be done after pipeline pass because pipeline pass
     # extracts slices from the original tensor.
-    pm.add_tritongpu_prefetch_pass()
+    #pm.add_tritongpu_prefetch_pass()
     pm.add_canonicalizer_pass()
     pm.add_cse_pass()
     pm.add_coalesce_pass()
@@ -925,6 +925,7 @@ def llir_to_ptx(mod: Any, compute_capability: int = None, ptx_version: int = Non
         compute_capability = compute_capability[0] * 10 + compute_capability[1]
     if ptx_version is None:
         _, cuda_version = path_to_ptxas()
+        print(_)
         ptx_version = ptx_get_version(cuda_version)
     return _triton.translate_llvmir_to_ptx(mod, compute_capability, ptx_version)
 
