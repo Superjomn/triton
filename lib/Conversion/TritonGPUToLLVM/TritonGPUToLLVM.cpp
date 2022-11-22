@@ -48,6 +48,9 @@ namespace LLVM {
 
 static StringRef getStructAttrsAttrName() { return "llvm.struct_attrs"; }
 
+Value gThreadId;
+
+
 namespace {
 
 // Create a 32-bit integer constant.
@@ -90,6 +93,25 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
 // A helper function for using printf in LLVM conversion.
 void llPrintf(StringRef msg, ValueRange args,
               ConversionPatternRewriter &rewriter);
+
+void vprintf(StringRef msg, ValueRange args,
+             ConversionPatternRewriter &rewriter) {
+  llPrintf(msg, args, rewriter);
+}
+
+void vprintf_array(Value thread, ArrayRef<Value> arr, std::string info,
+                   std::string elem_repr, ConversionPatternRewriter &builder) {
+  std::string fmt = "t-%d " + info + ": ";
+  std::vector<Value> new_arr({thread});
+  for (auto v : arr) {
+    fmt += elem_repr + ", ";
+    new_arr.push_back(v);
+  }
+  fmt += "";
+
+  vprintf(fmt, new_arr, builder);
+}
+
 
 // Shortcuts for some commonly used LLVM ops to keep code simple and intuitive
 #define inttoptr(...) rewriter.create<LLVM::IntToPtrOp>(loc, __VA_ARGS__)
@@ -557,6 +579,8 @@ public:
         ValueRange{rewriter.create<::mlir::gpu::ThreadIdOp>(
             loc, rewriter.getIndexType(), ::mlir::gpu::Dimension::x)});
     Value threadId = cast.getResult(0);
+    LLVM::gThreadId = threadId;
+
     return threadId;
   }
 
@@ -4407,12 +4431,53 @@ struct MMA16816ConversionHelper {
       for (int i = 0; i < 4; ++i)
         fc[m * colsPerThread + 4 * n + i] =
             extract_val(elemTy, mmaOut, getIntAttr(i));
+
+#define SHOW_MMA 1
+#if SHOW_MMA
+      auto get_f16 = [&](Value val, int idx) {
+        return extract_element(f16_ty, val, i32_val(idx));
+      };
+     LLVM::vprintf("t-%d mma.A (%d,%d,%d): (%f,%f) (%f,%f) (%f,%f) (%f,%f) mma.B: "
+                     "(%f,%f) (%f,%f) mma.D (%f,%f,%f,%f)",
+                     {
+                         LLVM::gThreadId,
+                         i32_val(m),
+                         i32_val(n),
+                         i32_val(k),
+                         // A
+                         get_f16(ha[{m, k}], 0),
+                         get_f16(ha[{m, k}], 1),
+                         get_f16(ha[{m + 1, k}], 0),
+                         get_f16(ha[{m + 1, k}], 1),
+                         get_f16(ha[{m, k + 1}], 0),
+                         get_f16(ha[{m, k + 1}], 1),
+                         get_f16(ha[{m + 1, k + 1}], 0),
+                         get_f16(ha[{m + 1, k + 1}], 1),
+
+                         // B
+                         get_f16(hb[{n, k}], 0),
+                         get_f16(hb[{n, k}], 1),
+                         get_f16(hb[{n, k + 1}], 0),
+                         get_f16(hb[{n, k + 1}], 1),
+
+                         // D
+
+                         extract_val(elemTy, mmaOut, getIntAttr(0)),
+                         extract_val(elemTy, mmaOut, getIntAttr(1)),
+                         extract_val(elemTy, mmaOut, getIntAttr(2)),
+                         extract_val(elemTy, mmaOut, getIntAttr(3)),
+
+                     },
+                     rewriter);
+#endif
     };
 
     for (int k = 0; k < numRepK; ++k)
       for (int m = 0; m < numRepM; ++m)
         for (int n = 0; n < numRepN; ++n)
           callMma(2 * m, n, 2 * k);
+
+
 
     Type resElemTy = dTensorTy.getElementType();
 
