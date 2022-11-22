@@ -281,4 +281,6 @@ def test_gemm_fmadot(M, N, K, num_warps, block_M, block_N, block_K):
 
 #test_gemm(*[128, 64, 128, 4, 16, 16, 16, True, False])
 #test_gemm(* [128, 64, 128, 4, 128, 64, 32, True, False])
-test_gemm(*[32, 16, 16, 1, 32, 16, 16, False, False])
+
+# pass
+test_gemm(*[16, 16, 64, 4, 16, 16, 16, False, False])
