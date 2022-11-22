@@ -26,6 +26,7 @@ namespace triton{
 namespace codegen{
 
 Value* gThreadId;
+bool isB = false;
 
 using namespace llvm;
 
@@ -117,6 +118,18 @@ void vprintf( const char* fmt, ArrayRef<Value*> Args, Builder* builder) {
   Value* strPtr = builder->CreateGEP(str, builder->getInt32(0));
   std::vector<Value*> opernds{strPtr, buf};
   builder->CreateCall(funcType, opernds);
+}
+
+void vprintf_array(Value* thread, ArrayRef<Value*> arr, std::string info, std::string elem_repr, Builder* builder) {
+  std::string fmt = "t-%d " + info + ": ";
+  std::vector<Value*> new_arr({thread});
+  for (auto* v : arr) {
+    fmt += elem_repr + ", ";
+    new_arr.push_back(v);
+  }
+  fmt += "\n";
+
+  vprintf(fmt.c_str(), new_arr, builder);
 }
 
 Value* adder::operator()(Value *x, Value *y, const std::string& name) {
@@ -2202,11 +2215,28 @@ public:
       mat_off[k_order_^1] = add(mul(warp_off,   i32(warp_off_stride_)),
                                 mul(nk_mat_arr, i32(mat_arr_stride_)));
       mat_off[k_order_]   = k_mat_arr;
+
+      if (isB) {
+        //vprintf("t-%d c, s, s0, s1, warp_off, warp_off_stride, mat_arr_stride: %d %d %d %d %d %d %d\n",
+                //{gThreadId, c, s, s0, s1, warp_off, i32(warp_off_stride_), i32(mat_arr_stride_)}, builder_);
+      }
+
       // physical offset (before swizzling)
       Value *c_mat_off = mat_off[order_[0]];
       Value *s_mat_off = mat_off[order_[1]];
       // offset inside a matrix
       Value *s_off_in_mat = c;
+
+      if (isB) {
+        vprintf("t-%d matOff: %d, %d\n", {gThreadId, mat_off[0], mat_off[1]}, builder_);
+      }
+
+#define SHOW_SC_MAT_OFF 0
+#if SHOW_SC_MAT_OFF
+      if (isB) vprintf("t-%d sMatOff, cMatOff1: %d,%d\n", {gThreadId,
+                                                                  s_mat_off, c_mat_off}, builder_);
+#endif
+
 
       std::vector<Value*> offs(num_ptr_);
       Value *phase = urem(udiv(s_off_in_mat, i32(per_phase_)), i32(max_phase_));
@@ -2530,6 +2560,7 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
   const int num_rep_m = shapes[0] / layout->shape_per_cta(0);
   const int num_rep_n = shapes[1] / layout->shape_per_cta(1);
   const int num_rep_k = std::max<int>(NK/mma_instr_k, 1);
+  printf("numRepM,N,K: %d,%d,%d\n", num_rep_m, num_rep_n, num_rep_k);
 
   // floating point types
   Type *fp32_ty = f32_ty;
@@ -2599,6 +2630,9 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
   Value *warp_mn = udiv(warp, i32(layout->wpt(0)));
   Value *warp_m  = urem(warp, i32(layout->wpt(0)));
   Value *warp_n  = urem(warp_mn, i32(layout->wpt(1)));
+  printf("wpt: %d %d\n", layout->wpt(0), layout->wpt(1));
+
+
   std::vector<Value *>& fc = fcs.begin()->second;
 
   size_t dtsize_a = A->get_type()->get_scalar_ty()->get_primitive_size_in_bits() / 8;
@@ -2702,7 +2736,16 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
   mma16816_smem_loader b_loader(layout->wpt(1), ord_b, k_order_b, shape_b,
                                 mma_instr_b, mat_shape_b,
                                 per_phase_b, max_phase_b, dtsize_b, builder_, add, mul, gep);
+  isB = true;
   std::vector<Value*> off_b = b_loader.compute_offs(warp_n, lane);
+  isB = false;
+
+#define SHOW_B_OFFS 0
+#if SHOW_B_OFFS
+  vprintf_array(gThreadId, off_b, "off_b", "%d", builder_);
+#endif
+
+
 
   if(licm_ptrs)
     builder_->SetInsertPoint(CurrBB);
@@ -2716,6 +2759,9 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
   // loading function
   std::function<void(int,int,int,bool)> load_b;
   load_b = [&](int n, int k, int inc, bool is_prefetch) {
+
+    //vprintf("t-%d warpm,warpn: %d %d\n", {gThreadId, warp_m, warp_n}, builder_);
+
       auto [hb0, hb1, hb2, hb3] = b_loader.load_x4(k, n, inc, is_prefetch, phiB, shared_pre_ptr_[layout_b],
                                                    shared_next_ptr_[layout_b], off_b, ptrs_b,
                                                    ldmatrix_ty, smem_ptr_ty, prefetch_latch_to_bb_);
@@ -2751,7 +2797,9 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
         return extract_elt(value, idx);
       };
 
-    vprintf("t-%d mma.A: (%f,%f) (%f,%f) (%f,%f) (%f,%f)\nmma.B: (%f,%f) (%f,%f)",
+#define SHOW_MMA 1
+#if SHOW_MMA
+    vprintf("t-%d mma.A: (%f,%f) (%f,%f) (%f,%f) (%f,%f) mma.B: (%f,%f) (%f,%f) mma.D (%f,%f,%f,%f)\n",
                    {
                        gThreadId,
                        // A
@@ -2768,15 +2816,21 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
                        get_f16(hb[{n,k}], 0),
                        get_f16(hb[{n,k}], 1),
                        get_f16(hb[{n,k+1}], 0),
-                       get_f16(hb[{n,k+1}], 1)
+                       get_f16(hb[{n,k+1}], 1),
+                       // D
+                       extract_val(nc, std::vector<unsigned>{0}),
+                       extract_val(nc, std::vector<unsigned>{1}),
+                       extract_val(nc, std::vector<unsigned>{2}),
+                       extract_val(nc, std::vector<unsigned>{3})
                    }, builder_);
-
+#endif
 
 
     fc[idx[0]] = extract_val(nc, std::vector<unsigned>{0});
       fc[idx[1]] = extract_val(nc, std::vector<unsigned>{1});
       fc[idx[2]] = extract_val(nc, std::vector<unsigned>{2});
       fc[idx[3]] = extract_val(nc, std::vector<unsigned>{3});
+
   };
   if (C->is_prefetched()) {
       // create phis
@@ -2826,7 +2880,31 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
       for (unsigned n = 0; n < num_rep_n; n++)
         call_mma(2*m, n, 2*k);
     }
+
+    vprintf_array(gThreadId, fc, "fc", "%f", builder_);
+
+    printf("loaded B records: %d\n", hb.size());
+
+#if 0
+    auto get_f16 = [&](Value* value, int idx) {
+      return extract_elt(value, idx);
+    };
+    std::vector<Value*> bvs({gThreadId});
+    std::string fmt = "t-%d loaded.B: ";
+
+    for (auto& item : hb) {
+      bvs.push_back(get_f16(item.second, 0));
+      bvs.push_back(get_f16(item.second, 1));
+      fmt += "(%f %f) ";
+    }
+    fmt += "\n";
+    vprintf(fmt.c_str(), bvs, builder_);
+#endif
+
   }
+
+
+  std::vector<Value*> FC;
   // write back
   unsigned i = 0;
   for(indices_t idx: idxs_.at(C)){
@@ -2835,6 +2913,7 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
     if(i >= fcs.at(key).size())
       i = 0;
     vals_[C][idx] = fcs.at(key)[i++];
+    FC.push_back(vals_[C][idx]);
   };
 
 }
@@ -2942,6 +3021,9 @@ void generator::visit_fmadot(ir::dot_inst* C, ir::value* A, ir::value* B, ir::va
  * Dispatches to appropriate specialized function
  */
 void generator::visit_dot_inst(ir::dot_inst* dot) {
+  Value* thread_id = tgt_->get_local_id(mod_, *builder_, 0);
+  gThreadId = thread_id;
+
   Function *fn = builder_->GetInsertBlock()->getParent();
   Module *module = fn->getParent();
   ir::value *A = dot->get_operand(0);
@@ -3945,7 +4027,6 @@ void generator::visit_layout_mma(analysis::mma_layout* layout) {
 
 void generator::visit_layout_scanline(analysis::scanline_layout* layout) {
   Value* thread_id = tgt_->get_local_id(mod_, *builder_, 0);
-  gThreadId = thread_id;
   auto order = layout->get_order();
   const auto& shape = layout->get_shape();
   // Delinearize
