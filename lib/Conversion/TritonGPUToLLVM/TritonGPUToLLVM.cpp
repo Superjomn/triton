@@ -46,6 +46,8 @@ using ::mlir::triton::gpu::SliceEncodingAttr;
 namespace mlir {
 namespace LLVM {
 
+Value gThreadId;
+
 static StringRef getStructAttrsAttrName() { return "llvm.struct_attrs"; }
 
 namespace {
@@ -90,6 +92,24 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
 // A helper function for using printf in LLVM conversion.
 void llPrintf(StringRef msg, ValueRange args,
               ConversionPatternRewriter &rewriter);
+
+void vprintf(StringRef msg, ValueRange args,
+             ConversionPatternRewriter &rewriter) {
+  llPrintf(msg, args, rewriter);
+}
+
+void vprintf_array(Value thread, ArrayRef<Value> arr, std::string info,
+                   std::string elem_repr, ConversionPatternRewriter &builder) {
+  std::string fmt = "t-%d " + info + ": ";
+  std::vector<Value> new_arr({thread});
+  for (auto v : arr) {
+    fmt += elem_repr + ", ";
+    new_arr.push_back(v);
+  }
+  fmt += "";
+
+  vprintf(fmt, new_arr, builder);
+}
 
 // Shortcuts for some commonly used LLVM ops to keep code simple and intuitive
 #define inttoptr(...) rewriter.create<LLVM::IntToPtrOp>(loc, __VA_ARGS__)
@@ -557,6 +577,7 @@ public:
         ValueRange{rewriter.create<::mlir::gpu::ThreadIdOp>(
             loc, rewriter.getIndexType(), ::mlir::gpu::Dimension::x)});
     Value threadId = cast.getResult(0);
+    LLVM::gThreadId = threadId;
     return threadId;
   }
 
@@ -2239,16 +2260,16 @@ struct AllocTensorOpConversion
     smemBase = bitcast(smemBase, elemPtrTy);
     auto order = resultTy.getEncoding().cast<SharedEncodingAttr>().getOrder();
     // workaround for 3D tensors
-    // TODO: We need to modify the pipeline pass to give a proper shared encoding to 3D tensors
+    // TODO: We need to modify the pipeline pass to give a proper shared
+    // encoding to 3D tensors
     SmallVector<unsigned> newOrder;
-    if (resultTy.getShape().size() == 3) 
+    if (resultTy.getShape().size() == 3)
       newOrder = {1 + order[0], 1 + order[1], 0};
     else
       newOrder = SmallVector<unsigned>(order.begin(), order.end());
 
-    
-    auto smemObj =
-        SharedMemoryObject(smemBase, resultTy.getShape(), newOrder, loc, rewriter);
+    auto smemObj = SharedMemoryObject(smemBase, resultTy.getShape(), newOrder,
+                                      loc, rewriter);
     auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
     rewriter.replaceOp(op, retVal);
     return success();
@@ -4247,7 +4268,7 @@ struct MMA16816ConversionHelper {
     if (aTensorTy.getEncoding().isa<SharedEncodingAttr>()) {
       // load from smem
       loadFn = getLoadMatrixFn(
-          tensor, smemObj, mmaLayout, mmaLayout.getWarpsPerCTA()[0] /*wpt*/,
+          tensor, smemObj, mmaLayout, wpt[0] /*wpt*/,
           1 /*kOrder*/, {mmaInstrM, mmaInstrK} /*instrShape*/,
           {matShapeM, matShapeK} /*matShape*/, warpM /*warpId*/, ha /*vals*/,
           true /*isA*/);
@@ -4279,7 +4300,7 @@ struct MMA16816ConversionHelper {
     int numRepN = getNumRepN(tensorTy, shape[1]);
 
     auto loadFn = getLoadMatrixFn(
-        tensor, smemObj, mmaLayout, mmaLayout.getWarpsPerCTA()[1] /*wpt*/,
+        tensor, smemObj, mmaLayout, wpt[1] /*wpt*/,
         0 /*kOrder*/, {mmaInstrK, mmaInstrN} /*instrShape*/,
         {matShapeK, matShapeN} /*matShape*/, warpN /*warpId*/, hb /*vals*/,
         false /*isA*/);
@@ -4352,10 +4373,21 @@ struct MMA16816ConversionHelper {
       auto bArgs =
           builder.newListOperand({{hb[{n, k}], "r"}, {hb[{n, k + 1}], "r"}});
       auto cArgs = builder.newListOperand();
+
+      std::vector<size_t> idx = {(m + 0) * colsPerThread + (n * 2 + 0),
+                                 (m + 0) * colsPerThread + (n * 2 + 1),
+                                 (m + 1) * colsPerThread + (n * 2 + 0),
+                                 (m + 1) * colsPerThread + (n * 2 + 1)};
+
+#define SHOW_OLD_IDX 1
+
       for (int i = 0; i < 4; ++i) {
+#if SHOW_OLD_IDX
         cArgs->listAppend(builder.newOperand(fc[m * colsPerThread + 4 * n + i],
                                              std::to_string(i)));
-        // reuse the output registers
+#else
+        cArgs->listAppend(builder.newOperand(fc[idx[i]], std::to_string(i)));
+#endif
       }
 
       mma(retArgs, aArgs, bArgs, cArgs);
@@ -4367,10 +4399,53 @@ struct MMA16816ConversionHelper {
 
       Type elemTy = mmaOut.getType().cast<LLVM::LLVMStructType>().getBody()[0];
       for (int i = 0; i < 4; ++i)
+#if SHOW_OLD_IDX
         fc[m * colsPerThread + 4 * n + i] =
             extract_val(elemTy, mmaOut, getIntAttr(i));
+#else
+        fc[idx[i]] = extract_val(elemTy, mmaOut, getIntAttr(i));
+#endif
+
+      printf("wpt: %d %d\n", wpt[0], wpt[1]);
+
+#define SHOW_MMA 0
+#if SHOW_MMA
+      auto get_f16 = [&](Value val, int idx) {
+        return extract_element(f16_ty, val, i32_val(idx));
+      };
+      LLVM::llPrintf("t-%d mma.A: (%f,%f) (%f,%f) (%f,%f) (%f,%f) mma.B: "
+                     "(%f,%f) (%f,%f) mma.D (%f,%f,%f,%f)",
+                     {
+                         LLVM::gThreadId,
+                         // A
+                         get_f16(ha[{m, k}], 0),
+                         get_f16(ha[{m, k}], 1),
+                         get_f16(ha[{m + 1, k}], 0),
+                         get_f16(ha[{m + 1, k}], 1),
+                         get_f16(ha[{m, k + 1}], 0),
+                         get_f16(ha[{m, k + 1}], 1),
+                         get_f16(ha[{m + 1, k + 1}], 0),
+                         get_f16(ha[{m + 1, k + 1}], 1),
+
+                         // B
+                         get_f16(hb[{n, k}], 0),
+                         get_f16(hb[{n, k}], 1),
+                         get_f16(hb[{n, k + 1}], 0),
+                         get_f16(hb[{n, k + 1}], 1),
+
+                         // D
+
+                         extract_val(elemTy, mmaOut, getIntAttr(0)),
+                         extract_val(elemTy, mmaOut, getIntAttr(1)),
+                         extract_val(elemTy, mmaOut, getIntAttr(2)),
+                         extract_val(elemTy, mmaOut, getIntAttr(3)),
+
+                     },
+                     rewriter);
+#endif
     };
 
+    printf("numRepM,N,K: %d,%d,%d\n", numRepM, numRepN, numRepK);
     for (int k = 0; k < numRepK; ++k)
       for (int m = 0; m < numRepM; ++m)
         for (int n = 0; n < numRepN; ++n)
@@ -4381,6 +4456,8 @@ struct MMA16816ConversionHelper {
     for (auto &elem : fc) {
       elem = bitcast(elem, resElemTy);
     }
+
+    LLVM::vprintf_array(LLVM::gThreadId, fc, "fc", "%f", rewriter);
 
     // replace with new packed result
     Type structTy = LLVM::LLVMStructType::getLiteral(
@@ -6163,10 +6240,9 @@ private:
       if (srcBlocked && dstDotOp) {
         auto tmpType = RankedTensorType::get(
             dstType.getShape(), dstType.getElementType(),
-            triton::gpu::SharedEncodingAttr::get(mod.getContext(), dstDotOp,
-                                                 srcType.getShape(),
-                                                 getOrder(srcBlocked),
-                                                 srcType.getElementType()));
+            triton::gpu::SharedEncodingAttr::get(
+                mod.getContext(), dstDotOp, srcType.getShape(),
+                getOrder(srcBlocked), srcType.getElementType()));
         auto tmp = builder.create<triton::gpu::ConvertLayoutOp>(
             cvtOp.getLoc(), tmpType, cvtOp.getOperand());
         auto newConvert = builder.create<triton::gpu::ConvertLayoutOp>(
