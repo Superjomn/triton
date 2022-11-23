@@ -2141,8 +2141,14 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
         load_a(m, K, /*inc*/0, /*is_prefetch*/false);
       if(hbs.find({n, K}) == hbs.end())
         load_b(n, K, /*inc*/0, /*is_prefetch*/false);
-      call_mma(m, n, K);
     }
+
+    for(unsigned K = 0; K < NK; K += 4)
+      for(unsigned m = 0; m < num_m/2; m++)
+        for(unsigned n = 0; n < num_n/2; n++) {
+          call_mma(m, n, K);
+        }
+
   }
 
   // write back accumulators
@@ -2216,26 +2222,12 @@ public:
                                 mul(nk_mat_arr, i32(mat_arr_stride_)));
       mat_off[k_order_]   = k_mat_arr;
 
-      if (isB) {
-        //vprintf("t-%d c, s, s0, s1, warp_off, warp_off_stride, mat_arr_stride: %d %d %d %d %d %d %d\n",
-                //{gThreadId, c, s, s0, s1, warp_off, i32(warp_off_stride_), i32(mat_arr_stride_)}, builder_);
-      }
-
       // physical offset (before swizzling)
       Value *c_mat_off = mat_off[order_[0]];
       Value *s_mat_off = mat_off[order_[1]];
       // offset inside a matrix
       Value *s_off_in_mat = c;
 
-      if (isB) {
-        vprintf("t-%d matOff: %d, %d\n", {gThreadId, mat_off[0], mat_off[1]}, builder_);
-      }
-
-#define SHOW_SC_MAT_OFF 0
-#if SHOW_SC_MAT_OFF
-      if (isB) vprintf("t-%d sMatOff, cMatOff1: %d,%d\n", {gThreadId,
-                                                                  s_mat_off, c_mat_off}, builder_);
-#endif
 
 
       std::vector<Value*> offs(num_ptr_);
@@ -2560,7 +2552,6 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
   const int num_rep_m = shapes[0] / layout->shape_per_cta(0);
   const int num_rep_n = shapes[1] / layout->shape_per_cta(1);
   const int num_rep_k = std::max<int>(NK/mma_instr_k, 1);
-  printf("numRepM,N,K: %d,%d,%d\n", num_rep_m, num_rep_n, num_rep_k);
 
   // floating point types
   Type *fp32_ty = f32_ty;
@@ -2630,7 +2621,6 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
   Value *warp_mn = udiv(warp, i32(layout->wpt(0)));
   Value *warp_m  = urem(warp, i32(layout->wpt(0)));
   Value *warp_n  = urem(warp_mn, i32(layout->wpt(1)));
-  printf("wpt: %d %d\n", layout->wpt(0), layout->wpt(1));
 
 
   std::vector<Value *>& fc = fcs.begin()->second;
@@ -2740,13 +2730,6 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
   std::vector<Value*> off_b = b_loader.compute_offs(warp_n, lane);
   isB = false;
 
-#define SHOW_B_OFFS 0
-#if SHOW_B_OFFS
-  vprintf_array(gThreadId, off_b, "off_b", "%d", builder_);
-#endif
-
-
-
   if(licm_ptrs)
     builder_->SetInsertPoint(CurrBB);
   // pointers
@@ -2759,8 +2742,6 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
   // loading function
   std::function<void(int,int,int,bool)> load_b;
   load_b = [&](int n, int k, int inc, bool is_prefetch) {
-
-    //vprintf("t-%d warpm,warpn: %d %d\n", {gThreadId, warp_m, warp_n}, builder_);
 
       auto [hb0, hb1, hb2, hb3] = b_loader.load_x4(k, n, inc, is_prefetch, phiB, shared_pre_ptr_[layout_b],
                                                    shared_next_ptr_[layout_b], off_b, ptrs_b,
@@ -2797,11 +2778,15 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
         return extract_elt(value, idx);
       };
 
-#define SHOW_MMA 1
+#define SHOW_MMA 0
 #if SHOW_MMA
-    vprintf("t-%d mma.A: (%f,%f) (%f,%f) (%f,%f) (%f,%f) mma.B: (%f,%f) (%f,%f) mma.D (%f,%f,%f,%f)\n",
+    vprintf("t-%d mma.A (%d,%d,%d): (%f,%f) (%f,%f) (%f,%f) (%f,%f) mma.B: (%f,%f) (%f,%f) mma.D (%f,%f,%f,%f)\n",
                    {
                        gThreadId,
+
+                       i32(m),
+                       i32(n),
+                       i32(k),
                        // A
                        get_f16(ha[{m,k}], 0),
                        get_f16(ha[{m,k}], 1),
@@ -2881,9 +2866,8 @@ void generator::visit_mma16816(ir::dot_inst* C, ir::value *A, ir::value *B, ir::
         call_mma(2*m, n, 2*k);
     }
 
-    vprintf_array(gThreadId, fc, "fc", "%f", builder_);
+    //vprintf_array(gThreadId, fc, "fc", "%f", builder_);
 
-    printf("loaded B records: %d\n", hb.size());
 
 #if 0
     auto get_f16 = [&](Value* value, int idx) {
