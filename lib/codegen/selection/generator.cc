@@ -2087,8 +2087,10 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       };
       std::vector<Value*> args;
       for (auto& item : has) {
-        args.push_back(item.second.first);
-        args.push_back(item.second.second);
+        args.push_back(get_f16(item.second.first, 0));
+        args.push_back(get_f16(item.second.first, 1));
+        args.push_back(get_f16(item.second.second, 0));
+        args.push_back(get_f16(item.second.second, 1));
         vprintf_array(gThreadId, args, "loaded A:", "%f", builder_);
       }
     };
