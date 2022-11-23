@@ -2176,7 +2176,9 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
         call_mma(m, n, K);
       }
     }
+    assert(false);
   } else { // not prefetched
+    printf("NK, num_m, num_n: %d %d %d\n", NK, num_m);
     for(unsigned K = 0; K < NK; K += 4)
     for(unsigned m = 0; m < num_m/2; m++)
     for(unsigned n = 0; n < num_n/2; n++) {
