@@ -2182,9 +2182,14 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     for(unsigned n = 0; n < num_n/2; n++) {
       if(has.find({m, K}) == has.end())
         load_a(m, K, /*inc*/0, /*is_prefetch*/false);
-      if(hbs.find({n, K}) == hbs.end())
-        load_b(n, K, /*inc*/0, /*is_prefetch*/false);
     }
+
+    for(unsigned K = 0; K < NK; K += 4)
+      for(unsigned m = 0; m < num_m/2; m++)
+        for(unsigned n = 0; n < num_n/2; n++) {
+          if(hbs.find({n, K}) == hbs.end())
+            load_b(n, K, /*inc*/0, /*is_prefetch*/false);
+        }
 
     for(unsigned K = 0; K < NK; K += 4)
       for(unsigned m = 0; m < num_m/2; m++)
