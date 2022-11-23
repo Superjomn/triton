@@ -562,11 +562,14 @@ public:
 
   static SmallVector<unsigned, 2>
   getWarpsPerTile(const ArrayRef<int64_t> &shape, int version, int numWarps) {
-    assert(version == 2);
     // TODO: Handle one warp per row for fused matmuls
     // TODO: unsigned -> int64_t to keep things uniform
     SmallVector<unsigned, 2> ret = {1, 1};
-    SmallVector<int64_t, 2> shapePerWarp = {16, 8};
+    SmallVector<int64_t, 2> shapePerWarp;
+    if (version == 2) shapePerWarp.assign({16, 8});
+    else if (version == 1) shapePerWarp.assign({16, 16});
+    else llvm::report_fatal_error("Unexpected mma version found");
+
     bool changed = false;
     // TODO (@daadaada): double-check.
     // original logic in

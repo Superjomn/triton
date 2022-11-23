@@ -46,6 +46,8 @@ using ::mlir::triton::gpu::SliceEncodingAttr;
 namespace mlir {
 namespace LLVM {
 
+Value thread;
+
 static StringRef getStructAttrsAttrName() { return "llvm.struct_attrs"; }
 
 namespace {
@@ -4875,13 +4877,13 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
 
     auto *resOprs = builder.newListOperand(8, "=f");
     auto *AOprs = builder.newListOperand({
-        {ha.first, "f"},
-        {ha.second, "f"},
+        {ha.first, "r"},
+        {ha.second, "r"},
     });
 
     auto *BOprs = builder.newListOperand({
-        {hb.first, "f"},
-        {hb.second, "f"},
+        {hb.first, "r"},
+        {hb.second, "r"},
     });
     auto *COprs = builder.newListOperand();
     for (int i = 0; i < 8; ++i)
@@ -5173,6 +5175,7 @@ DotOpMmaV1ConversionHelper::computeOffsets(Value threadId, bool isARow,
   Value warpMOff = mul(warp0, i32_val(spw[0]));
   Value warpNOff = mul(warp1, i32_val(spw[1]));
   // Quad offset
+  printArray(fpw, "fpw");
   Value quadMOff = mul(udiv(and_(lane, _16), _4), i32_val(fpw[0]));
   Value quadNOff = mul(udiv(and_(lane, _16), _4), i32_val(fpw[1]));
   // Pair offset
@@ -5207,6 +5210,8 @@ DotOpMmaV1ConversionHelper::computeOffsets(Value threadId, bool isARow,
     offsetBN = add(offsetBN, urem(threadId, _4));
     offsetBK = i32_val(0);
   }
+
+  LLVM::llPrintf("offsets: %d,%d,%d,%d", {offsetAM, offsetAK, offsetBN, offsetBK}, rewriter);
 
   return std::make_tuple(offsetAM, offsetAK, offsetBN, offsetBK);
 }
