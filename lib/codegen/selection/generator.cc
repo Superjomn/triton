@@ -1936,6 +1936,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   std::vector<Value*> off_a(num_ptr_a);
   for(int i = 0; i < num_ptr_a; i++){
     Value* off_a0i = add(off_a0, i32(i*(is_a_row?4:stride_rep_m)));
+    vprintf("off_a0i,vec_a,phase_a: %d %d %d", {off_a0i, i32(vec_a), phase_a}, builder_);
     off_a0i = exact_udiv(off_a0i, i32(vec_a));
     off_a0i = xor_(off_a0i, phase_a);
     off_a0i = mul(off_a0i, i32(vec_a));
