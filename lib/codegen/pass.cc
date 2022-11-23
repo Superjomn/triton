@@ -108,7 +108,7 @@ std::unique_ptr<llvm::Module> add_passes_to_emit_bin(
   dce.run(ir);
   peephole.run(ir);
   dce.run(ir);
-  pipeline.run(ir);
+  //pipeline.run(ir);
   dce.run(ir);
   // ir.print(std::cout);
   disassociate.run(ir);
