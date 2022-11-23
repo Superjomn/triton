@@ -133,9 +133,9 @@ namespace triton
         if (std::regex_search(ret, match, version_regex))
         {
           int major = std::stoi(match[1]);
-          major = 11;
+          //major = 11;
           int minor = std::stoi(match[2]);
-          minor = 4;
+          //minor = 4;
           version = major * 1000 + minor * 10;
           found = true;
           break;
@@ -145,6 +145,8 @@ namespace triton
       {
         throw std::runtime_error("Error in parsing version");
       }
+      printf("version: %d\n", version);
+
       return ptxas;
     }
 
@@ -152,13 +154,13 @@ namespace triton
     {
       if (version >= 11040)
         return 74;
-      // if(version >= 11030) return 73;
-      // if(version >= 11020) return 72;
-      // if(version >= 11010) return 71;
-      // if(version >= 11000) return 70;
-      // if(version >= 10020) return 65;
-      // if(version >= 10010) return 64;
-      // if(version >= 10000) return 63;
+       if(version >= 11030) return 73;
+       if(version >= 11020) return 72;
+       if(version >= 11010) return 71;
+       if(version >= 11000) return 70;
+       if(version >= 10020) return 65;
+       if(version >= 10010) return 64;
+       if(version >= 10000) return 63;
       throw std::runtime_error("Triton requires CUDA 11.4+");
     }
 

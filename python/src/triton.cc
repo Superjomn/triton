@@ -466,6 +466,7 @@ void init_triton_codegen(py::module &&m) {
             int version;
             std::string ptxas_path = drv::path_to_ptxas(version);
             printf("ptxas: %s\n", ptxas_path.c_str());
+            printf("cc: %d\n", cc);
             // Triton-IR -> NVPTX LLVM-IR
             triton::codegen::nvidia_cu_target target(cc);
             auto llvm = triton::codegen::add_passes_to_emit_bin(

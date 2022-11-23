@@ -2002,6 +2002,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       (m*2 + 1) + (n*4 + 2)*num_m, (m*2 + 1) + (n*4 + 3)*num_m
     };
     std::vector<Value*> args = {ha.first, ha.second, hb.first, hb.second};
+
+
     for(unsigned i = 0; i < 8; i++)
       args.push_back(acc[idx[i]]);
     // execute mma
@@ -2009,6 +2011,28 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     // unpack
     for(unsigned i = 0; i < 8; i++)
       acc[idx[i]] = extract_val(nc, {i});
+
+
+#define SHOW_MMA_V1 0
+#if SHOW_MMA_V1
+    auto get_f16 = [&](Value* value, int idx) {
+      return extract_elt(value, idx);
+    };
+
+    std::vector<Value*> pargs({gThreadId});
+    for (int i = 0; i < 4; i++) {
+      pargs.push_back(get_f16(args[i], 0));
+      pargs.push_back(get_f16(args[i], 1));
+    }
+    for (int i = 0; i < 8; i++) {
+      pargs.push_back(extract_val(nc, {i}));
+    }
+
+    vprintf("t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)\n", pargs, builder_);
+
+
+#endif
+
   };
 
   ir::phi_node* phiA = dynamic_cast<ir::phi_node*>(A);
@@ -2055,6 +2079,20 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       else
         register_lds(has, m+1, K, inc, ha10, ha11, is_prefetch);
     }
+#define SHOW_LD_A 1
+#if SHOW_LD_A
+    {
+      auto get_f16 = [&](Value* value, int idx) {
+        return extract_elt(value, idx);
+      };
+      std::vector<Value*> args;
+      for (auto& item : has) {
+        args.push_back(item.second.first);
+        args.push_back(item.second.second);
+        vprintf_array(gThreadId, args, "loaded A:", "%f", builder_);
+      }
+    };
+#endif
   };
 
   auto load_b = [&](int n, int K, int inc, bool is_prefetch) {
