@@ -2082,7 +2082,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       else
         register_lds(has, m+1, K, inc, ha10, ha11, is_prefetch);
     }
-#define SHOW_LD_A 1
+#define SHOW_LD_A 0
 #if SHOW_LD_A
     {
       auto get_f16 = [&](Value* value, int idx) {
