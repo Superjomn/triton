@@ -1936,7 +1936,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   std::vector<Value*> off_a(num_ptr_a);
   for(int i = 0; i < num_ptr_a; i++){
     Value* off_a0i = add(off_a0, i32(i*(is_a_row?4:stride_rep_m)));
-    vprintf("off_a0i,vec_a,: %d %d %d\n", {off_a0i, i32(vec_a), phase_a}, builder_);
     vprintf("t-%d off_a0i,vec_a,per_phase,max_phase: %d %d %d %d\n", {gThreadId, off_a0i, i32(vec_a), i32(per_phase_a),
                                                                       i32(max_phase_a)}, builder_);
 
