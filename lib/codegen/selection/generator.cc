@@ -1956,7 +1956,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   Value* off_b1 = is_b_row ? offset_b_k_[layout_c] : offset_b_n_[layout_c];
   Value* phase_b = urem(udiv(off_b1, i32(per_phase_b)), i32(max_phase_b));
 
-  vprintf("offB t-%d offB0,offB1,phaseB: %d %d %d\n", {off_b0, off_b1, phase_b}, rewriter);
+  vprintf("offB t-%d offB0,offB1,phaseB: %d %d %d\n", {gThreadId, off_b0, off_b1, phase_b}, rewriter);
   std::vector<Value*> off_b(num_ptr_b);
   for(int i = 0; i < num_ptr_b; i++){
     Value* off_b0i = add(off_b0, i32(i*(is_b_row?stride_rep_n:4)));
