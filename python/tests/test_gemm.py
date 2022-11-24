@@ -1,5 +1,6 @@
 import pytest
 import torch
+import pickle
 from torch.testing import assert_close
 
 import triton
@@ -191,6 +192,7 @@ def get_proper_err(a, b, golden):
     #[128, 64, 128, 4, 128, 64, 32, False, True],
 ])
 def test_gemm(SIZE_M, SIZE_N, SIZE_K, NUM_WARPS, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, TRANS_A, TRANS_B):
+    torch.manual_seed(0)
     if (TRANS_A):
         a = torch.randn((SIZE_K, SIZE_M), device='cuda', dtype=torch.float16).T
     else:
@@ -200,6 +202,13 @@ def test_gemm(SIZE_M, SIZE_N, SIZE_K, NUM_WARPS, BLOCK_SIZE_M, BLOCK_SIZE_N, BLO
         b = torch.randn((SIZE_N, SIZE_K), device='cuda', dtype=torch.float16).T
     else:
         b = torch.randn((SIZE_K, SIZE_N), device='cuda', dtype=torch.float16)
+
+    with open('./a.pkl', 'wb') as f:
+        pickle.dump(a, f)
+    with open('./b.pkl', 'wb') as f:
+        pickle.dump(b, f)
+
+    print('a', a)
 
     c = torch.empty((SIZE_M, SIZE_N), device=a.device, dtype=torch.float32)
     grid = lambda META: (1, )
