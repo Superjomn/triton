@@ -2142,7 +2142,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     } else
       ptrb = ptr_b[offidx];
 
-    printf("vecB t-0 %d\n", vec_b);
+    printf("vecB t-0 vecB,perPhase,MaxPhase: %d,%d,%d\n", vec_b, per_phase_b, max_phase_b);
 
     int stepbn = is_b_row ? n / (num_ptr_b)*(num_ptr_b) : n;
     int stepbk = is_b_row ? K : K / (num_ptr_b*vec_b)*(num_ptr_b*vec_b);
