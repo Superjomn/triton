@@ -2085,22 +2085,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       else
         register_lds(has, m+1, K, inc, ha10, ha11, is_prefetch);
     }
-#define SHOW_LD_A 1
-#if SHOW_LD_A
-    {
-      auto get_f16 = [&](Value* value, int idx) {
-        return extract_elt(value, idx);
-      };
-      std::vector<Value*> args;
-      for (auto& item : has) {
-        args.push_back(get_f16(item.second.first, 0));
-        args.push_back(get_f16(item.second.first, 1));
-        args.push_back(get_f16(item.second.second, 0));
-        args.push_back(get_f16(item.second.second, 1));
-        vprintf_array(gThreadId, args, "loadedA", "%f", builder_);
-      }
-    };
-#endif
   };
 
   auto load_b = [&](int n, int K, int inc, bool is_prefetch) {
@@ -2188,6 +2172,23 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       if(has.find({m, K}) == has.end())
         load_a(m, K, /*inc*/0, /*is_prefetch*/false);
     }
+
+#define SHOW_LD_A 1
+#if SHOW_LD_A
+    {
+      auto get_f16 = [&](Value* value, int idx) {
+        return extract_elt(value, idx);
+      };
+      std::vector<Value*> args;
+      for (auto& item : has) {
+        args.push_back(get_f16(item.second.first, 0));
+        args.push_back(get_f16(item.second.first, 1));
+        args.push_back(get_f16(item.second.second, 0));
+        args.push_back(get_f16(item.second.second, 1));
+        vprintf_array(gThreadId, args, "loadedA", "%f", builder_);
+      }
+    };
+#endif
 
     for(unsigned K = 0; K < NK; K += 4)
       for(unsigned m = 0; m < num_m/2; m++)
