@@ -2070,7 +2070,9 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
     int step_am = is_a_row ? m : m / (num_ptr_a)*(num_ptr_a);
     int step_ak = is_a_row ? K / (num_ptr_a*vec_a)*(num_ptr_a*vec_a) : K;
-    Value* pa =  gep(ptra, i32(step_am*stride_rep_m*stride_am + step_ak*stride_ak));
+    auto offset = i32(step_am*stride_rep_m*stride_am + step_ak*stride_ak);
+    vprintf("offset_A t-%d %d\n", {gThreadId, offset}, builder_);
+    Value* pa =  gep(ptra, offset);
     Value* ha = load(bit_cast(pa, ptr_ty(vec_ty(i32_ty, vec_a/2), 3)));
     // record lds that needs to be moved
     if (K == 0 && inc == 1 && is_prefetch)
