@@ -1990,10 +1990,14 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   std::vector<Value*> ptr_a(num_ptr_a);
   std::vector<Value*> ptr_b(num_ptr_b);
   std::map<std::pair<int, int>, std::pair<Value*, Value*>> has, hbs;
+  llvm::outs() << "smem.type: " << shmems_[A]->getType() << "\n";
   for(int i = 0; i < num_ptr_a; i++)
     ptr_a[i] = gep(shmems_[A], off_a[i]);
   for(int i = 0; i < num_ptr_b; i++)
     ptr_b[i] = gep(shmems_[B], off_b[i]);
+
+
+  llvm::outs() << "ptr_a.type: " << ptr_a[0]->getType() << "\n";
 
 
   // initialize accumulators
@@ -2069,10 +2073,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     int offidx = (is_a_row ? K/4 : m) % num_ptr_a;
     Value* ptra;
     if(K==0 && is_prefetch){
-      if(inc == 0)
-        ptra = gep(shared_pre_ptr_[layout_a], off_a[offidx]);
-      else
-        ptra = gep(shared_next_ptr_[layout_a], off_a[offidx]);
+      assert(false);
     }
     else
       ptra = ptr_a[offidx];
