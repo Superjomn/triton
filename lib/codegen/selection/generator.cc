@@ -2065,7 +2065,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     else
       ptra = ptr_a[offidx];
 
-    vprintf("t-%d offA: %d\n", {gThreadId, off_a[offidx]}, builder_);
+    vprintf("offA t-%d %d\n", {gThreadId, off_a[offidx]}, builder_);
 
     int step_am = is_a_row ? m : m / (num_ptr_a)*(num_ptr_a);
     int step_ak = is_a_row ? K / (num_ptr_a*vec_a)*(num_ptr_a*vec_a) : K;
