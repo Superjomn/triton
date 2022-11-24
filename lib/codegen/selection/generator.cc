@@ -2196,6 +2196,23 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
             load_b(n, K, /*inc*/0, /*is_prefetch*/false);
         }
 
+#define SHOW_LD_B 1
+#if SHOW_LD_B
+    {
+      auto get_f16 = [&](Value* value, int idx) {
+        return extract_elt(value, idx);
+      };
+      for (auto& item : has) {
+        std::vector<Value*> args;
+        args.push_back(get_f16(item.second.first, 0));
+        args.push_back(get_f16(item.second.first, 1));
+        args.push_back(get_f16(item.second.second, 0));
+        args.push_back(get_f16(item.second.second, 1));
+        vprintf_array(gThreadId, args, "loadedB", "%f", builder_);
+      }
+    };
+#endif
+
     for(unsigned K = 0; K < NK; K += 4)
       for(unsigned m = 0; m < num_m/2; m++)
         for(unsigned n = 0; n < num_n/2; n++) {
