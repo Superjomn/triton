@@ -1966,6 +1966,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     off_b0i = mul(off_b0i, i32(vec_b));
     off_b[i] = add(mul(off_b0i, i32(stride_b0)), mul(off_b1, i32(stride_b1)));
   }
+  vprintf_array(gThreadId, off_b, "offBs", "%d", rewriter);
+
   builder_->SetInsertPoint(curr_bb);
 
   /* --------------------------------- */
