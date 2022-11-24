@@ -2150,8 +2150,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       auto get_f16 = [&](Value* value, int idx) {
         return extract_elt(value, idx);
       };
-      std::vector<Value*> args;
       for (auto& item : has) {
+        std::vector<Value*> args;
         args.push_back(get_f16(item.second.first, 0));
         args.push_back(get_f16(item.second.first, 1));
         args.push_back(get_f16(item.second.second, 0));
