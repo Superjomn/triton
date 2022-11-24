@@ -2008,7 +2008,14 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
   vprintf_array(gThreadId, ptr_b, "ptrBs", "%d", rewriter);
 
-  vprintf("B.smem t-%d %d", {gThreadId, shmems_[B]}, rewriter);
+  {
+    std::vector<Value*> args;
+    for (auto& v : ptr_b){
+      auto newv = gep(v, i32(-512));
+      args.push_back(newv);
+    }
+    vprintf_array(gThreadId, args, "ptrBs", "%d", rewriter);
+  }
 
 
   llvm::outs() << "ptr_a.type t-0 " << type_to_str(ptr_a[0]->getType()) << "\n";
