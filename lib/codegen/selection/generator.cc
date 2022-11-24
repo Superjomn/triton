@@ -1936,17 +1936,19 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   Value* phase_a = urem(udiv(off_a1, i32(per_phase_a)), i32(max_phase_a));
   std::vector<Value*> off_a(num_ptr_a);
   for(int i = 0; i < num_ptr_a; i++){
+    std::vector<Value*> args;
     Value* off_a0i = add(off_a0, i32(i*(is_a_row?4:stride_rep_m)));
-    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a0i}, rewriter);
-
+    args.push_back(off_a0i);
     off_a0i = exact_udiv(off_a0i, i32(vec_a));
-    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a0i}, rewriter);
+    args.push_back(off_a0i);
     off_a0i = xor_(off_a0i, phase_a);
-    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a0i}, rewriter);
+    args.push_back(off_a0i);
     off_a0i = mul(off_a0i, i32(vec_a));
-    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a0i}, rewriter);
+    args.push_back(off_a0i);
+
     off_a[i] = add(mul(off_a0i, i32(stride_a0)), mul(off_a1, i32(stride_a1)));
-    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a[i]}, rewriter);
+    args.push_back(off_a[i]);
+    vprintf_array(gThreadId, args, "offA_0i", "%d", rewriter);
   }
 
   vprintf_array(gThreadId, off_a, "offA_i", "%d", builder_);
