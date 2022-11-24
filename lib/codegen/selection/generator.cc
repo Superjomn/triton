@@ -2031,7 +2031,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       pargs.push_back(extract_val(nc, {i}));
     }
 
-    vprintf("t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)\n", pargs, builder_);
+    vprintf("mma t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)\n", pargs, builder_);
 
 
 #endif
@@ -2085,7 +2085,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       else
         register_lds(has, m+1, K, inc, ha10, ha11, is_prefetch);
     }
-#define SHOW_LD_A 0
+#define SHOW_LD_A 1
 #if SHOW_LD_A
     {
       auto get_f16 = [&](Value* value, int idx) {
