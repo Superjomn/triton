@@ -2009,16 +2009,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
   vprintf_array(gThreadId, ptr_b, "ptrBs", "%d", rewriter);
 
-  {
-    std::vector<Value*> args;
-    for (auto& v : ptr_b){
-      //auto newv = gep(v, i32(-(512/16)));
-
-      args.push_back(v);
-    }
-    vprintf_array(gThreadId, args, "ptrBs", "%d", rewriter);
-  }
-
 
   llvm::outs() << "ptr_a.type t-0 " << type_to_str(ptr_a[0]->getType()) << "\n";
 
@@ -2151,6 +2141,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
         ptrb = gep(shared_next_ptr_[layout_b], off_b[offidx]);
     } else
       ptrb = ptr_b[offidx];
+
+    printf("vecB t-0 %d\n", vec_b);
 
     int stepbn = is_b_row ? n / (num_ptr_b)*(num_ptr_b) : n;
     int stepbk = is_b_row ? K : K / (num_ptr_b*vec_b)*(num_ptr_b*vec_b);
