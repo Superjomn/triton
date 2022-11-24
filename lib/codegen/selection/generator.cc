@@ -2001,6 +2001,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     return buf;
   };
 
+  printf("num_ptr_b t-0 %d\n", num_ptr_b);
   for(int i = 0; i < num_ptr_a; i++)
     ptr_a[i] = gep(shmems_[A], off_a[i]);
   for(int i = 0; i < num_ptr_b; i++)
