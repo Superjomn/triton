@@ -104,7 +104,8 @@ packArgsIntoNVPTXFormatBuffer(Builder* builder, ArrayRef<Value*> Args) {
   }
 }
 
-void vprintf( const char* fmt, ArrayRef<Value*> Args, Builder* builder) {
+void vprintf(std::string fmt, ArrayRef<Value*> Args, Builder* builder) {
+  fmt += "\n";
   auto* mod = builder->GetInsertBlock()->getModule();
 
   auto* funcType = GetVprintfDeclaration(*mod);
