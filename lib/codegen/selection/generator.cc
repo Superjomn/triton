@@ -2131,7 +2131,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     for(unsigned m = 0; m < num_m/2; m++)
       if(has.find({m, K}) == has.end())
         load_a(m, K, /*inc*/0, /*is_prefetch*/false);
-    }
+
 
 #define SHOW_LD_A 1
 #if SHOW_LD_A
