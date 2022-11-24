@@ -121,7 +121,7 @@ void vprintf( const char* fmt, ArrayRef<Value*> Args, Builder* builder) {
 }
 
 void vprintf_array(Value* thread, ArrayRef<Value*> arr, std::string info, std::string elem_repr, Builder* builder) {
-  std::string fmt = info + " t-%d " + " ";
+  std::string fmt = info + " t-%d ";
   std::vector<Value*> new_arr({thread});
   for (auto* v : arr) {
     fmt += elem_repr + ", ";
