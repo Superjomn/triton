@@ -2000,12 +2000,13 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     return buf;
   };
 
-  llvm::outs() << "smem.type t-0 " << type_to_str(shmems_[A]->getType()) << "\n";
-
   for(int i = 0; i < num_ptr_a; i++)
     ptr_a[i] = gep(shmems_[A], off_a[i]);
   for(int i = 0; i < num_ptr_b; i++)
     ptr_b[i] = gep(shmems_[B], off_b[i]);
+
+
+  vprintf("B.smem t-%d %d", {gThreadId, shmems_[B]}, rewriter);
 
 
   llvm::outs() << "ptr_a.type t-0 " << type_to_str(ptr_a[0]->getType()) << "\n";
