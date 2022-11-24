@@ -2006,6 +2006,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   for(int i = 0; i < num_ptr_b; i++)
     ptr_b[i] = gep(shmems_[B], off_b[i]);
 
+  vprintf_array(gThreadId, ptr_b, "ptrBs", "%d", rewriter);
 
   vprintf("B.smem t-%d %d", {gThreadId, shmems_[B]}, rewriter);
 
