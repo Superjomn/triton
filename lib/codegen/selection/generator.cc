@@ -121,7 +121,7 @@ void vprintf( const char* fmt, ArrayRef<Value*> Args, Builder* builder) {
 }
 
 void vprintf_array(Value* thread, ArrayRef<Value*> arr, std::string info, std::string elem_repr, Builder* builder) {
-  std::string fmt = "t-%d " + info + ": ";
+  std::string fmt = info + " t-%d " + " ";
   std::vector<Value*> new_arr({thread});
   for (auto* v : arr) {
     fmt += elem_repr + ", ";
@@ -2097,7 +2097,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
         args.push_back(get_f16(item.second.first, 1));
         args.push_back(get_f16(item.second.second, 0));
         args.push_back(get_f16(item.second.second, 1));
-        vprintf_array(gThreadId, args, "loaded A:", "%f", builder_);
+        vprintf_array(gThreadId, args, "loadedA", "%f", builder_);
       }
     };
 #endif
