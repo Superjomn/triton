@@ -46,7 +46,7 @@ using ::mlir::triton::gpu::SliceEncodingAttr;
 namespace mlir {
 namespace LLVM {
 
-Value thread;
+Value gThreadId;
 
 static StringRef getStructAttrsAttrName() { return "llvm.struct_attrs"; }
 
@@ -94,7 +94,26 @@ static Value createLLVMIntegerConstant(OpBuilder &builder, Location loc,
 void llPrintf(StringRef msg, ValueRange args,
               ConversionPatternRewriter &rewriter);
 
+void vprintf(StringRef msg, ValueRange args,
+             ConversionPatternRewriter &rewriter) {
+  llPrintf(msg, args, rewriter);
+}
+
+void vprintf_array(Value thread, ArrayRef<Value> arr, std::string info,
+                   std::string elem_repr, ConversionPatternRewriter &builder) {
+  std::string fmt = info + " t-%d ";
+  std::vector<Value> new_arr({thread});
+  for (auto v : arr) {
+    fmt += elem_repr + ", ";
+    new_arr.push_back(v);
+  }
+  fmt += "";
+
+  vprintf(fmt, new_arr, builder);
+}
+
 // Shortcuts for some commonly used LLVM ops to keep code simple and intuitive
+
 #define inttoptr(...) rewriter.create<LLVM::IntToPtrOp>(loc, __VA_ARGS__)
 #define ptrtoint(...) rewriter.create<LLVM::PtrToIntOp>(loc, __VA_ARGS__)
 #define zext(...) rewriter.create<LLVM::ZExtOp>(loc, __VA_ARGS__)
@@ -536,6 +555,7 @@ public:
         ValueRange{rewriter.create<::mlir::gpu::ThreadIdOp>(
             loc, rewriter.getIndexType(), ::mlir::gpu::Dimension::x)});
     Value threadId = cast.getResult(0);
+    LLVM::gThreadId = threadId;
     return threadId;
   }
 
@@ -4829,6 +4849,7 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
   auto DShape = DTensorTy.getShape();
   auto wpt = mmaLayout.getWarpsPerCTA();
 
+  // TODO[Superjomn]: deal with the transA/transB.
   bool transA = op.transA();
   bool transB = op.transB();
 
@@ -4892,7 +4913,7 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
     auto mma = builder.create("mma.sync.aligned.m8n8k4")
                    ->o(isARow ? "row" : "col")
                    .o(isBRow ? "row" : "col")
-                   .o(".f32.f16.f16.f32");
+                   .o("f32.f16.f16.f32");
 
     mma(resOprs, AOprs, BOprs, COprs);
 
@@ -4927,11 +4948,19 @@ Value DotOpMmaV1ConversionHelper::loadA(
   Value smem = smemObj.base;
   auto strides = smemObj.strides;
 
+  // TODO[Superjomn]: deal with DotOp::transA here
+  //  NOTE currently we can't access it in ConvertLayoutOp.
+  bool transA = false;
+
   auto *ctx = rewriter.getContext();
   auto tensorTy = tensor.getType().cast<RankedTensorType>();
-  auto shape = tensorTy.getShape();
   auto sharedLayout = tensorTy.getEncoding().cast<SharedEncodingAttr>();
-  auto order = sharedLayout.getOrder();
+  SmallVector<unsigned> shape ( tensorTy.getShape().begin(), tensorTy.getShape().end());
+  SmallVector<unsigned> order (sharedLayout.getOrder().begin(), sharedLayout.getOrder().end());
+  if (transA) {
+    std::swap(shape[0], shape[1]);
+    std::swap(order[0], order[1]);
+  }
 
   bool isARow = order[0] != 0;
   bool isAVec4 = !isARow && shape[order[0]] <= 16; // fp16*4 = 16bytes
@@ -4943,8 +4972,16 @@ Value DotOpMmaV1ConversionHelper::loadA(
   int spwM = fpw[0] * 4 * repM;
   SmallVector<int> rep({repM, 0, repK}); // pad N with 0
   SmallVector<int> spw({spwM, 0, 1});    // pad N with 0
+  printf("Aparams t-0 isARow:%d isAVec4:%d packSize0:%d repM:%d repK%d spwM:%d\n",
+         isARow,
+         isAVec4,
+         packSize0,
+         repM,
+         repK,
+         spwM);
 
   int vecA = sharedLayout.getVec();
+  vecA = 4; // debug
 
   Value strideAM = isARow ? strides[0] : i32_val(1);
   Value strideAK = isARow ? i32_val(1) : strides[1];
@@ -4956,6 +4993,7 @@ Value DotOpMmaV1ConversionHelper::loadA(
 
   auto [offsetAM, offsetAK, _0, _1] =
       computeOffsets(thread, isARow, false, fpw, spw, rep, rewriter, loc);
+  if (transA) std::swap(offsetAM, offsetAK);
 
   // swizzling
   int perPhaseA = sharedLayout.getPerPhase();
@@ -4969,19 +5007,31 @@ Value DotOpMmaV1ConversionHelper::loadA(
   Value offA1 = isARow ? offsetAM : offsetAK;
   Value phaseA = urem(udiv(offA1, i32_val(perPhaseA)), i32_val(maxPhaseA));
   SmallVector<Value> offA(numPtrA);
+  using namespace LLVM;
 
+  vprintf("show0 t-%d phase_a:%d vec_a:%d", {gThreadId, phaseA, i32_val(vecA)}, rewriter);
   for (int i = 0; i < numPtrA; i++) {
+    std::vector<Value> args;
     Value offA0I = add(offA0, i32_val(i * (isARow ? 4 : strideRepM)));
+    args.push_back(offA0I);
     offA0I = udiv(offA0I, i32_val(vecA));
+    args.push_back(offA0I);
     offA0I = xor_(offA0I, phaseA);
-    offA0I = xor_(offA0I, i32_val(vecA));
+    vprintf("show1 phaseA t-%d %d^%d=%d", {gThreadId, args.back(), phaseA, offA0I}, rewriter);
+    args.push_back(offA0I);
+    offA0I = mul(offA0I, i32_val(vecA));
+    vprintf("show1 vecA t-%d %d^%d=%d", {gThreadId, args.back(), i32_val(vecA), offA0I}, rewriter);
+    args.push_back(offA0I); // wrong
     offA[i] = add(mul(offA0I, strideA0), mul(offA1, strideA1));
+    args.push_back(offA[i]); // wrong
+    vprintf_array(gThreadId, args, "offA_0i", "%d", rewriter);
   }
+
+  vprintf_array(gThreadId, offA, "offA_i", "%d", rewriter);
 
   Type f16x2Ty = vec_ty(f16_ty, 2);
   // One thread get 8 elements as result
-  Type retTy =
-      LLVM::LLVMStructType::getLiteral(ctx, SmallVector(8, type::f32Ty(ctx)));
+  Type retTy = struct_ty(SmallVector(8, type::f32Ty(ctx)));
 
   // prepare arguments
   SmallVector<Value> ptrA(numPtrA);
@@ -4991,24 +5041,35 @@ Value DotOpMmaV1ConversionHelper::loadA(
     ptrA[i] = gep(ptr_ty(f16_ty), smem, offA[i]);
 
   auto instrShape = getMmaInstrShape();
-  unsigned numM = rep[0] * shape[0] / (spw[0] * wpt[0]);
+  unsigned numM = std::max<int>(rep[0] * shape[0] / (spw[0] * wpt[0]), 1);
 
   Type f16PtrTy = ptr_ty(f16_ty);
+  using namespace LLVM;
 
   auto ld = [&](decltype(has) &vals, int m, int k, Value val0, Value val1) {
     vals[{m, k}] = {val0, val1};
   };
   auto loadA = [&](int m, int k) {
+    printf("loada_args t-0 m,n: (%d,%d)\n", m, k);
     int offidx = (isARow ? k / 4 : m) % numPtrA;
-    Value thePtrA = gep(f16PtrTy, smem, offA[offidx]);
+    vprintf("offA2 t-%d: %d", {gThreadId, offA[offidx]}, rewriter);
+    Value offA_ = offA[offidx];
+    //offA_ = i32_val(0);
+    Value thePtrA = gep(f16PtrTy, smem, offA_);
 
     int stepAM = isARow ? m : m / numPtrA * numPtrA;
     int stepAK = isARow ? k / (numPtrA * vecA) * (numPtrA * vecA) : k;
     Value offset = add(mul(i32_val(stepAM * strideRepM), strideAM),
                        mul(i32_val(stepAK), strideAK));
+    //offset = i32_val(0);
+
+    vprintf("offset_A t-%d %d %d", {gThreadId, offA[offidx], offset}, rewriter);
     Value pa = gep(f16PtrTy, thePtrA, offset);
+
     Type aPtrTy = ptr_ty(vec_ty(i32_ty, std::max<int>(vecA / 2, 1)), 3);
+    vprintf("ha t-%d before load", {gThreadId}, rewriter);
     Value ha = load(bitcast(pa, aPtrTy));
+    vprintf("ha t-%d after load", {gThreadId}, rewriter);
     // record lds that needs to be moved
     Value ha00 = bitcast(extract_element(ha, i32_val(0)), f16x2Ty);
     Value ha01 = bitcast(extract_element(ha, i32_val(1)), f16x2Ty);
@@ -5022,12 +5083,31 @@ Value DotOpMmaV1ConversionHelper::loadA(
       else
         ld(has, m + 1, k, ha10, ha11);
     }
+
   };
 
+  printf("NKM t-0 NK, num_m: %d %d\n", NK, numM);
   for (unsigned k = 0; k < NK; k += 4)
     for (unsigned m = 0; m < numM / 2; ++m)
-      if (!has.count({m, k}))
         loadA(m, k);
+
+
+#define SHOW_LD_A 1
+#if SHOW_LD_A
+  {
+    auto get_f16 = [&](Value value, int idx) {
+      return extract_element(value, i32_val(idx));
+    };
+    std::vector<Value> args;
+    for (auto& item : has) {
+      args.push_back(get_f16(item.second.first, 0));
+      args.push_back(get_f16(item.second.first, 1));
+      args.push_back(get_f16(item.second.second, 0));
+      args.push_back(get_f16(item.second.second, 1));
+      LLVM::vprintf_array(LLVM::gThreadId, args, "loaded A:", "%f", rewriter);
+    }
+  };
+#endif
 
   SmallVector<Value> elems;
   elems.reserve(has.size() * 2);
@@ -5211,7 +5291,7 @@ DotOpMmaV1ConversionHelper::computeOffsets(Value threadId, bool isARow,
     offsetBK = i32_val(0);
   }
 
-  LLVM::llPrintf("offsets: %d,%d,%d,%d", {offsetAM, offsetAK, offsetBN, offsetBK}, rewriter);
+  //LLVM::llPrintf("offsets: %d,%d,%d,%d", {offsetAM, offsetAK, offsetBN, offsetBK}, rewriter);
 
   return std::make_tuple(offsetAM, offsetAK, offsetBN, offsetBK);
 }
