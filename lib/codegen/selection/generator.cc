@@ -2121,51 +2121,9 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
   // update accumulators
   if (C->is_prefetched()) {
-    // create phis
-    builder_->SetInsertPoint(curr_bb->getFirstNonPHI());
-    for (unsigned m = 0; m < num_m/2; m += is_a_row?1:2) {
-      has[{m, 0}].first = phi(f16x2_ty, 2);
-      has[{m, 0}].second = phi(f16x2_ty, 2);
-      if (!is_a_row && vec_a>4) {
-        has[{m+1, 0}].first = phi(f16x2_ty, 2);
-        has[{m+1, 0}].second = phi(f16x2_ty, 2);
-      }
-    }
-    for (unsigned n = 0; n < num_n/2; n += is_b_row?2:1) {
-      hbs[{n, 0}].first = phi(f16x2_ty, 2);
-      hbs[{n, 0}].second = phi(f16x2_ty, 2);
-      if (is_b_row && vec_b>4) {
-        hbs[{n+1, 0}].first = phi(f16x2_ty, 2);
-        hbs[{n+1, 0}].second = phi(f16x2_ty, 2);
-      }
-    }
-
-    // insert prefetched lds at the end of loop header
-    builder_->SetInsertPoint(bbs_[phiA->get_incoming_block(0)]->getTerminator());
-    for (unsigned m = 0; m < num_m/2; m += is_a_row?1:2)
-      load_a(m, 0, 0, true);
-    for (unsigned n = 0; n < num_n/2; n += is_b_row?2:1)
-      load_b(n, 0, 0, true);
-
-    // update accumulators
-    builder_->SetInsertPoint(curr_bb);
-    for (unsigned K = 0; K < NK; K += 4) {
-      int NEXTK = (K + 4) % NK;
-      // prefetch A
-      for (unsigned m = 0; m < num_m/2; m+=is_a_row?1:2)
-        load_a(m, NEXTK, 1, true);
-      // prefetch B
-      for (unsigned n = 0; n < num_n/2; n+=is_b_row?2:1)
-        load_b(n, NEXTK, 1, true);
-      // tensor core ops
-      for(unsigned m = 0; m < num_m/2; m++)
-      for(unsigned n = 0; n < num_n/2; n++){
-        call_mma(m, n, K);
-      }
-    }
     assert(false);
   } else { // not prefetched
-    printf("NK, num_m, num_n: %d %d %d\n", NK, num_m);
+    printf("NKM t-0 NK, num_m, num_n: %d %d\n", NK, num_m);
     for(unsigned K = 0; K < NK; K += 4)
     for(unsigned m = 0; m < num_m/2; m++)
     for(unsigned n = 0; n < num_n/2; n++) {
