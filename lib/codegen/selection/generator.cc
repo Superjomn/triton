@@ -1867,6 +1867,7 @@ void generator::visit_atomic_rmw_inst(ir::atomic_rmw_inst *atom) {
  */
 //TODO: clean-up
 void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::value *D, unsigned NK) {
+  auto rewriter = builder_;
   // shapes
   auto shape_c = C->get_type()->get_block_shapes();
   auto shape_a = A->get_type()->get_block_shapes();
@@ -1936,13 +1937,16 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   std::vector<Value*> off_a(num_ptr_a);
   for(int i = 0; i < num_ptr_a; i++){
     Value* off_a0i = add(off_a0, i32(i*(is_a_row?4:stride_rep_m)));
-    vprintf("offset t-%d off_a0i,vec_a,per_phase,max_phase: %d %d %d %d\n", {gThreadId, off_a0i, i32(vec_a), i32(per_phase_a),
-                                                                      i32(max_phase_a)}, builder_);
+    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a0i}, rewriter);
 
     off_a0i = exact_udiv(off_a0i, i32(vec_a));
+    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a0i}, rewriter);
     off_a0i = xor_(off_a0i, phase_a);
+    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a0i}, rewriter);
     off_a0i = mul(off_a0i, i32(vec_a));
+    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a0i}, rewriter);
     off_a[i] = add(mul(off_a0i, i32(stride_a0)), mul(off_a1, i32(stride_a1)));
+    vprintf("offA_0i t-%d %d\n", {gThreadId, off_a[i]}, rewriter);
   }
 
   vprintf_array(gThreadId, off_a, "offA_i", "%d", builder_);
