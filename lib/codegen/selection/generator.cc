@@ -1990,14 +1990,26 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   std::vector<Value*> ptr_a(num_ptr_a);
   std::vector<Value*> ptr_b(num_ptr_b);
   std::map<std::pair<int, int>, std::pair<Value*, Value*>> has, hbs;
-  llvm::outs() << "smem.type t-0 " << shmems_[A]->getType() << "\n";
+  std::string buf;
+  llvm::raw_string_ostream os(buf);
+
+  auto type_to_str = [](Type* x) {
+    std::string buf;
+    llvm::raw_string_ostream os(buf);
+    x->print(os);
+    os.flush();
+    return buf;
+  };
+
+  llvm::outs() << "smem.type t-0 " << type_to_str(shmems_[A]->getType()) << "\n";
+
   for(int i = 0; i < num_ptr_a; i++)
     ptr_a[i] = gep(shmems_[A], off_a[i]);
   for(int i = 0; i < num_ptr_b; i++)
     ptr_b[i] = gep(shmems_[B], off_b[i]);
 
 
-  llvm::outs() << "ptr_a.type t-0 " << ptr_a[0]->getType() << "\n";
+  llvm::outs() << "ptr_a.type t-0 " << type_to_str(ptr_a[0]->getType()) << "\n";
 
 
   // initialize accumulators
