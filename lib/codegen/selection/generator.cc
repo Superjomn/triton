@@ -2054,6 +2054,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   };
 
   auto load_a = [&](int m, int K, int inc, bool is_prefetch) {
+    printf("loada_args t-0 m,n: (%d,%d)\n", m, K);
     int offidx = (is_a_row ? K/4 : m) % num_ptr_a;
     Value* ptra;
     if(K==0 && is_prefetch){
