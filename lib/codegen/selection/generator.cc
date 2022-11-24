@@ -2090,7 +2090,24 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       prefetch_latch_to_bb_[phiA->get_incoming_value(1)].push_back(ha);
     Value *ha00 = bit_cast(extract_elt(ha, i32(0)), f16x2_ty);
     Value *ha01 = bit_cast(extract_elt(ha, i32(1)), f16x2_ty);
+
+
     register_lds(has, m, K, inc, ha00, ha01, is_prefetch);
+
+
+    {
+      auto get_f16 = [&](Value* value, int idx) {
+        return extract_elt(value, idx);
+      };
+
+      std::vector<Value*> args;
+      args.push_back(get_f16(ha00, 0));
+      args.push_back(get_f16(ha00, 1));
+      args.push_back(get_f16(ha01, 0));
+      args.push_back(get_f16(ha01, 1));
+      vprintf_array(gThreadId, args, "ha0x", "%f", rewriter);
+    }
+
     if(vec_a > 4){
       Value *ha10 = bit_cast(extract_elt(ha, i32(2)), f16x2_ty);
       Value *ha11 = bit_cast(extract_elt(ha, i32(3)), f16x2_ty);
