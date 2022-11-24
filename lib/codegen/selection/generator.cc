@@ -2011,7 +2011,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   {
     std::vector<Value*> args;
     for (auto& v : ptr_b){
-      auto newv = gep(v, i32(-512/16));
+      auto newv = gep(v, i32(-512));
       args.push_back(newv);
     }
     vprintf_array(gThreadId, args, "ptrBs", "%d", rewriter);
