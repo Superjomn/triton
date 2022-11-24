@@ -1935,7 +1935,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   Value* off_a1 = is_a_row ? offset_a_m_[layout_c] : offset_a_k_[layout_c];
   Value* phase_a = urem(udiv(off_a1, i32(per_phase_a)), i32(max_phase_a));
   std::vector<Value*> off_a(num_ptr_a);
-  vprintf("show0 t-%d phase_a:%d vec_a:%d", {gThreadId, phase_a, i32(vec_a)}, rewriter);
+  vprintf("show0 t-%d phase_a:%d vec_a:%d\n", {gThreadId, phase_a, i32(vec_a)}, rewriter);
   for(int i = 0; i < num_ptr_a; i++){
     std::vector<Value*> args;
     Value* off_a0i = add(off_a0, i32(i*(is_a_row?4:stride_rep_m)));
