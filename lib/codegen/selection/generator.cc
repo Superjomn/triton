@@ -1943,6 +1943,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     off_a0i = exact_udiv(off_a0i, i32(vec_a));
     args.push_back(off_a0i);
     off_a0i = xor_(off_a0i, phase_a);
+    vprintf("show1 t-%d %d^%d=%d\n", {gThreadId, off_a0i, phase_a, off_a0i}, rewriter);
     args.push_back(off_a0i);
     off_a0i = mul(off_a0i, i32(vec_a));
     args.push_back(off_a0i);
