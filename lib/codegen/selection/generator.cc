@@ -1955,6 +1955,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   Value* off_b0 = is_b_row ? offset_b_n_[layout_c] : offset_b_k_[layout_c];
   Value* off_b1 = is_b_row ? offset_b_k_[layout_c] : offset_b_n_[layout_c];
   Value* phase_b = urem(udiv(off_b1, i32(per_phase_b)), i32(max_phase_b));
+
+  vprintf("offB t-%d offB0,offB1,phaseB: %d %d %d\n", {off_b0, off_b1, phase_b}, rewriter);
   std::vector<Value*> off_b(num_ptr_b);
   for(int i = 0; i < num_ptr_b; i++){
     Value* off_b0i = add(off_b0, i32(i*(is_b_row?stride_rep_n:4)));
@@ -2098,8 +2100,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     llvm::outs() << "aPtrTy t-0 " << type_to_str(ptrTy) << "\n";
     Value* ha = load(bit_cast(pa, ptrTy));
     // record lds that needs to be moved
-    if (K == 0 && inc == 1 && is_prefetch)
-      prefetch_latch_to_bb_[phiA->get_incoming_value(1)].push_back(ha);
+    //if (K == 0 && inc == 1 && is_prefetch)
+      //prefetch_latch_to_bb_[phiA->get_incoming_value(1)].push_back(ha);
     Value *ha00 = bit_cast(extract_elt(ha, i32(0)), f16x2_ty);
     Value *ha01 = bit_cast(extract_elt(ha, i32(1)), f16x2_ty);
     register_lds(has, m, K, inc, ha00, ha01, is_prefetch);
