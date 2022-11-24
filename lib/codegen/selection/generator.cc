@@ -2093,7 +2093,10 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     Value* pa =  gep(ptra, offset);
     vprintf("offset_A t-%d %d %d\n", {gThreadId, pa, offset}, builder_);
     llvm::outs() << "pa t-0 " << type_to_str(pa->getType()) << "\n";
-    Value* ha = load(bit_cast(pa, ptr_ty(vec_ty(i32_ty, vec_a/2), 3)));
+    vprintf("ha0x t-%d address %d\n", {gThreadId, pa}, rewriter);
+    auto ptrTy = ptr_ty(vec_ty(i32_ty, vec_a/2), 3);
+    llvm::outs() << "aPtrTy t-0 " << type_to_str(ptrTy) << "\n";
+    Value* ha = load(bit_cast(pa, ptrTy));
     // record lds that needs to be moved
     if (K == 0 && inc == 1 && is_prefetch)
       prefetch_latch_to_bb_[phiA->get_incoming_value(1)].push_back(ha);
@@ -2101,7 +2104,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     Value *ha01 = bit_cast(extract_elt(ha, i32(1)), f16x2_ty);
     register_lds(has, m, K, inc, ha00, ha01, is_prefetch);
 
-    vprintf("ha0x t-%d address %d\n", {gThreadId, pa}, rewriter);
     {
       auto get_f16 = [&](Value* value, int idx) {
         return extract_elt(value, idx);
