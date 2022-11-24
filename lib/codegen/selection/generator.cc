@@ -2090,12 +2090,10 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     else
       ptra = ptr_a[offidx];
 
-    vprintf("offA t-%d %d\n", {gThreadId, off_a[offidx]}, builder_);
-
     int step_am = is_a_row ? m : m / (num_ptr_a)*(num_ptr_a);
     int step_ak = is_a_row ? K / (num_ptr_a*vec_a)*(num_ptr_a*vec_a) : K;
     auto offset = i32(step_am*stride_rep_m*stride_am + step_ak*stride_ak);
-    vprintf("offset_A t-%d %d %d\n", {gThreadId, off_a[offidx], offset}, builder_);
+    vprintf("offset_A t-%d %d %d\n", {gThreadId, ptra, offset}, builder_);
     Value* pa =  gep(ptra, offset);
     llvm::outs() << "pa t-0 " << type_to_str(pa->getType()) << "\n";
     Value* ha = load(bit_cast(pa, ptr_ty(vec_ty(i32_ty, vec_a/2), 3)));
@@ -2104,10 +2102,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       prefetch_latch_to_bb_[phiA->get_incoming_value(1)].push_back(ha);
     Value *ha00 = bit_cast(extract_elt(ha, i32(0)), f16x2_ty);
     Value *ha01 = bit_cast(extract_elt(ha, i32(1)), f16x2_ty);
-
-
     register_lds(has, m, K, inc, ha00, ha01, is_prefetch);
-
 
     {
       auto get_f16 = [&](Value* value, int idx) {
