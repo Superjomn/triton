@@ -1892,7 +1892,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   analysis::shared_layout* layout_b = layouts_->get(B)->to_shared();
   // vectorization
   int vec_a = swizzle_->get_vec(layout_a);
-  vec_a = 1; // match mlir
   int vec_b = swizzle_->get_vec(layout_b);
   // strides
   bool is_a_row = ord_a[0] != 0;
