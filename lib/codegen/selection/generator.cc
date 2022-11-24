@@ -84,7 +84,6 @@ packArgsIntoNVPTXFormatBuffer(Builder* builder, ArrayRef<Value*> Args) {
     // clang type.
     llvm::Type *AllocaTy = llvm::StructType::create(ArgTypes, "printf_args");
     llvm::Value *Alloca = builder->CreateAlloca(AllocaTy);
-    int size = 0;
 
     for (unsigned I = 0, NumArgs = Args.size(); I < NumArgs; ++I) {
       llvm::Value *P = builder->CreateStructGEP(AllocaTy, Alloca, I);
@@ -92,10 +91,8 @@ packArgsIntoNVPTXFormatBuffer(Builder* builder, ArrayRef<Value*> Args) {
       llvm::Value *newArg;
       if (Arg->getType()->isFloatingPointTy()) {
         newArg = builder->CreateFPExt(Arg, builder->getDoubleTy());
-        size += 64;
       } else if (Arg->getType()->isIntegerTy()) {
         newArg = builder->CreateSExt(Arg, builder->getInt32Ty());
-        size += 32;
       } else {
         newArg = Arg;
       }
@@ -2093,8 +2090,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     int step_am = is_a_row ? m : m / (num_ptr_a)*(num_ptr_a);
     int step_ak = is_a_row ? K / (num_ptr_a*vec_a)*(num_ptr_a*vec_a) : K;
     auto offset = i32(step_am*stride_rep_m*stride_am + step_ak*stride_ak);
-    vprintf("offset_A t-%d %d %d\n", {gThreadId, ptra, offset}, builder_);
     Value* pa =  gep(ptra, offset);
+    vprintf("offset_A t-%d %d %d\n", {gThreadId, pa, offset}, builder_);
     llvm::outs() << "pa t-0 " << type_to_str(pa->getType()) << "\n";
     Value* ha = load(bit_cast(pa, ptr_ty(vec_ty(i32_ty, vec_a/2), 3)));
     // record lds that needs to be moved
@@ -2104,6 +2101,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     Value *ha01 = bit_cast(extract_elt(ha, i32(1)), f16x2_ty);
     register_lds(has, m, K, inc, ha00, ha01, is_prefetch);
 
+    vprintf("ha0x t-%d address %d\n", {gThreadId, pa}, rewriter);
     {
       auto get_f16 = [&](Value* value, int idx) {
         return extract_elt(value, idx);
