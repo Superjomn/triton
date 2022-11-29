@@ -1941,7 +1941,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     off_a0i = exact_udiv(off_a0i, i32(vec_a));
     args.push_back(off_a0i);
     off_a0i = xor_(off_a0i, phase_a);
-    vprintf("show1 t-%d %d^%d=%d\n", {gThreadId, off_a0i, phase_a, off_a0i}, rewriter);
     args.push_back(off_a0i);
     off_a0i = mul(off_a0i, i32(vec_a));
     args.push_back(off_a0i);
@@ -2081,10 +2080,10 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
         lazy_phi_incs_.push_back(std::make_tuple((PHINode*)vals[{m, K}].second, val1, inc_block));
       } else
         vals[{m, K}] = {val0, val1};
+
   };
 
   auto load_a = [&](int m, int K, int inc, bool is_prefetch) {
-    printf("loada_args t-0 m,n: (%d,%d)\n", m, K);
     int offidx = (is_a_row ? K/4 : m) % num_ptr_a;
     Value* ptra;
     if(K==0 && is_prefetch){
@@ -2099,7 +2098,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     Value* pa =  gep(ptra, offset);
     vprintf("offset_A t-%d %d %d\n", {gThreadId, pa, offset}, builder_);
     llvm::outs() << "pa t-0 " << type_to_str(pa->getType()) << "\n";
-    vprintf("ha0x t-%d address %d\n", {gThreadId, pa}, rewriter);
     auto ptrTy = ptr_ty(vec_ty(i32_ty, vec_a/2), 3);
     llvm::outs() << "aPtrTy t-0 " << type_to_str(ptrTy) << "\n";
     Value* ha = load(bit_cast(pa, ptrTy));
