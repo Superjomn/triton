@@ -2009,9 +2009,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     ptr_b[i] = gep(shmems_[B], off_b[i]);
   vprintf_array(gThreadId, ptr_b, "ptrB", "%d", rewriter);
 
-  vprintf_array(gThreadId, ptr_b, "ptrBs", "%d", rewriter);
-
-
   llvm::outs() << "ptr_a.type t-0 " << type_to_str(ptr_a[0]->getType()) << "\n";
 
 
