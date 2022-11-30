@@ -475,7 +475,6 @@ void init_triton_codegen(py::module &&m) {
             llir << *llvm;
             llir.flush();
             llvm::outs() << "llvmir:\n" << tmp << "\n";
-            printf("version: %d\n", version);
             // LLVM-IR -> PTX
             ptx = drv::llir_to_ptx(llvm.get(), cc, version);
             // PTX -> Binary

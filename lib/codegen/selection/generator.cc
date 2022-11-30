@@ -1956,6 +1956,9 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   Value* off_b1 = is_b_row ? offset_b_k_[layout_c] : offset_b_n_[layout_c];
   Value* phase_b = urem(udiv(off_b1, i32(per_phase_b)), i32(max_phase_b));
 
+
+  vprintf("offBNK t-%d %d %d\n", {gThreadId, offset_b_n_[layout_c], offset_b_k_[layout_c]}, rewriter);
+
   vprintf("offB t-%d offB0,offB1,phaseB: %d %d %d\n", {gThreadId, off_b0, off_b1, phase_b}, rewriter);
   std::vector<Value*> off_b(num_ptr_b);
   for(int i = 0; i < num_ptr_b; i++){
@@ -2095,6 +2098,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     int step_am = is_a_row ? m : m / (num_ptr_a)*(num_ptr_a);
     int step_ak = is_a_row ? K / (num_ptr_a*vec_a)*(num_ptr_a*vec_a) : K;
     auto offset = i32(step_am*stride_rep_m*stride_am + step_ak*stride_ak);
+    vprintf("Aoffsets t-%d %d %d %d\n", {i32(offidx), off_a[offidx], offset}, rewriter);
+
     Value* pa =  gep(ptra, offset);
     vprintf("offset_A t-%d %d %d\n", {gThreadId, pa, offset}, builder_);
     llvm::outs() << "pa t-0 " << type_to_str(pa->getType()) << "\n";
