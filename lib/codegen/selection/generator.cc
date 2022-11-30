@@ -2155,6 +2155,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     auto offset = i32(stepbn*stride_rep_n*stride_bn + stepbk*stride_bk);
     Value* pb =   gep(ptrb, offset);
     vprintf("B t-%d pb,thePtrB,offset: %d,%d,%d\n", {gThreadId, pb, ptrb, offset}, rewriter);
+    vprintf("pb t-%d %d\n", {gThreadId, pb}, rewriter);
     Value* hb =   load(bit_cast(pb, ptr_ty(vec_ty(i32_ty, vec_b/2), 3)));
     // record lds that needs to be moved
     if (K == 0 && inc == 1 && is_prefetch)
@@ -2170,7 +2171,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       else
         register_lds(hbs, n, K+4, inc, hb10, hb11, is_prefetch);
     }
-
   };
 
   // update accumulators
