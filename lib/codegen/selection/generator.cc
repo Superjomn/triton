@@ -2098,7 +2098,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     int step_am = is_a_row ? m : m / (num_ptr_a)*(num_ptr_a);
     int step_ak = is_a_row ? K / (num_ptr_a*vec_a)*(num_ptr_a*vec_a) : K;
     auto offset = i32(step_am*stride_rep_m*stride_am + step_ak*stride_ak);
-    vprintf("Aoffsets t-%d %d %d %d\n", {i32(offidx), off_a[offidx], offset}, rewriter);
+    vprintf("Aoffsets t-%d %d %d %d\n", {gThreadId, i32(offidx), off_a[offidx], offset}, rewriter);
 
     Value* pa =  gep(ptra, offset);
     vprintf("offset_A t-%d %d %d\n", {gThreadId, pa, offset}, builder_);
