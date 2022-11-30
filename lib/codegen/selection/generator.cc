@@ -2007,7 +2007,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
   { // DEBUG
   std::vector<Value*> vs;
-  for (int i = 0; i < 20; i++) {
+  for (int i = 0; i < 196; i++) {
     auto v0 = load(gep( shmems_[A], i32(i)));
     vs.push_back(v0);
   }
