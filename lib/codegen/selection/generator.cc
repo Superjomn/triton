@@ -2020,7 +2020,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       auto v0 = load(gep( shmems_[B], i32(i)));
       vs.push_back(v0);
     }
-    vprintf_array(gThreadId, vs, "A.content", "%f", rewriter);
+    vprintf_array(gThreadId, vs, "B.content", "%f", rewriter);
   }
 
   printf("num_ptr_b t-0 %d\n", num_ptr_b);
