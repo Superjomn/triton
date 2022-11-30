@@ -2005,11 +2005,29 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     return buf;
   };
 
+  { // DEBUG
+  std::vector<Value*> vs;
+  for (int i = 0; i < 20; i++) {
+    auto v0 = load(gep( shmems_[A], i32(i)));
+    vs.push_back(v0);
+  }
+  vprintf_array(gThreadId, vs, "A.content", "%f", rewriter);
+
+}
+  { // DEBUG
+    std::vector<Value*> vs;
+    for (int i = 0; i < 20; i++) {
+      auto v0 = load(gep( shmems_[B], i32(i)));
+      vs.push_back(v0);
+    }
+    vprintf_array(gThreadId, vs, "A.content", "%f", rewriter);
+  }
+
   printf("num_ptr_b t-0 %d\n", num_ptr_b);
   for(int i = 0; i < num_ptr_a; i++)
     ptr_a[i] = gep(shmems_[A], off_a[i]);
   for(int i = 0; i < num_ptr_b; i++)
-    ptr_b[i] = gep(shmems_[B], off_b[i]);
+    ptr_b[i] = gep(shmems_[B],off_b[i]);
   vprintf("B_smem t-%d %d\n", {gThreadId, shmems_[B]}, rewriter);
   vprintf_array(gThreadId, ptr_b, "ptrB", "%d", rewriter);
 
