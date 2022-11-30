@@ -2101,10 +2101,11 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     vprintf("Aoffsets t-%d %d %d %d\n", {gThreadId, i32(offidx), off_a[offidx], offset}, rewriter);
 
     Value* pa =  gep(ptra, offset);
+    vprintf("aPtr t-%d %d\n", {gThreadId, pa}, rewriter);
+
     vprintf("offset_A t-%d %d %d\n", {gThreadId, pa, offset}, builder_);
     llvm::outs() << "pa t-0 " << type_to_str(pa->getType()) << "\n";
     auto ptrTy = ptr_ty(vec_ty(i32_ty, vec_a/2), 3);
-    llvm::outs() << "aPtrTy t-0 " << type_to_str(ptrTy) << "\n";
     Value* ha = load(bit_cast(pa, ptrTy));
     // record lds that needs to be moved
     //if (K == 0 && inc == 1 && is_prefetch)
