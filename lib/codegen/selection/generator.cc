@@ -2158,7 +2158,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     vprintf("pb t-%d %d\n", {gThreadId, pb}, rewriter);
     Value* hb =   load(bit_cast(pb, ptr_ty(vec_ty(i32_ty, vec_b/2), 3)));
 
-    vprintf("Boffsets t-%d %d %d %d\n", {gThreadId, i32_val(offidx), off_b[offidx], offset}, rewriter);
+    vprintf("Boffsets t-%d %d %d %d\n", {gThreadId, i32(offidx), off_b[offidx], offset}, rewriter);
     // record lds that needs to be moved
     if (K == 0 && inc == 1 && is_prefetch)
       prefetch_latch_to_bb_[phiB->get_incoming_value(1)].push_back(hb);
