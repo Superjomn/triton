@@ -96,7 +96,20 @@ A_{3, 2}  A_{3, 3}  A_{3, 0}  A_{3, 1} ...   [phase 1] /
         // https://github.com/openai/triton/blob/master/lib/codegen/analysis/layout.cc#L209)
         if (version == 1) {
           int maxPhase = (order[inner] == 1 ? 8 : 4) / perPhase;
-          return $_get(context, 4, perPhase, maxPhase, order);
+          // TODO[Superjomn]: Implement the vec computation.
+          // Currently, the vec=4 just make several cases work.
+          // int vec = opIdx == 0 ? 4: 8;
+          // if (opIdx == 0) {
+          //   vec = 4;
+          //   perPhase = 4;
+          //   maxPhase = 2;
+          // } else {
+          //   vec = 4;
+          //   perPhase = 4;
+          //   maxPhase = 1;
+          // }
+          int vec = 4;
+          return $_get(context, vec, perPhase, maxPhase, order);
         }
 
         // ---- begin version 2 ----
