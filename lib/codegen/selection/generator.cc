@@ -1892,6 +1892,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   // vectorization
   int vec_a = swizzle_->get_vec(layout_a);
   int vec_b = swizzle_->get_vec(layout_b);
+  printf("vec_ab t-0 %d %d\n", vec_a, vec_b);
+
   // strides
   bool is_a_row = ord_a[0] != 0;
   bool is_b_row = ord_b[0] != 0;
@@ -1916,8 +1918,24 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   int step_b0   = is_b_row ? stride_rep_n : stride_rep_k;
   int num_ptr_b = std::max(2 * per_phase_b * max_phase_b / step_b0, 1);
 
+            { // DEBUG
+                for (int i = 0; i < 16*16; i++) {
+                    auto elem = load(gep( shmems_[A], i32(i)));
+                    vprintf("A.smem t-%d %f", {gThreadId, elem}, rewriter);
+                }
+            }
 
-  // max_phase_a = 4;
+            { // DEBUG
+                for (int i = 0; i < 16*16; i++) {
+                    auto elem = load(gep( shmems_[B], i32(i)));
+                    vprintf("B.smem t-%d %f", {gThreadId, elem}, rewriter);
+                }
+            }
+
+  printf("A.meta t-0 perPhase:%d maxPhase:%d step:%d NK:%d vec:%d\n", per_phase_a, max_phase_a, step_a0, NK, vec_a);
+  printf("B.meta t-0 perPhase:%d maxPhase:%d step:%d NK:%d vec:%d\n", per_phase_b, max_phase_b, step_b0, NK, vec_b);
+
+            // max_phase_a = 4;
   // vec_a = 8;
   // std::cout << per_phase_a << " " << max_phase_a << " " << step_a0 << " " << num_ptr_a << " " << stride_am << " " << stride_ak << " " << stride_a0 << " " << stride_a1 << std::endl;
   // std::cout << vec_a << " " << vec_b << std::endl;
@@ -1933,7 +1951,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   Value* off_a1 = is_a_row ? offset_a_m_[layout_c] : offset_a_k_[layout_c];
   Value* phase_a = urem(udiv(off_a1, i32(per_phase_a)), i32(max_phase_a));
   std::vector<Value*> off_a(num_ptr_a);
-  vprintf("show0 t-%d phase_a:%d vec_a:%d\n", {gThreadId, phase_a, i32(vec_a)}, rewriter);
+  vprintf("show0 t-%d phase_a:%d vec_a:%d", {gThreadId, phase_a, i32(vec_a)}, rewriter);
   for(int i = 0; i < num_ptr_a; i++){
     std::vector<Value*> args;
     Value* off_a0i = add(off_a0, i32(i*(is_a_row?4:stride_rep_m)));
@@ -1950,25 +1968,33 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     vprintf_array(gThreadId, args, "offA_0i", "%d", rewriter);
   }
 
-  vprintf_array(gThreadId, off_a, "offA_i", "%d", builder_);
+  vprintf_array(gThreadId, off_a, "offAs", "%d", builder_);
 
   Value* off_b0 = is_b_row ? offset_b_n_[layout_c] : offset_b_k_[layout_c];
   Value* off_b1 = is_b_row ? offset_b_k_[layout_c] : offset_b_n_[layout_c];
   Value* phase_b = urem(udiv(off_b1, i32(per_phase_b)), i32(max_phase_b));
 
 
-  vprintf("offBNK t-%d %d %d\n", {gThreadId, offset_b_n_[layout_c], offset_b_k_[layout_c]}, rewriter);
+  vprintf("offBNK t-%d %d %d %d", {gThreadId, offset_b_n_[layout_c], offset_b_k_[layout_c], i32(vec_b)}, rewriter);
 
   vprintf("offB t-%d offB0,offB1,phaseB: %d %d %d\n", {gThreadId, off_b0, off_b1, phase_b}, rewriter);
   std::vector<Value*> off_b(num_ptr_b);
+
+ std::vector<Value*> off_b_i;
   for(int i = 0; i < num_ptr_b; i++){
     Value* off_b0i = add(off_b0, i32(i*(is_b_row?stride_rep_n:4)));
+    off_b_i.push_back(off_b0i);
     off_b0i = udiv(off_b0i, i32(vec_b));
+    off_b_i.push_back(off_b0i);
     off_b0i = xor_(off_b0i, phase_b);
+    off_b_i.push_back(off_b0i);
     off_b0i = mul(off_b0i, i32(vec_b));
+    off_b_i.push_back(off_b0i);
     off_b[i] = add(mul(off_b0i, i32(stride_b0)), mul(off_b1, i32(stride_b1)));
+    off_b_i.push_back(off_b[i]);
   }
   vprintf_array(gThreadId, off_b, "offBs", "%d", rewriter);
+  vprintf_array(gThreadId, off_b_i, "offB_0i", "%d", rewriter);
 
   builder_->SetInsertPoint(curr_bb);
 
@@ -2006,17 +2032,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   };
 
   { // DEBUG
-  std::vector<Value*> vs;
-  for (int i = 0; i < 196; i++) {
-    auto v0 = load(gep( shmems_[A], i32(i)));
-    vs.push_back(v0);
-  }
-  vprintf_array(gThreadId, vs, "A.content", "%f", rewriter);
-
-}
-  { // DEBUG
     std::vector<Value*> vs;
-    for (int i = 0; i < 196; i++) {
+    for (int i = 0; i < 30; i++) {
       auto v0 = load(gep( shmems_[B], i32(i)));
       vs.push_back(v0);
     }
@@ -2038,6 +2055,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   std::vector<Value*> acc;
   for(indices_t idx: idxs_.at(C))
     acc.push_back(vals_[D][idx]);
+  printf("acc.size %d\n", acc.size());
 
   unsigned num_m = layout_c->rep(0) * shape_c[0] / layout_c->shape_per_cta(0);
   unsigned num_n = layout_c->rep(1) * shape_c[1] / layout_c->shape_per_cta(1);
@@ -2065,7 +2083,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       acc[idx[i]] = extract_val(nc, {i});
 
 
-#define SHOW_MMA_V1 0
+#define SHOW_MMA_V1 1
 #if SHOW_MMA_V1
     auto get_f16 = [&](Value* value, int idx) {
       return extract_elt(value, idx);
@@ -2079,9 +2097,10 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     for (int i = 0; i < 8; i++) {
       pargs.push_back(extract_val(nc, {i}));
     }
+    vprintf("working on mma!!!!", {}, rewriter);
 
-    vprintf("mma t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)\n", pargs, builder_);
-
+    vprintf("mma t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)", pargs, builder_);
+      vprintf("mma.acc t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)", pargs, builder_);
 
 #endif
 
@@ -2117,12 +2136,14 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     int step_ak = is_a_row ? K / (num_ptr_a*vec_a)*(num_ptr_a*vec_a) : K;
     auto offset = i32(step_am*stride_rep_m*stride_am + step_ak*stride_ak);
     vprintf("Aoffsets t-%d %d %d %d\n", {gThreadId, i32(offidx), off_a[offidx], offset}, rewriter);
+      vprintf("offA t-%d %d", {gThreadId, off_a[offidx]}, rewriter);
 
-    Value* pa =  gep(ptra, offset);
-    vprintf("aPtr t-%d %d\n", {gThreadId, pa}, rewriter);
+      Value* pa =  gep(ptra, offset);
+    vprintf("pa t-%d %d %d", {gThreadId, ptra, offset}, rewriter);
+
+
 
     vprintf("offset_A t-%d %d %d\n", {gThreadId, pa, offset}, builder_);
-    llvm::outs() << "pa t-0 " << type_to_str(pa->getType()) << "\n";
     auto ptrTy = ptr_ty(vec_ty(i32_ty, vec_a/2), 3);
     Value* ha = load(bit_cast(pa, ptrTy));
     // record lds that needs to be moved
@@ -2138,11 +2159,11 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       };
 
       std::vector<Value*> args;
-      args.push_back(get_f16(ha00, 0));
-      args.push_back(get_f16(ha00, 1));
-      args.push_back(get_f16(ha01, 0));
-      args.push_back(get_f16(ha01, 1));
-      vprintf_array(gThreadId, args, "ha0x", "%f", rewriter);
+        for (int i = 0; i < vec_a/2; i++)
+            args.push_back(get_f16(ha00, i));
+        for (int i = 0; i < vec_a/2; i++)
+            args.push_back(get_f16(ha01, i));
+        vprintf_array(gThreadId, args, "ha0x", "%f", rewriter);
     }
 
     if(vec_a > 4){
@@ -2173,24 +2194,49 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     auto offset = i32(stepbn*stride_rep_n*stride_bn + stepbk*stride_bk);
     Value* pb =   gep(ptrb, offset);
     vprintf("B t-%d pb,thePtrB,offset: %d,%d,%d\n", {gThreadId, pb, ptrb, offset}, rewriter);
-    vprintf("pb t-%d %d\n", {gThreadId, pb}, rewriter);
+    vprintf("pb t-%d %d %d", {gThreadId, pb, offset}, rewriter);
     Value* hb =   load(bit_cast(pb, ptr_ty(vec_ty(i32_ty, vec_b/2), 3)));
 
-    vprintf("Boffsets t-%d %d %d %d\n", {gThreadId, i32(offidx), off_b[offidx], offset}, rewriter);
+    vprintf("Boffsets t-%d %d %d %d", {gThreadId, i32(offidx), off_b[offidx], offset}, rewriter);
     // record lds that needs to be moved
     if (K == 0 && inc == 1 && is_prefetch)
       prefetch_latch_to_bb_[phiB->get_incoming_value(1)].push_back(hb);
     Value *hb00 = bit_cast(extract_elt(hb, i32(0)), f16x2_ty);
     Value *hb01 = bit_cast(extract_elt(hb, i32(1)), f16x2_ty);
+
+
     register_lds(hbs, n, K, inc, hb00, hb01, is_prefetch);
+    Value *hb10;
+    Value *hb11;
     if(vec_b > 4){
-      Value *hb10 = bit_cast(extract_elt(hb, i32(2)), f16x2_ty);
-      Value *hb11 = bit_cast(extract_elt(hb, i32(3)), f16x2_ty);
+      hb10 = bit_cast(extract_elt(hb, i32(2)), f16x2_ty);
+      hb11 = bit_cast(extract_elt(hb, i32(3)), f16x2_ty);
       if(is_b_row)
         register_lds(hbs, n+1, K, inc, hb10, hb11, is_prefetch);
       else
         register_lds(hbs, n, K+4, inc, hb10, hb11, is_prefetch);
+
     }
+
+  {
+      auto get_f16 = [&](Value* value, int idx) {
+          return extract_elt(value, idx);
+      };
+
+      std::vector<Value*> args;
+      for (int i = 0; i < 2; i++)
+          args.push_back(get_f16(hb00, i));
+      for (int i = 0; i < 2; i++)
+          args.push_back(get_f16(hb01, i));
+      if (vec_b>4) {
+          for (int i = 0; i < 2; i++)
+              args.push_back(get_f16(hb10, i));
+          for (int i = 0; i < 2; i++)
+              args.push_back(get_f16(hb11, i));
+      }
+      vprintf_array(gThreadId, args, "hb0x", "%f", rewriter);
+  }
+
   };
 
   // update accumulators
@@ -2253,9 +2299,13 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
   }
 
+  vprintf_array(gThreadId, acc, "acc", "%f", builder_);
+
+
   // write back accumulators
-  for(size_t i = 0; i < idxs_.at(C).size(); i++)
-    vals_[C][idxs_[C][i]] = acc[i];
+  for(size_t i = 0; i < idxs_.at(C).size(); i++) {
+      vals_[C][idxs_[C][i]] = acc[i];
+  }
 }
 
 namespace {
@@ -4034,6 +4084,7 @@ void generator::visit_layout_mma(analysis::mma_layout* layout) {
     Value *off_quad_m = mul(udiv(and_(lane, _16), _4), i32(layout->fpw(0)));
     Value *off_quad_n = mul(udiv(and_(lane, _16), _4), i32(layout->fpw(1)));
     // Pair offset
+    // DEBUG
     Value *off_pair_m = udiv(urem(lane, _16), _4);
     off_pair_m = urem(off_pair_m, i32(layout->fpw(0)));
     off_pair_m = mul(off_pair_m, i32(4));
