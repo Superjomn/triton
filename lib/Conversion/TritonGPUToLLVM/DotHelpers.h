@@ -107,14 +107,22 @@ struct DotOpMmaV1ConversionHelper {
 
   // number of fp16x2 elements for $b.
   int numElemsPerThreadB(RankedTensorType tensorTy) const {
-    auto shape = tensorTy.getShape();
-    auto order = getOrder();
+    SmallVector<int64_t> shape (tensorTy.getShape().begin(), tensorTy.getShape().end());
+    SmallVector<unsigned >order (getOrder().begin(), getOrder().end());
+    // TODO[Superjomn]: transB is not accessiable here.
+    bool transB = false;
+    if (transB) {
+      std::swap(shape[0], shape[1]);
+      std::swap(order[0], order[1]);
+    }
+
     bool isBRow = order[0] != 0;
     bool isBVec4 = isBRow && shape[order[0]] <= 16;
     // TODO[Superjomn]: Support the case when isBVec4=false later
     // Currently, we only support ld.v2, for the mma layout varies with
     // different ld vector width.
     isBVec4 = true;
+
 
     int packSize1 = (isBRow && !isBVec4) ? 2 : 1;
     SmallVector<int> fpw({2, 2, 1});
@@ -127,7 +135,7 @@ struct DotOpMmaV1ConversionHelper {
     int elemsPerLd = vecGt4 ? 4 : 2;
     int NK = shape[0];
 
-    unsigned numN = rep[1] * shape[1] / (spw[1] * wpt[0]);
+    unsigned numN = rep[1] * shape[1] / (spw[1] * wpt[1]);
     return (numN / 2) * (NK / 4) * elemsPerLd;
   }
 
@@ -1516,6 +1524,9 @@ Value DotOpMmaV1ConversionHelper::loadA(
     for (unsigned m = 0; m < numM / 2; ++m)
       loadA(m, k);
 
+
+  printf("mma.A_mn t-0 %d\n", numM);
+
   SmallVector<Value> elems;
   elems.reserve(has.size() * 2);
   auto vecTy = vec_ty(f16_ty, 2);
@@ -1523,6 +1534,8 @@ Value DotOpMmaV1ConversionHelper::loadA(
     elems.push_back(item.second.first);
     elems.push_back(item.second.second);
   }
+
+  printf("loadA.hbs.size: %lu, elems.size:%lu\n", has.size(), elems.size());
 
   Type resTy = struct_ty(SmallVector<Type>(elems.size(), f16x2Ty));
   Value res = getStructFromElements(loc, elems, rewriter, resTy);
@@ -1637,6 +1650,7 @@ Value DotOpMmaV1ConversionHelper::loadB(
   };
 
   auto loadB = [&](int n, int K) {
+    printf("loadB: (%d,%d)\n", n, K);
     int offidx = (isBRow ? n : K / 4) % numPtrB;
     Value thePtrB = ptrB[offidx];
 
@@ -1675,23 +1689,28 @@ Value DotOpMmaV1ConversionHelper::loadB(
     }
   };
 
-  unsigned numN = rep[1] * shape[1] / (spw[1] * wpt[0]);
+  unsigned numN = rep[1] * shape[1] / (spw[1] * wpt[1]);
+
   for (unsigned k = 0; k < NK; k += 4)
     for (unsigned n = 0; n < numN / 2; ++n) {
-      if (!hbs.count({n, k}))
         loadB(n, k);
     }
   printf("B.meta t-0 perPhase:%d maxPhase:%d step:%d NK:%d vec:%d numN:%d\n",
          perPhaseB, maxPhaseB, stepB0, NK, vecB, numN);
+
+  printf("mma.B_n t-0 %d\n", numN);
 
   SmallVector<Value> elems;
   for (auto &item : hbs) { // has is a map, the key should be ordered.
     elems.push_back(item.second.first);
     elems.push_back(item.second.second);
   }
+
+  printf("loadB.hbs.size: %lu, elems.size:%lu\n", hbs.size(), elems.size());
   Type fp16x2Ty = vec_ty(type::f16Ty(ctx), 2);
   Type resTy = struct_ty(SmallVector<Type>(elems.size(), fp16x2Ty));
   Value res = getStructFromElements(loc, elems, rewriter, resTy);
+  llvm::outs() << "loadB " << res << " types.size:" << res.getType().cast<LLVM::LLVMStructType>().getBody().size() << "\n";
   return res;
 }
 
@@ -1770,6 +1789,9 @@ DotOpMmaV1ConversionHelper::extractLoadedOperand(
       offset += 2;
     }
   }
+
+  llvm::outs() << "extract.in " << llStruct << " types.size:" << llStruct.getType().cast<LLVM::LLVMStructType>().getBody().size() << "\n";
+  printf("extractLoadedOperand: size:%lu dic.size:%lu\n", elems.size(), rcds.size());
 
   return rcds;
 }

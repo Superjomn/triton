@@ -3534,6 +3534,9 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
   bool isBRow = BOrder[0] != 0;
   bool isAVec4 = !isARow && AShape[isARow] <= 16; // fp16*4 = 16bytes
   bool isBVec4 = isBRow && BShape[isBRow] <= 16;
+  isAVec4 = true;
+  isBVec4 = true;
+
   int packSize0 = (isARow || isAVec4) ? 1 : 2;
   int packSize1 = (isBRow && !isBVec4) ? 2 : 1;
   SmallVector<int> fpw({2, 2, 1});
@@ -3545,18 +3548,21 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
   Value loadedC = adaptor.c();
   DotOpMmaV1ConversionHelper helper(mmaLayout);
 
-  unsigned numM = rep[0] * DShape[0] / (spw[0] * wpt[0]);
-  unsigned numN = rep[1] * DShape[1] / (spw[1] * wpt[0]);
+  int shapePerCTA0 = spw[0] * wpt[0];
+  int shapePerCTA1 = spw[1] * wpt[1];
+
+  unsigned numM = rep[0] * DShape[0] / shapePerCTA0;
+  unsigned numN = rep[1] * DShape[1] / shapePerCTA1;
   unsigned NK = AShape[1];
+
+  printf("num_n t-0 numN:%d rep:%d shapec:%lu spc:%d\n", numN, rep[1], DShape[1], shapePerCTA1);
 
   auto has = helper.extractLoadedOperand(loadedA, NK, rewriter);
   auto hbs = helper.extractLoadedOperand(loadedB, NK, rewriter);
+  printf("mma.hbs.size: %lu\n", hbs.size());
 
   // initialize accumulators
   SmallVector<Value> acc = getElementsFromStruct(loc, loadedC, rewriter);
-  SmallVector<Value> acc2(acc.size()); // reorder to make internal order
-                                       // consistent with external order
-
   auto getIdx = [&](int m, int n) {
     std::vector<size_t> idx{{
         (m * 2 + 0) + (n * 4 + 0) * numM, // row0
@@ -3571,20 +3577,40 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
     return idx;
   };
 
-  {
-    auto idx = getIdx(0, 0);
-    for (unsigned i = 0; i < 8; i++) {
-      acc2[idx[i]] = acc[(0 * numN / 2 + 0) * 8 + i];
-    }
-    acc = acc2;
+  printf("mma.mn t-0 %d %d\n", numM, numN);
+
+  { // convert the acc's value from accumuator-external order to
+    // accumulator-internal order.
+    SmallVector<Value> accInit(acc);
+
+    for (unsigned m = 0; m < numM / 2; ++m)
+      for (unsigned n = 0; n < numN / 2; ++n) {
+        auto idx = getIdx(m, n);
+        for (unsigned i = 0; i < 8; ++i) {
+          printf("init-id: %lu\n", idx[i]);
+          accInit[idx[i]] = acc[(m * numN / 2 + n) * 8 + i];
+        }
+      }
+
+    acc = accInit;
   }
 
   size_t resSize = acc.size();
-  LLVM::vprintf_array(LLVM::gThreadId, acc, "acc", "%f", rewriter);
+  //LLVM::vprintf_array(LLVM::gThreadId, acc, "acc", "%f", rewriter);
 
   SmallVector<Value> resVals(resSize);
 
   auto callMMA = [&](unsigned m, unsigned n, unsigned k) {
+    for (auto& item : has) {
+      printf("has.key: %d %d\n", item.first.first, item.first.second);
+    }
+    for (auto& item : hbs) {
+      printf("hbs.key: %d %d\n", item.first.first, item.first.second);
+    }
+
+    printf("has.key get: %d %d\n", m, k);
+    printf("hbs.key get: %d %d\n", n, k);
+
     auto ha = has.at({m, k});
     auto hb = hbs.at({n, k});
 
@@ -3660,7 +3686,9 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
 
     for (unsigned i = 0; i < 8; i++) {
       Value elem = extract_val(f32_ty, res, getIntAttr(i));
+      printf("acc-id: %lu\n", idx[i]);
       acc[idx[i]] = elem;
+      printf("assign-res-id: %d\n", (m * numN / 2 + n) * 8 + i);
       resVals[(m * numN / 2 + n) * 8 + i] = elem;
     }
   };
@@ -3668,8 +3696,11 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
   for (unsigned k = 0; k < NK; k += 4)
     for (unsigned m = 0; m < numM / 2; ++m)
       for (unsigned n = 0; n < numN / 2; ++n) {
+        printf("mma on %d %d %d\n", m, n, k);
         callMMA(m, n, k);
       }
+
+
 
   LLVM::vprintf_array(LLVM::gThreadId, acc, "acc", "%f", rewriter);
   // replace with new packed result
@@ -4799,7 +4830,7 @@ public:
 
     decomposeInsertSliceAsyncOp(mod);
 
-    llvm::outs() << "finalIR: " << mod << "\n";
+    //llvm::outs() << "finalIR: " << mod << "\n";
 
     Allocation allocation(mod);
     MembarAnalysis membarPass(&allocation);
