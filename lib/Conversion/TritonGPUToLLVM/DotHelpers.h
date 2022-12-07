@@ -81,6 +81,10 @@ struct DotOpMmaV1ConversionHelper {
 
     bool isARow = order[0] != 0;
     bool isAVec4 = !isARow && shape[order[0]] <= 16; // fp16*4 = 16bytes
+    // TODO[Superjomn]: Support the case when isAVec4=false later
+    // Currently, we only support ld.v2, for the mma layout varies with
+    // different ld vector width.
+    isAVec4 = true;
     int packSize0 = (isARow || isAVec4) ? 1 : 2;
 
     SmallVector<int> fpw({2, 2, 1});
@@ -107,6 +111,11 @@ struct DotOpMmaV1ConversionHelper {
     auto order = getOrder();
     bool isBRow = order[0] != 0;
     bool isBVec4 = isBRow && shape[order[0]] <= 16;
+    // TODO[Superjomn]: Support the case when isBVec4=false later
+    // Currently, we only support ld.v2, for the mma layout varies with
+    // different ld vector width.
+    isBVec4 = true;
+
     int packSize1 = (isBRow && !isBVec4) ? 2 : 1;
     SmallVector<int> fpw({2, 2, 1});
     SmallVector<int> rep({0, 2 * packSize1, 1});       // pad M with 0
@@ -710,17 +719,13 @@ public:
       if (kOrder == 1) {
         elems[0] = load(gep(elemPtrTy, ptr, sOffsetElemVal));
         elems[1] = load(gep(elemPtrTy, ptr2, sOffsetElemVal));
-        elems[2] =
-            load(gep(elemPtrTy, ptr, sOffsetArrElemVal));
-        elems[3] =
-            load(gep(elemPtrTy, ptr2, sOffsetArrElemVal));
+        elems[2] = load(gep(elemPtrTy, ptr, sOffsetArrElemVal));
+        elems[3] = load(gep(elemPtrTy, ptr2, sOffsetArrElemVal));
       } else {
         elems[0] = load(gep(elemPtrTy, ptr, sOffsetElemVal));
         elems[2] = load(gep(elemPtrTy, ptr2, sOffsetElemVal));
-        elems[1] =
-            load(gep(elemPtrTy, ptr, sOffsetArrElemVal));
-        elems[3] =
-            load(gep(elemPtrTy, ptr2, sOffsetArrElemVal));
+        elems[1] = load(gep(elemPtrTy, ptr, sOffsetArrElemVal));
+        elems[3] = load(gep(elemPtrTy, ptr2, sOffsetArrElemVal));
       }
       return {elems[0], elems[1], elems[2], elems[3]};
 
@@ -1351,15 +1356,18 @@ Value DotOpMmaV1ConversionHelper::loadA(
   Value smemBase = smemBaseBeforeSwizzle;
   // Value smemBase = gep(ptr_ty(f16_ty), smemBaseBeforeSwizzle,
   // cSwizzleOffset);
+  vprintf("A.smembase t-0 %d", {smemBase}, rewriter);
 
-  /*{
-    for (int i = 0; i < 16*16; i++) {
+  {
+    SmallVector<Value> args;
+    for (int i = 0; i < 16 * 16; i++) {
       Value addr = gep(ptr_ty(f16_ty), smemBase, i32_val(i));
       addr = bitcast(addr, ptr_ty(f16_ty));
       Value elem = load(addr);
-      vprintf("A.smem t-%d %f", {gThreadId, elem}, rewriter);
+      args.push_back(elem);
     }
-  }*/
+    vprintf_array(gThreadId, args, "A.smem", "%f", rewriter);
+  }
 
   /*
   { // DEBUG
@@ -1375,6 +1383,10 @@ Value DotOpMmaV1ConversionHelper::loadA(
 
   bool isARow = order[0] != 0;
   bool isAVec4 = !isARow && shape[order[0]] <= 16; // fp16*4 = 16bytes
+  // TODO[Superjomn]: Support the case when isBVec4=false later
+  // Currently, we only support ld.v2, for the mma layout varies with different
+  // ld vector width.
+  isAVec4 = true;
   int packSize0 = (isARow || isAVec4) ? 1 : 2;
 
   SmallVector<int> fpw({2, 2, 1});
@@ -1412,8 +1424,6 @@ Value DotOpMmaV1ConversionHelper::loadA(
   int numPtrA = std::max(2 * perPhaseA * maxPhaseA / stepA0, 1);
   int NK = shape[1];
 
-  printf("A.meta t-0 perPhase:%d maxPhase:%d step:%d NK:%d vec:%d\n", perPhaseA,
-         maxPhaseA, stepA0, NK, vecA);
   // pre-compute pointer lanes
   Value offA0 = isARow ? offsetAK : offsetAM;
   Value offA1 = isARow ? offsetAM : offsetAK;
@@ -1470,7 +1480,8 @@ Value DotOpMmaV1ConversionHelper::loadA(
     Value offset = add(mul(i32_val(stepAM * strideRepM), strideAM),
                        mul(i32_val(stepAK), strideAK));
     Value pa = gep(f16PtrTy, thePtrA, offset);
-    vprintf("pa t-%d %d %d", {gThreadId, thePtrA, offset}, rewriter);
+    vprintf("pa t-%d base:%d %d %d", {gThreadId, smemBase, thePtrA, offset},
+            rewriter);
     Type aPtrTy = ptr_ty(vec_ty(i32_ty, std::max<int>(vecA / 2, 1)), 3);
     Value ha = load(bitcast(pa, aPtrTy));
     // record lds that needs to be moved
@@ -1499,6 +1510,8 @@ Value DotOpMmaV1ConversionHelper::loadA(
     }
   };
 
+  printf("A.meta t-0 perPhase:%d maxPhase:%d step:%d NK:%d vec:%d numM:%d\n",
+         perPhaseA, maxPhaseA, stepA0, NK, vecA, numM);
   for (unsigned k = 0; k < NK; k += 4)
     for (unsigned m = 0; m < numM / 2; ++m)
       loadA(m, k);
@@ -1534,16 +1547,22 @@ Value DotOpMmaV1ConversionHelper::loadB(
   Value smem = smemObj.getBaseBeforeSwizzle(order[0], loc, rewriter);
 
   {
+    SmallVector<Value> args;
     for (int i = 0; i < 16 * 16; i++) {
       Value addr = gep(ptr_ty(f16_ty), smem, i32_val(i));
       addr = bitcast(addr, ptr_ty(f16_ty));
       Value elem = load(addr);
-      vprintf("B.smem t-%d %f", {gThreadId, elem}, rewriter);
+      args.push_back(elem);
     }
+    vprintf_array(gThreadId, args, "B.smem", "%f", rewriter);
   }
 
   bool isBRow = order[0] != 0;
   bool isBVec4 = isBRow && shape[order[0]] <= 16;
+  // TODO[Superjomn]: Support the case when isBVec4=false later
+  // Currently, we only support ld.v2, for the mma layout varies with different
+  // ld vector width.
+  isBVec4 = true;
   int packSize1 = (isBRow && !isBVec4) ? 2 : 1;
   SmallVector<int> fpw({2, 2, 1});
   SmallVector<int> rep({0, 2 * packSize1, 1});       // pad M with 0
@@ -1662,6 +1681,8 @@ Value DotOpMmaV1ConversionHelper::loadB(
       if (!hbs.count({n, k}))
         loadB(n, k);
     }
+  printf("B.meta t-0 perPhase:%d maxPhase:%d step:%d NK:%d vec:%d numN:%d\n",
+         perPhaseB, maxPhaseB, stepB0, NK, vecB, numN);
 
   SmallVector<Value> elems;
   for (auto &item : hbs) { // has is a map, the key should be ordered.

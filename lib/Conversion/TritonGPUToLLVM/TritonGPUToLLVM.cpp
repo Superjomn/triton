@@ -3185,7 +3185,6 @@ LogicalResult ConvertLayoutOpConversion::lowerBlockedToShared(
 
   auto smemObj = SharedMemoryObject(smemBase, dstShape, outOrd, loc, rewriter);
   auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
-  barrier(); // DEBUG
   rewriter.replaceOp(op, retVal);
   barrier(); // DEBUG
   return success();
@@ -3555,12 +3554,10 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
 
   // initialize accumulators
   SmallVector<Value> acc = getElementsFromStruct(loc, loadedC, rewriter);
-  size_t resSize = acc.size();
-  SmallVector<Value> resVals(resSize);
+  SmallVector<Value> acc2(acc.size()); // reorder to make internal order
+                                       // consistent with external order
 
-  auto callMMA = [&](unsigned m, unsigned n, unsigned k) {
-    auto ha = has.at({m, k});
-    auto hb = hbs.at({n, k});
+  auto getIdx = [&](int m, int n) {
     std::vector<size_t> idx{{
         (m * 2 + 0) + (n * 4 + 0) * numM, // row0
         (m * 2 + 0) + (n * 4 + 1) * numM,
@@ -3571,7 +3568,27 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
         (m * 2 + 1) + (n * 4 + 2) * numM, // row3
         (m * 2 + 1) + (n * 4 + 3) * numM,
     }};
+    return idx;
+  };
 
+  {
+    auto idx = getIdx(0, 0);
+    for (unsigned i = 0; i < 8; i++) {
+      acc2[idx[i]] = acc[(0 * numN / 2 + 0) * 8 + i];
+    }
+    acc = acc2;
+  }
+
+  size_t resSize = acc.size();
+  LLVM::vprintf_array(LLVM::gThreadId, acc, "acc", "%f", rewriter);
+
+  SmallVector<Value> resVals(resSize);
+
+  auto callMMA = [&](unsigned m, unsigned n, unsigned k) {
+    auto ha = has.at({m, k});
+    auto hb = hbs.at({n, k});
+
+    auto idx = getIdx(m, n);
     PTXBuilder builder;
 
     auto *resOprs = builder.newListOperand(8, "=f");
@@ -3584,6 +3601,16 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
         {hb.first, "r"},
         {hb.second, "r"},
     });
+
+    /*
+    SmallVector<Value> acc2(acc.size());
+    for (int m = 0; m < numM; m++) {
+      for (int n = 0; n < numN; n++) {
+        acc2[m * numN/2 + n] = acc[]
+      }
+    }
+    */
+
     auto *COprs = builder.newListOperand();
     for (int i = 0; i < 8; ++i)
       COprs->listAppend(builder.newOperand(acc[idx[i]], std::to_string(i)));
@@ -3602,6 +3629,7 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
     };
 
 #define SHOW_MMA_V1 1
+#define SHOW_MMA_D 0
 #if SHOW_MMA_V1
     auto get_f16 = [&](Value value, int idx) {
       return extract_element(value, i32_val(idx));
@@ -3619,21 +3647,20 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
     pargs.push_back(get_f16(hb.second, 0));
     pargs.push_back(get_f16(hb.second, 1));
 
+#if SHOW_MMA_D
     for (int i = 0; i < 8; i++) {
       pargs.push_back(extract_val(f32_ty, res, getIntAttr(i)));
     }
+#endif
 
     vprintf("mma t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) "
             "D:(%f,%f,%f,%f,%f,%f,%f,%f)",
             pargs, rewriter);
-
 #endif
 
     for (unsigned i = 0; i < 8; i++) {
       Value elem = extract_val(f32_ty, res, getIntAttr(i));
       acc[idx[i]] = elem;
-      // TODO[goostavz]: double confirm this when m/n/k = [32, 32, x] has been
-      // verified before MMA
       resVals[(m * numN / 2 + n) * 8 + i] = elem;
     }
   };
@@ -3648,10 +3675,17 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
   // replace with new packed result
   Type structTy = LLVM::LLVMStructType::getLiteral(
       ctx, SmallVector<Type>(resSize, type::f32Ty(ctx)));
+
+  /*
+  for (int i = 0; i < 8; i++) {
+    resVals[i] = acc[i];
+  }
+   */
+
   Value res = getStructFromElements(loc, resVals, rewriter, structTy);
   rewriter.replaceOp(op, res);
   return success();
-}
+} // namespace
 
 LogicalResult
 DotOpConversion::convertFMADot(triton::DotOp op, OpAdaptor adaptor,
@@ -4764,6 +4798,8 @@ public:
     decomposeBlockedToDotOperand(mod);
 
     decomposeInsertSliceAsyncOp(mod);
+
+    llvm::outs() << "finalIR: " << mod << "\n";
 
     Allocation allocation(mod);
     MembarAnalysis membarPass(&allocation);
