@@ -3,11 +3,9 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Support/LogicalResult.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
@@ -101,9 +99,6 @@ translateLLVMToLLVMIR(llvm::LLVMContext *llvmContext, mlir::ModuleOp module) {
     return nullptr;
   }
 
-  // Initialize LLVM targets.
-  mlir::ExecutionEngine::setupTargetTriple(llvmModule.get());
-
   auto optPipeline = mlir::makeOptimizingTransformer(
       /*optLevel=*/3, /*sizeLevel=*/0,
       /*targetMachine=*/nullptr);
@@ -124,7 +119,7 @@ translateLLVMToLLVMIR(llvm::LLVMContext *llvmContext, mlir::ModuleOp module) {
 
 std::unique_ptr<llvm::Module>
 translateTritonGPUToLLVMIR(llvm::LLVMContext *llvmContext,
-                           mlir::ModuleOp module) {
+                           mlir::ModuleOp module, int computeCapability) {
   mlir::PassManager pm(module->getContext());
   applyPassManagerCLOptions(pm);
   auto printingFlags = mlir::OpPrintingFlags();
@@ -139,8 +134,8 @@ translateTritonGPUToLLVMIR(llvm::LLVMContext *llvmContext,
       /*printAfterOnlyOnChange=*/true,
       /*printAfterOnlyOnFailure*/ false, llvm::dbgs(), printingFlags);
 
-  pm.addPass(createConvertTritonGPUToLLVMPass());
-  // Conanicalize to eliminate the remaining UnrealizedConversionCastOp
+  pm.addPass(createConvertTritonGPUToLLVMPass(computeCapability));
+  // Canonicalize to eliminate the remaining UnrealizedConversionCastOp
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass()); // Simplify the IR to improve readability.
   pm.addPass(mlir::createSymbolDCEPass());
@@ -151,7 +146,7 @@ translateTritonGPUToLLVMIR(llvm::LLVMContext *llvmContext,
     return nullptr;
   }
 
-  std::map<std::string, std::string> extern_libs;
+  std::map<std::string, std::string> externLibs;
   SmallVector<LLVM::LLVMFuncOp> funcs;
   module.walk([&](LLVM::LLVMFuncOp func) {
     if (func.isExternal())
@@ -166,7 +161,7 @@ translateTritonGPUToLLVMIR(llvm::LLVMContext *llvmContext,
           func.getOperation()->getAttr("libpath").dyn_cast<StringAttr>();
       if (name) {
         std::string lib_name = name.str();
-        extern_libs[lib_name] = path.str();
+        externLibs[lib_name] = path.str();
       }
     }
   }
@@ -176,7 +171,7 @@ translateTritonGPUToLLVMIR(llvm::LLVMContext *llvmContext,
                     ->getAttr("triton_gpu.externs")
                     .dyn_cast<DictionaryAttr>();
     for (auto &attr : dict) {
-      extern_libs[attr.getName().strref().trim().str()] =
+      externLibs[attr.getName().strref().trim().str()] =
           attr.getValue().dyn_cast<StringAttr>().strref().trim().str();
     }
   }
@@ -188,19 +183,9 @@ translateTritonGPUToLLVMIR(llvm::LLVMContext *llvmContext,
   }
 
   llvm::SMDiagnostic err;
-  for (auto &lib : extern_libs) {
-    auto ext_mod = llvm::parseIRFile(lib.second, err, *llvmContext);
-    if (!ext_mod) {
-      llvm::errs() << "Failed to load extern lib " << lib.first;
+  for (auto &lib : externLibs) {
+    if (linkExternLib(*llvmir, lib.second))
       return nullptr;
-    }
-    ext_mod->setTargetTriple(llvmir->getTargetTriple());
-    ext_mod->setDataLayout(llvmir->getDataLayout());
-
-    if (llvm::Linker::linkModules(*llvmir, std::move(ext_mod))) {
-      llvm::errs() << "Failed to link extern lib " << lib.first;
-      return nullptr;
-    }
   }
 
   return llvmir;
@@ -224,6 +209,28 @@ void addExternalLibs(mlir::ModuleOp &module,
   DictionaryAttr dict = DictionaryAttr::get(module->getContext(), attrs);
   module.getOperation()->setAttr("triton_gpu.externs", dict);
   return;
+}
+
+bool linkExternLib(llvm::Module &module, llvm::StringRef path) {
+  llvm::SMDiagnostic err;
+  auto &ctx = module.getContext();
+
+  auto extMod = llvm::parseIRFile(path, err, ctx);
+  if (!extMod) {
+    llvm::errs() << "Failed to load " << path;
+    return true;
+  }
+
+  extMod->setTargetTriple(module.getTargetTriple());
+  extMod->setDataLayout(module.getDataLayout());
+
+  if (llvm::Linker::linkModules(module, std::move(extMod),
+                                llvm::Linker::Flags::LinkOnlyNeeded)) {
+    llvm::errs() << "Failed to link " << path;
+    return true;
+  }
+
+  return false;
 }
 
 } // namespace triton

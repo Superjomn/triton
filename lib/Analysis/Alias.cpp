@@ -1,4 +1,5 @@
 #include "triton/Analysis/Alias.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
@@ -24,18 +25,19 @@ ChangeResult SharedMemoryAliasAnalysis::visitOperation(
   if (maybeSharedAllocationOp(op)) {
     // These ops may allocate a new shared memory buffer.
     auto result = op->getResult(0);
-    if (isSharedEncoding(result)) {
-      // FIXME(Keren): extract and insert are always alias for now
-      if (auto extractSliceOp = dyn_cast<triton::gpu::ExtractSliceOp>(op)) {
-        // extract_slice %src, %index
-        aliasInfo = AliasInfo(operands[0]->getValue());
-      } else if (auto insertSliceOp =
-                     dyn_cast<triton::gpu::InsertSliceAsyncOp>(op)) {
-        // insert_slice_async %src, %dst, %index
-        aliasInfo = AliasInfo(operands[1]->getValue());
-      } else {
-        aliasInfo.insert(result);
-      }
+    // FIXME(Keren): extract and insert are always alias for now
+    if (isa<tensor::ExtractSliceOp, triton::TransOp>(op)) {
+      // extract_slice %src
+      aliasInfo = AliasInfo(operands[0]->getValue());
+      pessimistic = false;
+    } else if (isa<tensor::InsertSliceOp>(op) ||
+               isa<triton::gpu::InsertSliceAsyncOp>(op)) {
+      // insert_slice_async %src, %dst, %index
+      // insert_slice %src into %dst[%offsets]
+      aliasInfo = AliasInfo(operands[1]->getValue());
+      pessimistic = false;
+    } else if (isSharedEncoding(result)) {
+      aliasInfo.insert(result);
       pessimistic = false;
     }
   }
@@ -43,7 +45,7 @@ ChangeResult SharedMemoryAliasAnalysis::visitOperation(
   if (pessimistic) {
     return markAllPessimisticFixpoint(op->getResults());
   }
-  // Join all latice elements
+  // Join all lattice elements
   ChangeResult result = ChangeResult::NoChange;
   for (Value value : op->getResults()) {
     result |= getLatticeElement(value).join(aliasInfo);

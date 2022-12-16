@@ -132,6 +132,7 @@ ChangeResult AxisInfoAnalysis::visitOperation(
           AxisInfo::DimVectorT(ty.getShape().begin(), ty.getShape().end()));
     }
   }
+  // TODO: refactor & complete binary ops
   // Addition
   if (llvm::isa<arith::AddIOp, triton::AddPtrOp>(op)) {
     auto newContiguity = [&](AxisInfo lhs, AxisInfo rhs, int d) {
@@ -155,6 +156,30 @@ ChangeResult AxisInfoAnalysis::visitOperation(
     };
     auto newDivisibility = [](AxisInfo lhs, AxisInfo rhs, int d) {
       return lhs.getDivisibility(d) * rhs.getDivisibility(d);
+    };
+    curr = visitBinaryOp(op, operands[0]->getValue(), operands[1]->getValue(),
+                         newContiguity, newDivisibility, newConstancy);
+  }
+  // Remainder
+  if (llvm::isa<arith::RemSIOp, arith::RemUIOp>(op)) {
+    auto newContiguity = [](AxisInfo lhs, AxisInfo rhs, int d) {
+      return gcd(lhs.getContiguity(d), rhs.getDivisibility(d));
+    };
+    auto newDivisibility = [](AxisInfo lhs, AxisInfo rhs, int d) {
+      return gcd(lhs.getDivisibility(d), rhs.getDivisibility(d));
+    };
+    auto newConstancy = [](AxisInfo lhs, AxisInfo rhs, int d) {
+      return gcd(lhs.getConstancy(d), rhs.getConstancy(d));
+    };
+    curr = visitBinaryOp(op, operands[0]->getValue(), operands[1]->getValue(),
+                         newContiguity, newDivisibility, newConstancy);
+  }
+  // TODO: All other binary ops
+  if (llvm::isa<arith::AndIOp, arith::OrIOp>(op)) {
+    auto newContiguity = [](AxisInfo lhs, AxisInfo rhs, int d) { return 1; };
+    auto newDivisibility = [](AxisInfo lhs, AxisInfo rhs, int d) { return 1; };
+    auto newConstancy = [](AxisInfo lhs, AxisInfo rhs, int d) {
+      return gcd(lhs.getConstancy(d), rhs.getConstancy(d));
     };
     curr = visitBinaryOp(op, operands[0]->getValue(), operands[1]->getValue(),
                          newContiguity, newDivisibility, newConstancy);
@@ -200,7 +225,8 @@ ChangeResult AxisInfoAnalysis::visitOperation(
     for (int d = 0; d < retTy.getRank(); ++d) {
       contiguity.push_back(opShape[d] == 1 ? 1 : opInfo.getContiguity(d));
       divisibility.push_back(opInfo.getDivisibility(d));
-      constancy.push_back(opShape[d] == 1 ? retShape[d] : 1);
+      constancy.push_back(opShape[d] == 1 ? retShape[d]
+                                          : opInfo.getConstancy(d));
     }
     curr = AxisInfo(contiguity, divisibility, constancy);
   }
@@ -248,6 +274,48 @@ ChangeResult AxisInfoAnalysis::visitOperation(
     result |= getLatticeElement(value).join(curr);
   }
   return result;
+}
+
+unsigned AxisInfoAnalysis::getPtrVectorSize(Value ptr) {
+  auto tensorTy = ptr.getType().dyn_cast<RankedTensorType>();
+  if (!tensorTy)
+    return 1;
+  auto layout = tensorTy.getEncoding();
+  auto shape = tensorTy.getShape();
+
+  // Here order should be ordered by contiguous first, so the first element
+  // should have the largest contiguous.
+  auto order = triton::gpu::getOrder(layout);
+  unsigned align = getPtrAlignment(ptr);
+
+  unsigned contigPerThread = triton::gpu::getSizePerThread(layout)[order[0]];
+  unsigned vec = std::min(align, contigPerThread);
+  vec = std::min<unsigned>(shape[order[0]], vec);
+
+  return vec;
+}
+
+unsigned AxisInfoAnalysis::getPtrAlignment(Value ptr) {
+  auto tensorTy = ptr.getType().dyn_cast<RankedTensorType>();
+  if (!tensorTy)
+    return 1;
+  auto axisInfo = lookupLatticeElement(ptr)->getValue();
+  auto layout = tensorTy.getEncoding();
+  auto order = triton::gpu::getOrder(layout);
+  unsigned maxMultiple = axisInfo.getDivisibility(order[0]);
+  unsigned maxContig = axisInfo.getContiguity(order[0]);
+  unsigned alignment = std::min(maxMultiple, maxContig);
+  return alignment;
+}
+
+unsigned AxisInfoAnalysis::getMaskAlignment(Value mask) {
+  auto tensorTy = mask.getType().dyn_cast<RankedTensorType>();
+  if (!tensorTy)
+    return 1;
+  auto maskOrder = triton::gpu::getOrder(tensorTy.getEncoding());
+  auto maskAxis = lookupLatticeElement(mask)->getValue();
+  auto alignment = std::max<unsigned>(maskAxis.getConstancy(maskOrder[0]), 1);
+  return alignment;
 }
 
 } // namespace mlir

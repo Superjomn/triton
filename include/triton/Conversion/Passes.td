@@ -38,10 +38,17 @@ def ConvertTritonGPUToLLVM : Pass<"convert-triton-gpu-to-llvm", "mlir::ModuleOp"
                              "mlir::gpu::GPUDialect",
                              "mlir::scf::SCFDialect",
                              "mlir::LLVM::LLVMDialect",
+                             "mlir::tensor::TensorDialect",
                              "mlir::triton::TritonDialect",
                              "mlir::triton::gpu::TritonGPUDialect",
                              "mlir::NVVM::NVVMDialect",
                              "mlir::StandardOpsDialect"];
+
+    let options = [
+        Option<"computeCapability", "compute-capability",
+               "int32_t", /*default*/"80",
+               "device compute capability">
+    ];
 }
 
 #endif

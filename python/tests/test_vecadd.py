@@ -68,7 +68,7 @@ def test_vecadd_scf_mask(shape, num_warps, block_size, iter_size):
         @num_elements: number of elements
         '''
         pid = tl.program_id(axis=0)
-        for i in range(math.ceil(block_size / iter_size)):
+        for i in range(tl.cdiv(block_size, iter_size)):
             # TODO: a bug here, if put the offset outside the forloop, there will be a GPU mis-aligned error.
             offset = pid * block_size + tl.arange(0, iter_size)
             x_ptrs = x_ptr + offset
@@ -131,7 +131,7 @@ def vecadd_no_scf_tester(num_warps, block_size, shape):
 
 def vecadd_fcmp_no_scf_tester(num_warps, block_size, shape):
     '''
-    vecadd tester with float comparation as load/store mask.
+    vecadd tester with float comparison as load/store mask.
     '''
     @triton.jit
     def kernel(x_ptr,

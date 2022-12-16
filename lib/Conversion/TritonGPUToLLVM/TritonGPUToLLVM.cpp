@@ -1,5 +1,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/TritonGPUToLLVM.h"
 #include "../PassDetail.h"
+#include "./DotHelpers.h"
+#include "./Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Conversion/ArithmeticToLLVM/ArithmeticToLLVM.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
@@ -11,6 +13,7 @@
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
 #include "mlir/Dialect/GPU/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -31,6 +34,17 @@
 
 using namespace mlir;
 using namespace mlir::triton;
+using ::mlir::LLVM::DotOpFMAConversionHelper;
+using ::mlir::LLVM::DotOpMmaV1ConversionHelper;
+using ::mlir::LLVM::DotOpMmaV2ConversionHelper;
+using ::mlir::LLVM::getElementsFromStruct;
+using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
+using ::mlir::LLVM::getStridesFromShapeAndOrder;
+using ::mlir::LLVM::getStructFromElements;
+using ::mlir::LLVM::MMA16816ConversionHelper;
+using ::mlir::LLVM::SharedMemoryObject;
+using ::mlir::LLVM::shflSync;
+using ::mlir::LLVM::storeShared;
 using ::mlir::triton::gpu::BlockedEncodingAttr;
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
 using ::mlir::triton::gpu::getElemsPerThread;
@@ -47,93 +61,12 @@ namespace LLVM {
 
 static StringRef getStructAttrsAttrName() { return "llvm.struct_attrs"; }
 
-namespace {
+// A helper function for using printf in LLVM conversion.
+void vprintf(StringRef msg, ValueRange args,
+             ConversionPatternRewriter &rewriter);
 
-// Create a 32-bit integer constant.
-Value createConstantI32(Location loc, PatternRewriter &rewriter, int32_t v) {
-  auto i32ty = rewriter.getIntegerType(32);
-  return rewriter.create<LLVM::ConstantOp>(loc, i32ty,
-                                           IntegerAttr::get(i32ty, v));
-}
-
-Value createConstantF32(Location loc, PatternRewriter &rewriter, float v) {
-  auto type = type::f32Ty(rewriter.getContext());
-  return rewriter.create<LLVM::ConstantOp>(loc, type,
-                                           rewriter.getF32FloatAttr(v));
-}
-
-// Create a index type constant.
-Value createIndexConstant(OpBuilder &builder, Location loc,
-
-                          TypeConverter *converter, int64_t value) {
-  Type ty = converter->convertType(builder.getIndexType());
-  return builder.create<LLVM::ConstantOp>(loc, ty,
-                                          builder.getIntegerAttr(ty, value));
-}
-
-// Create an integer constant of \param width bits.
-Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
-                                int64_t value) {
-  Type ty = builder.getIntegerType(width);
-  return builder.create<LLVM::ConstantOp>(loc, ty,
-                                          builder.getIntegerAttr(ty, value));
-}
-
-} // namespace
-
-// Shortcuts for some commonly used LLVM ops to keep code simple and intuitive
-#define zext(...) rewriter.create<LLVM::ZExtOp>(loc, __VA_ARGS__)
-#define udiv(...) rewriter.create<LLVM::UDivOp>(loc, __VA_ARGS__)
-#define urem(...) rewriter.create<LLVM::URemOp>(loc, __VA_ARGS__)
-#define add(...) rewriter.create<LLVM::AddOp>(loc, __VA_ARGS__)
-#define fadd(...) rewriter.create<LLVM::FAddOp>(loc, __VA_ARGS__)
-#define mul(...) rewriter.create<LLVM::MulOp>(loc, __VA_ARGS__)
-#define smax(...) rewriter.create<LLVM::SMaxOp>(loc, __VA_ARGS__)
-#define umax(...) rewriter.create<LLVM::UMaxOp>(loc, __VA_ARGS__)
-#define fmax(...) rewriter.create<LLVM::MaxNumOp>(loc, __VA_ARGS__)
-#define smin(...) rewriter.create<LLVM::SMinOp>(loc, __VA_ARGS__)
-#define umin(...) rewriter.create<LLVM::UMinOp>(loc, __VA_ARGS__)
-#define fmin(...) rewriter.create<LLVM::MinNumOp>(loc, __VA_ARGS__)
-#define and_(...) rewriter.create<LLVM::AndOp>(loc, __VA_ARGS__)
-#define xor_(...) rewriter.create<LLVM::XOrOp>(loc, __VA_ARGS__)
-#define bitcast(val__, type__)                                                 \
-  rewriter.create<LLVM::BitcastOp>(loc, type__, val__)
-#define gep(...) rewriter.create<LLVM::GEPOp>(loc, __VA_ARGS__)
-#define ptr_ty(...) LLVM::LLVMPointerType::get(__VA_ARGS__)
-#define insert_val(...) rewriter.create<LLVM::InsertValueOp>(loc, __VA_ARGS__)
-#define extract_val(...) rewriter.create<LLVM::ExtractValueOp>(loc, __VA_ARGS__)
-#define insert_element(...)                                                    \
-  rewriter.create<LLVM::InsertElementOp>(loc, __VA_ARGS__)
-#define extract_element(...)                                                   \
-  rewriter.create<LLVM::ExtractElementOp>(loc, __VA_ARGS__)
-#define load(...) rewriter.create<LLVM::LoadOp>(loc, __VA_ARGS__)
-#define store(val, ptr) rewriter.create<LLVM::StoreOp>(loc, val, ptr)
-#define icmp_eq(...)                                                           \
-  rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::eq, __VA_ARGS__)
-#define icmp_ne(...)                                                           \
-  rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::ne, __VA_ARGS__)
-#define icmp_slt(...)                                                          \
-  rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::slt, __VA_ARGS__)
-#define select(...) rewriter.create<LLVM::SelectOp>(loc, __VA_ARGS__)
-#define address_of(...) rewriter.create<LLVM::AddressOfOp>(loc, __VA_ARGS__)
-#define barrier() rewriter.create<mlir::gpu::BarrierOp>(loc)
-#define undef(...) rewriter.create<LLVM::UndefOp>(loc, __VA_ARGS__)
-#define i32_ty rewriter.getIntegerType(32)
-#define f16_ty rewriter.getF16Type()
-#define i8_ty rewriter.getIntegerType(8)
-#define f32_ty rewriter.getF32Type()
-#define vec_ty(type, num) VectorType::get(num, type)
-#define f32_val(...) LLVM::createConstantF32(loc, rewriter, __VA_ARGS__)
-#define void_ty(ctx) LLVM::LLVMVoidType::get(ctx)
-#define struct_ty(...) LLVM::LLVMStructType::getLiteral(ctx, __VA_ARGS__)
-
-// Creator for constant
-#define i32_val(...) LLVM::createConstantI32(loc, rewriter, __VA_ARGS__)
-#define int_val(width, val)                                                    \
-  LLVM::createLLVMIntegerConstant(rewriter, loc, width, val)
-#define idx_val(...)                                                           \
-  LLVM::createIndexConstant(rewriter, loc, this->getTypeConverter(),           \
-                            __VA_ARGS__)
+void vprintf_array(Value thread, ArrayRef<Value> arr, std::string info,
+                   std::string elem_repr, ConversionPatternRewriter &builder);
 
 } // namespace LLVM
 } // namespace mlir
@@ -165,9 +98,8 @@ template <typename T> void printScalar(const T &e, const std::string &info) {
 /// Only retain those attributes that are not constructed by
 /// `LLVMFuncOp::build`. If `filterArgAttrs` is set, also filter out argument
 /// attributes.
-static void filterFuncAttributes(ArrayRef<NamedAttribute> attrs,
-                                 bool filterArgAttrs,
-                                 SmallVectorImpl<NamedAttribute> &result) {
+void filterFuncAttributes(ArrayRef<NamedAttribute> attrs, bool filterArgAttrs,
+                          SmallVectorImpl<NamedAttribute> &result) {
   for (const auto &attr : attrs) {
     if (attr.getName() == SymbolTable::getSymbolAttrName() ||
         attr.getName() == FunctionOpInterface::getTypeAttrName() ||
@@ -180,7 +112,7 @@ static void filterFuncAttributes(ArrayRef<NamedAttribute> attrs,
 }
 
 /// Helper function for wrapping all attributes into a single DictionaryAttr
-static auto wrapAsStructAttrs(OpBuilder &b, ArrayAttr attrs) {
+auto wrapAsStructAttrs(OpBuilder &b, ArrayAttr attrs) {
   return DictionaryAttr::get(
       b.getContext(), b.getNamedAttr(LLVM::getStructAttrsAttrName(), attrs));
 }
@@ -319,84 +251,73 @@ struct ReturnOpConversion : public ConvertOpToLLVMPattern<::mlir::ReturnOp> {
   }
 };
 
-Value getStructFromElements(Location loc, ValueRange resultVals,
-                            ConversionPatternRewriter &rewriter,
-                            Type structType) {
-  if (!structType.isa<LLVM::LLVMStructType>()) {
-    return *resultVals.begin();
-  }
-
-  Value llvmStruct = rewriter.create<LLVM::UndefOp>(loc, structType);
-  for (auto v : llvm::enumerate(resultVals)) {
-    llvmStruct = insert_val(structType, llvmStruct, v.value(),
-                            rewriter.getI64ArrayAttr(v.index()));
-  }
-  return llvmStruct;
-}
-
+// delinearize supposing order is [0, 1, .. , n]
 template <typename T>
-static SmallVector<T> getMultiDimIndex(T linearIndex, ArrayRef<T> shape) {
-  // shape: {a, b, c, d}  ->  accMul: {b*c*d, c*d, d, 1}
+SmallVector<T> getMultiDimIndexImpl(T linearIndex, ArrayRef<T> shape) {
+  // shape: {a, b, c, d}  ->  accMul: {1, a, a*b, a*b*c}
   size_t rank = shape.size();
-  T accMul = product(shape.drop_front());
+  T accMul = product(shape.drop_back());
   T linearRemain = linearIndex;
   SmallVector<T> multiDimIndex(rank);
-  for (size_t i = 0; i < rank; ++i) {
+  for (int i = rank - 1; i >= 0; --i) {
     multiDimIndex[i] = linearRemain / accMul;
     linearRemain = linearRemain % accMul;
-    if (i != (rank - 1)) {
-      accMul = accMul / shape[i + 1];
+    if (i != 0) {
+      accMul = accMul / shape[i - 1];
     }
   }
   return multiDimIndex;
 }
 
 template <typename T>
-static T getLinearIndex(ArrayRef<T> multiDimIndex, ArrayRef<T> shape) {
-  assert(multiDimIndex.size() == shape.size());
-  // shape: {a, b, c, d}  ->  accMul: {b*c*d, c*d, d, 1}
+SmallVector<T> getMultiDimIndex(T linearIndex, ArrayRef<T> shape,
+                                ArrayRef<unsigned> order) {
   size_t rank = shape.size();
-  T accMul = product(shape.drop_front());
+  assert(rank == order.size());
+  auto reordered = reorder(shape, order);
+  auto reorderedMultiDim = getMultiDimIndexImpl<T>(linearIndex, reordered);
+  SmallVector<T> multiDim(rank);
+  for (unsigned i = 0; i < rank; ++i) {
+    multiDim[order[i]] = reorderedMultiDim[i];
+  }
+  return multiDim;
+}
+
+// linearize supposing order is [0, 1, .. , n]
+template <typename T>
+T getLinearIndexImpl(ArrayRef<T> multiDimIndex, ArrayRef<T> shape) {
+  assert(multiDimIndex.size() == shape.size());
+  // shape: {a, b, c, d}  ->  accMul: {1, a, a*b, a*b*c}
+  size_t rank = shape.size();
+  T accMul = product(shape.drop_back());
   T linearIndex = 0;
-  for (size_t i = 0; i < rank; ++i) {
+  for (int i = rank - 1; i >= 0; --i) {
     linearIndex += multiDimIndex[i] * accMul;
-    if (i != (rank - 1)) {
-      accMul = accMul / shape[i + 1];
+    if (i != 0) {
+      accMul = accMul / shape[i - 1];
     }
   }
   return linearIndex;
 }
 
-Value storeShared(ConversionPatternRewriter &rewriter, Location loc, Value ptr,
-                  Value val, Value pred) {
-  MLIRContext *ctx = rewriter.getContext();
-  unsigned bits = val.getType().getIntOrFloatBitWidth();
-  const char *c = bits == 64 ? "l" : (bits == 16 ? "h" : "r");
-
-  PTXBuilder builder;
-  auto &st = builder.create<PTXIOInstr>("st")->shared().b(bits);
-  auto *ptrOpr = builder.newAddrOperand(ptr, "r");
-  auto *valOpr = builder.newOperand(val, c);
-  st(ptrOpr, valOpr).predicate(pred, "b");
-  return builder.launch(rewriter, loc, void_ty(ctx));
+template <typename T>
+T getLinearIndex(ArrayRef<T> multiDimIndex, ArrayRef<T> shape,
+                 ArrayRef<unsigned> order) {
+  assert(shape.size() == order.size());
+  return getLinearIndexImpl<T>(reorder(multiDimIndex, order),
+                               reorder(shape, order));
 }
 
 struct ConvertTritonGPUOpToLLVMPatternBase {
-  static SmallVector<Value>
-  getElementsFromStruct(Location loc, Value llvmStruct,
-                        ConversionPatternRewriter &rewriter) {
-    if (llvmStruct.getType().isIntOrIndexOrFloat() ||
-        llvmStruct.getType().isa<triton::PointerType>() ||
-        llvmStruct.getType().isa<LLVM::LLVMPointerType>())
-      return {llvmStruct};
-    ArrayRef<Type> types =
-        llvmStruct.getType().cast<LLVM::LLVMStructType>().getBody();
-    SmallVector<Value> results(types.size());
-    for (unsigned i = 0; i < types.size(); ++i) {
-      Type type = types[i];
-      results[i] = extract_val(type, llvmStruct, rewriter.getI64ArrayAttr(i));
-    }
-    return results;
+  static Value
+  getStructFromSharedMemoryObject(Location loc,
+                                  const SharedMemoryObject &smemObj,
+                                  ConversionPatternRewriter &rewriter) {
+    auto elems = smemObj.getElems();
+    auto types = smemObj.getTypes();
+    auto structTy =
+        LLVM::LLVMStructType::getLiteral(rewriter.getContext(), types);
+    return getStructFromElements(loc, elems, rewriter, structTy);
   }
 };
 
@@ -435,6 +356,10 @@ public:
         rewriter.getIntegerAttr(rewriter.getIndexType(), value));
   }
 
+  // -----------------------------------------------------------------------
+  // Utilities
+  // -----------------------------------------------------------------------
+
   // Convert an \param index to a multi-dim coordinate given \param shape and
   // \param order.
   SmallVector<Value> delinearize(ConversionPatternRewriter &rewriter,
@@ -462,14 +387,21 @@ public:
       multiDim[0] = linear;
     } else {
       Value remained = linear;
-      for (auto &&en : llvm::enumerate(llvm::reverse(shape.drop_front()))) {
+      for (auto &&en : llvm::enumerate(shape.drop_back())) {
         Value dimSize = idx_val(en.value());
-        multiDim[rank - 1 - en.index()] = urem(remained, dimSize);
+        multiDim[en.index()] = urem(remained, dimSize);
         remained = udiv(remained, dimSize);
       }
-      multiDim[0] = remained;
+      multiDim[rank - 1] = remained;
     }
     return multiDim;
+  }
+
+  Value linearize(ConversionPatternRewriter &rewriter, Location loc,
+                  ArrayRef<Value> multiDim, ArrayRef<unsigned> shape,
+                  ArrayRef<unsigned> order) const {
+    return linearize(rewriter, loc, reorder<Value>(multiDim, order),
+                     reorder<unsigned>(shape, order));
   }
 
   Value linearize(ConversionPatternRewriter &rewriter, Location loc,
@@ -477,15 +409,29 @@ public:
     int rank = multiDim.size();
     Value linear = idx_val(0);
     if (rank > 0) {
-      linear = multiDim.front();
+      linear = multiDim.back();
       for (auto [dim, shape] :
-           llvm::zip(multiDim.drop_front(), shape.drop_front())) {
+           llvm::reverse(llvm::zip(multiDim.drop_back(), shape.drop_back()))) {
         Value dimSize = idx_val(shape);
         linear = add(mul(linear, dimSize), dim);
       }
     }
     return linear;
   }
+
+  Value dot(ConversionPatternRewriter &rewriter, Location loc,
+            ArrayRef<Value> offsets, ArrayRef<Value> strides) const {
+    assert(offsets.size() == strides.size());
+    Value ret = idx_val(0);
+    for (auto [offset, stride] : llvm::zip(offsets, strides)) {
+      ret = add(ret, mul(offset, stride));
+    }
+    return ret;
+  }
+
+  // -----------------------------------------------------------------------
+  // Blocked layout indices
+  // -----------------------------------------------------------------------
 
   // Get an index-base for each dimension for a \param blocked_layout.
   SmallVector<Value>
@@ -508,6 +454,7 @@ public:
         delinearize(rewriter, loc, warpId, warpsPerCTA, order);
     SmallVector<Value> multiDimThreadId =
         delinearize(rewriter, loc, laneId, threadsPerWarp, order);
+
     SmallVector<Value> multiDimBase(rank);
     for (unsigned k = 0; k < rank; ++k) {
       // Wrap around multiDimWarpId/multiDimThreadId incase
@@ -529,58 +476,13 @@ public:
     return multiDimBase;
   }
 
-  SmallVector<SmallVector<Value>> emitIndices(Location loc,
-                                              ConversionPatternRewriter &b,
-                                              const Attribute &layout,
-                                              ArrayRef<int64_t> shape) const {
-    if (auto blocked = layout.dyn_cast<BlockedEncodingAttr>()) {
-      return emitIndicesForBlockedLayout(loc, b, blocked, shape);
-    } else if (auto slice = layout.dyn_cast<SliceEncodingAttr>()) {
-      return emitIndicesForSliceLayout(loc, b, slice, shape);
-    } else {
-      assert(0 && "emitIndices for layouts other than blocked & slice not "
-                  "implemented yet");
-      return {};
-    }
-  }
-
-  SmallVector<SmallVector<Value>>
-  emitIndicesForSliceLayout(Location loc, ConversionPatternRewriter &rewriter,
-                            const SliceEncodingAttr &sliceLayout,
-                            ArrayRef<int64_t> shape) const {
-    auto parent = sliceLayout.getParent();
-    unsigned dim = sliceLayout.getDim();
-    size_t rank = shape.size();
-    if (auto blockedParent = parent.dyn_cast<BlockedEncodingAttr>()) {
-      auto paddedIndices = emitIndicesForBlockedLayout(
-          loc, rewriter, blockedParent, sliceLayout.paddedShape(shape));
-      unsigned numIndices = paddedIndices.size();
-      SmallVector<SmallVector<Value>> resultIndices(numIndices);
-      for (unsigned i = 0; i < numIndices; ++i)
-        for (unsigned d = 0; d < rank + 1; ++d)
-          if (d != dim)
-            resultIndices[i].push_back(paddedIndices[i][d]);
-
-      return resultIndices;
-
-    } else if (auto sliceParent = parent.dyn_cast<SliceEncodingAttr>()) {
-      assert(0 && "emitIndicesForSliceLayout with parent of sliceLayout"
-                  "is not implemented yet");
-      return {};
-
-    } else {
-      assert(0 && "emitIndicesForSliceLayout with parent other than blocked & "
-                  "slice not implemented yet");
-      return {};
-    }
-  }
-
   SmallVector<SmallVector<unsigned>>
   emitOffsetForBlockedLayout(const BlockedEncodingAttr &blockedLayout,
                              ArrayRef<int64_t> shape) const {
     auto sizePerThread = blockedLayout.getSizePerThread();
     auto threadsPerWarp = blockedLayout.getThreadsPerWarp();
     auto warpsPerCTA = blockedLayout.getWarpsPerCTA();
+    auto order = blockedLayout.getOrder();
 
     unsigned rank = shape.size();
     SmallVector<unsigned> shapePerCTA = getShapePerCTA(blockedLayout);
@@ -612,9 +514,9 @@ public:
       unsigned linearNanoTileId = n / totalSizePerThread;
       unsigned linearNanoTileElemId = n % totalSizePerThread;
       SmallVector<unsigned> multiDimNanoTileId =
-          getMultiDimIndex<unsigned>(linearNanoTileId, tilesPerDim);
-      SmallVector<unsigned> multiDimNanoTileElemId =
-          getMultiDimIndex<unsigned>(linearNanoTileElemId, sizePerThread);
+          getMultiDimIndex<unsigned>(linearNanoTileId, tilesPerDim, order);
+      SmallVector<unsigned> multiDimNanoTileElemId = getMultiDimIndex<unsigned>(
+          linearNanoTileElemId, sizePerThread, order);
       for (unsigned k = 0; k < rank; ++k) {
         unsigned reorderedMultiDimId =
             multiDimNanoTileId[k] *
@@ -626,23 +528,122 @@ public:
     return reorderedOffset;
   }
 
+  // -----------------------------------------------------------------------
+  // Mma layout indices
+  // -----------------------------------------------------------------------
+
+  SmallVector<Value>
+  emitBaseIndexForMmaLayoutV1(Location loc, ConversionPatternRewriter &rewriter,
+                              const MmaEncodingAttr &mmaLayout,
+                              ArrayRef<int64_t> shape) const {
+    llvm_unreachable("emitIndicesForMmaLayoutV1 not implemented");
+  }
+
+  SmallVector<SmallVector<unsigned>>
+  emitOffsetForMmaLayoutV1(const MmaEncodingAttr &mmaLayout,
+                           ArrayRef<int64_t> shape) const {
+    SmallVector<SmallVector<unsigned>> ret;
+
+    for (unsigned i = 0; i < shape[0]; i += getShapePerCTA(mmaLayout)[0]) {
+      for (unsigned j = 0; j < shape[1]; j += getShapePerCTA(mmaLayout)[1]) {
+        ret.push_back({i, j});
+        ret.push_back({i, j + 1});
+        ret.push_back({i + 2, j});
+        ret.push_back({i + 2, j + 1});
+        ret.push_back({i, j + 8});
+        ret.push_back({i, j + 9});
+        ret.push_back({i + 2, j + 8});
+        ret.push_back({i + 2, j + 9});
+      }
+    }
+    return ret;
+  }
+
+  SmallVector<Value>
+  emitBaseIndexForMmaLayoutV2(Location loc, ConversionPatternRewriter &rewriter,
+                              const MmaEncodingAttr &mmaLayout,
+                              ArrayRef<int64_t> shape) const {
+    auto _warpsPerCTA = mmaLayout.getWarpsPerCTA();
+    assert(_warpsPerCTA.size() == 2);
+    SmallVector<Value> warpsPerCTA = {idx_val(_warpsPerCTA[0]),
+                                      idx_val(_warpsPerCTA[1])};
+    Value threadId = getThreadId(rewriter, loc);
+    Value warpSize = idx_val(32);
+    Value laneId = urem(threadId, warpSize);
+    Value warpId = udiv(threadId, warpSize);
+    Value warpId0 = urem(warpId, warpsPerCTA[0]);
+    Value warpId1 = urem(udiv(warpId, warpsPerCTA[0]), warpsPerCTA[1]);
+    Value offWarp0 = mul(warpId0, idx_val(16));
+    Value offWarp1 = mul(warpId1, idx_val(8));
+
+    SmallVector<Value> multiDimBase(2);
+    multiDimBase[0] = add(udiv(laneId, idx_val(4)), offWarp0);
+    multiDimBase[1] = add(mul(idx_val(2), urem(laneId, idx_val(4))), offWarp1);
+    return multiDimBase;
+  }
+
+  SmallVector<SmallVector<unsigned>>
+  emitOffsetForMmaLayoutV2(const MmaEncodingAttr &mmaLayout,
+                           ArrayRef<int64_t> shape) const {
+    SmallVector<SmallVector<unsigned>> ret;
+
+    for (unsigned i = 0; i < shape[0]; i += getShapePerCTA(mmaLayout)[0]) {
+      for (unsigned j = 0; j < shape[1]; j += getShapePerCTA(mmaLayout)[1]) {
+        ret.push_back({i, j});
+        ret.push_back({i, j + 1});
+        ret.push_back({i + 8, j});
+        ret.push_back({i + 8, j + 1});
+      }
+    }
+    return ret;
+  }
+
+  // -----------------------------------------------------------------------
+  // Get offsets / indices for any layout
+  // -----------------------------------------------------------------------
+
+  SmallVector<Value> emitBaseIndexForLayout(Location loc,
+                                            ConversionPatternRewriter &rewriter,
+                                            const Attribute &layout,
+                                            ArrayRef<int64_t> shape) const {
+    if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>())
+      return emitBaseIndexForBlockedLayout(loc, rewriter, blockedLayout, shape);
+    if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
+      if (mmaLayout.isVolta())
+        return emitBaseIndexForMmaLayoutV1(loc, rewriter, mmaLayout, shape);
+      if (mmaLayout.isAmpere())
+        return emitBaseIndexForMmaLayoutV2(loc, rewriter, mmaLayout, shape);
+    }
+    llvm_unreachable("unsupported emitBaseIndexForLayout");
+  }
+
+  SmallVector<SmallVector<unsigned>>
+  emitOffsetForLayout(const Attribute &layout, ArrayRef<int64_t> shape) const {
+    if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>())
+      return emitOffsetForBlockedLayout(blockedLayout, shape);
+    if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
+      if (mmaLayout.isVolta())
+        return emitOffsetForMmaLayoutV1(mmaLayout, shape);
+      if (mmaLayout.isAmpere())
+        return emitOffsetForMmaLayoutV2(mmaLayout, shape);
+    }
+    llvm_unreachable("unsupported emitOffsetForLayout");
+  }
+
   // Emit indices calculation within each ConversionPattern, and returns a
   // [elemsPerThread X rank] index matrix.
-  // TODO: [goostavz] Double confirm the redundant indices calculations will
-  //       be eliminated in the consequent MLIR/LLVM optimization. We might
-  //       implement a indiceCache if necessary.
-  SmallVector<SmallVector<Value>>
-  emitIndicesForBlockedLayout(Location loc, ConversionPatternRewriter &rewriter,
-                              const BlockedEncodingAttr &blockedLayout,
-                              ArrayRef<int64_t> shape) const {
+
+  // TODO: [phil] redundant indices commputation do not appear to hurt
+  // performance much, but they could still significantly slow down
+  // computations.
+  SmallVector<SmallVector<Value>> emitIndicesForDistributedLayout(
+      Location loc, ConversionPatternRewriter &rewriter,
+      const Attribute &layout, ArrayRef<int64_t> shape) const {
+
     // step 1, delinearize threadId to get the base index
-    auto multiDimBase =
-        emitBaseIndexForBlockedLayout(loc, rewriter, blockedLayout, shape);
-
+    auto multiDimBase = emitBaseIndexForLayout(loc, rewriter, layout, shape);
     // step 2, get offset of each element
-    SmallVector<SmallVector<unsigned>> offset =
-        emitOffsetForBlockedLayout(blockedLayout, shape);
-
+    auto offset = emitOffsetForLayout(layout, shape);
     // step 3, add offset to base, and reorder the sequence of indices to
     // guarantee that elems in the same sizePerThread are adjacent in order
     unsigned rank = shape.size();
@@ -655,6 +656,65 @@ public:
 
     return multiDimIdx;
   }
+
+  struct SmallVectorKeyInfo {
+    static unsigned getHashValue(const SmallVector<unsigned> &key) {
+      return llvm::hash_combine_range(key.begin(), key.end());
+    }
+    static bool isEqual(const SmallVector<unsigned> &lhs,
+                        const SmallVector<unsigned> &rhs) {
+      return lhs == rhs;
+    }
+    static SmallVector<unsigned> getEmptyKey() {
+      return SmallVector<unsigned>();
+    }
+    static SmallVector<unsigned> getTombstoneKey() {
+      return {std::numeric_limits<unsigned>::max()};
+    }
+  };
+
+  SmallVector<SmallVector<Value>>
+  emitIndicesForSliceLayout(Location loc, ConversionPatternRewriter &rewriter,
+                            const SliceEncodingAttr &sliceLayout,
+                            ArrayRef<int64_t> shape) const {
+    auto parent = sliceLayout.getParent();
+    unsigned dim = sliceLayout.getDim();
+    size_t rank = shape.size();
+    auto parentIndices =
+        emitIndices(loc, rewriter, parent, sliceLayout.paddedShape(shape));
+    unsigned numIndices = parentIndices.size();
+    SmallVector<SmallVector<Value>> resultIndices;
+    for (unsigned i = 0; i < numIndices; ++i) {
+      SmallVector<Value> indices = parentIndices[i];
+      indices.erase(indices.begin() + dim);
+      resultIndices.push_back(indices);
+    }
+    return resultIndices;
+  }
+
+  // -----------------------------------------------------------------------
+  // Emit indices
+  // -----------------------------------------------------------------------
+  SmallVector<SmallVector<Value>> emitIndices(Location loc,
+                                              ConversionPatternRewriter &b,
+                                              const Attribute &layout,
+                                              ArrayRef<int64_t> shape) const {
+    if (auto blocked = layout.dyn_cast<BlockedEncodingAttr>()) {
+      return emitIndicesForDistributedLayout(loc, b, blocked, shape);
+    } else if (auto mma = layout.dyn_cast<MmaEncodingAttr>()) {
+      return emitIndicesForDistributedLayout(loc, b, mma, shape);
+    } else if (auto slice = layout.dyn_cast<SliceEncodingAttr>()) {
+      return emitIndicesForSliceLayout(loc, b, slice, shape);
+    } else {
+      assert(0 && "emitIndices for layouts other than blocked & slice not "
+                  "implemented yet");
+      return {};
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Shared memory utilities
+  // -----------------------------------------------------------------------
 
   template <typename T>
   Value getSharedMemoryBase(Location loc, ConversionPatternRewriter &rewriter,
@@ -691,8 +751,8 @@ Value convertSplatLikeOp(Type elemType, Type resType, Value constVal,
                          TypeConverter *typeConverter,
                          ConversionPatternRewriter &rewriter, Location loc) {
   auto tensorTy = resType.cast<RankedTensorType>();
-  if (tensorTy.getEncoding().isa<BlockedEncodingAttr>()) {
-    auto tensorTy = resType.cast<RankedTensorType>();
+  if (tensorTy.getEncoding().isa<BlockedEncodingAttr>() ||
+      tensorTy.getEncoding().isa<SliceEncodingAttr>()) {
     auto srcType = typeConverter->convertType(elemType);
     auto llSrc = bitcast(constVal, srcType);
     size_t elemsPerThread = getElemsPerThread(tensorTy);
@@ -772,13 +832,13 @@ struct ArithConstantSplatOpConversion
 
 // Contains some helper functions for both Load and Store conversions.
 struct LoadStoreConversionBase : public ConvertTritonGPUOpToLLVMPatternBase {
-  LoadStoreConversionBase(AxisInfoAnalysis &axisAnalysisPass)
-      : AxisAnalysisPass(axisAnalysisPass) {}
+  explicit LoadStoreConversionBase(AxisInfoAnalysis &axisAnalysisPass)
+      : axisAnalysisPass(axisAnalysisPass) {}
 
   // Get corresponding LLVM element values of \param value.
-  SmallVector<Value> getLLVMElems(Value value, Value llValue,
-                                  ConversionPatternRewriter &rewriter,
-                                  Location loc) const {
+  static SmallVector<Value> getLLVMElems(Value value, Value llValue,
+                                         ConversionPatternRewriter &rewriter,
+                                         Location loc) {
     if (!value)
       return {};
     if (!llValue.getType().isa<LLVM::LLVMStructType>())
@@ -789,51 +849,15 @@ struct LoadStoreConversionBase : public ConvertTritonGPUOpToLLVMPatternBase {
   }
 
   unsigned getVectorSize(Value ptr) const {
-    auto tensorTy = ptr.getType().dyn_cast<RankedTensorType>();
-    if (!tensorTy)
-      return 1;
-    auto layout = tensorTy.getEncoding();
-    auto shape = tensorTy.getShape();
-
-    auto axisInfo = getAxisInfo(ptr);
-    // Here order should be ordered by contiguous first, so the first element
-    // should have the largest contiguous.
-    auto order = getOrder(layout);
-    unsigned align = getAlignment(ptr, layout);
-
-    unsigned contigPerThread = getSizePerThread(layout)[order[0]];
-    unsigned vec = std::min(align, contigPerThread);
-    vec = std::min<unsigned>(shape[order[0]], vec);
-
-    return vec;
-  }
-
-  unsigned getAlignment(Value val, const Attribute &layout) const {
-    auto axisInfo = getAxisInfo(val);
-    auto order = getOrder(layout);
-    unsigned maxMultiple = axisInfo->getDivisibility(order[0]);
-    unsigned maxContig = axisInfo->getContiguity(order[0]);
-    unsigned alignment = std::min(maxMultiple, maxContig);
-    return alignment;
+    return axisAnalysisPass.getPtrVectorSize(ptr);
   }
 
   unsigned getMaskAlignment(Value mask) const {
-    auto tensorTy = mask.getType().cast<RankedTensorType>();
-    auto maskOrder = getOrder(tensorTy.getEncoding());
-    auto maskAxis = getAxisInfo(mask);
-    return std::max<int>(maskAxis->getConstancy(maskOrder[0]), 1);
-  }
-
-  llvm::Optional<AxisInfo> getAxisInfo(Value val) const {
-    if (auto it = AxisAnalysisPass.lookupLatticeElement(val)) {
-      return it->getValue();
-    }
-
-    return llvm::Optional<AxisInfo>{};
+    return axisAnalysisPass.getMaskAlignment(mask);
   }
 
 protected:
-  AxisInfoAnalysis &AxisAnalysisPass;
+  AxisInfoAnalysis &axisAnalysisPass;
 };
 
 struct LoadOpConversion
@@ -864,7 +888,8 @@ struct LoadOpConversion
 
     // Determine the vectorization size
     Type valueTy = op.getResult().getType();
-    Type valueElemTy = getElementTypeOrSelf(valueTy);
+    Type valueElemTy =
+        typeConverter->convertType(getElementTypeOrSelf(valueTy));
     unsigned vec = getVectorSize(ptr);
     unsigned numElems = getElemsPerThread(ptr.getType());
     if (llMask)
@@ -916,7 +941,6 @@ struct LoadOpConversion
       const bool hasL2EvictPolicy = false;
 
       PTXBuilder ptxBuilder;
-      auto &ld = *ptxBuilder.create<PTXIOInstr>("ld");
 
       Value pred = mask ? maskElems[vecStart] : int_val(1, 1);
 
@@ -936,16 +960,18 @@ struct LoadOpConversion
           ptxBuilder.newAddrOperand(ptrElems[vecStart], "l", in_off);
 
       // Define the instruction opcode
-      ld.o("volatile", op.isVolatile())
-          .global()
-          .o("ca", op.cache() == triton::CacheModifier::CA)
-          .o("cg", op.cache() == triton::CacheModifier::CG)
-          .o("L1::evict_first",
-             op.evict() == triton::EvictionPolicy::EVICT_FIRST)
-          .o("L1::evict_last", op.evict() == triton::EvictionPolicy::EVICT_LAST)
-          .o("L1::cache_hint", hasL2EvictPolicy)
-          .v(nWords)
-          .b(width);
+      auto &ld = ptxBuilder.create<>("ld")
+                     ->o("volatile", op.isVolatile())
+                     .global()
+                     .o("ca", op.cache() == triton::CacheModifier::CA)
+                     .o("cg", op.cache() == triton::CacheModifier::CG)
+                     .o("L1::evict_first",
+                        op.evict() == triton::EvictionPolicy::EVICT_FIRST)
+                     .o("L1::evict_last",
+                        op.evict() == triton::EvictionPolicy::EVICT_LAST)
+                     .o("L1::cache_hint", hasL2EvictPolicy)
+                     .v(nWords)
+                     .b(width);
 
       PTXBuilder::Operand *evictOpr{};
 
@@ -960,13 +986,15 @@ struct LoadOpConversion
 
       if (other) {
         for (size_t ii = 0; ii < nWords; ++ii) {
-          PTXInstr &mov = *ptxBuilder.create<>("mov");
-          mov.o("u", width);
+          // PTX doesn't support mov.u8, so we need to use mov.u16
+          auto movWidth = width < 16 ? 16 : width;
+          PTXInstr &mov =
+              ptxBuilder.create<>("mov")->o("u" + std::to_string(movWidth));
 
           size_t size = width / valueElemNbits;
 
           auto vecTy = LLVM::getFixedVectorType(valueElemTy, size);
-          Value v = rewriter.create<LLVM::UndefOp>(loc, vecTy);
+          Value v = undef(vecTy);
           for (size_t s = 0; s < size; ++s) {
             Value falseVal = otherElems[vecStart + ii * size + s];
             Value sVal = createIndexAttrConstant(
@@ -994,7 +1022,8 @@ struct LoadOpConversion
                        : retTys[0];
 
       // TODO: if (has_l2_evict_policy)
-      // auto asmDialectAttr = LLVM::AsmDialectAttr::get(rewriter.getContext(),
+      // auto asmDialectAttr =
+      // LLVM::AsmDialectAttr::get(rewriter.getContext(),
       //                                                 LLVM::AsmDialect::AD_ATT);
       Value ret = ptxBuilder.launch(rewriter, loc, retTy);
 
@@ -1057,7 +1086,8 @@ struct StoreOpConversion
     MLIRContext *ctx = rewriter.getContext();
 
     auto valueTy = value.getType();
-    Type valueElemTy = getElementTypeOrSelf(valueTy);
+    Type valueElemTy =
+        typeConverter->convertType(getElementTypeOrSelf(valueTy));
 
     unsigned vec = getVectorSize(ptr);
     unsigned numElems = getElemsPerThread(ptr.getType());
@@ -1101,7 +1131,7 @@ struct StoreOpConversion
       SmallVector<std::pair<Value, std::string>> asmArgs;
       for (size_t wordIdx = 0; wordIdx < nWords; ++wordIdx) {
         // llWord is a width-len composition
-        Value llWord = rewriter.create<LLVM::UndefOp>(loc, wordTy);
+        Value llWord = undef(wordTy);
         // Insert each value element to the composition
         for (size_t elemIdx = 0; elemIdx < wordNElems; ++elemIdx) {
           const size_t elemOffset = vecStart + wordIdx * wordNElems + elemIdx;
@@ -1112,10 +1142,7 @@ struct StoreOpConversion
           elem = bitcast(elem, valueElemTy);
 
           Type u32Ty = typeConverter->convertType(type::u32Ty(ctx));
-          llWord =
-              insert_element(wordTy, llWord, elem,
-                             rewriter.create<LLVM::ConstantOp>(
-                                 loc, u32Ty, IntegerAttr::get(u32Ty, elemIdx)));
+          llWord = insert_element(wordTy, llWord, elem, i32_val(elemIdx));
         }
         llWord = bitcast(llWord, valArgTy);
         std::string constraint =
@@ -1133,7 +1160,7 @@ struct StoreOpConversion
           ptxBuilder.newAddrOperand(ptrElems[vecStart], "l", in_off);
 
       auto &ptxStoreInstr =
-          ptxBuilder.create<PTXIOInstr>("st")->global().v(nWords).b(width);
+          ptxBuilder.create<>("st")->global().v(nWords).b(width);
       ptxStoreInstr(asmAddr, asmArgList).predicate(maskVal, "b");
 
       Type boolTy = getTypeConverter()->convertType(rewriter.getIntegerType(1));
@@ -1175,78 +1202,31 @@ struct BroadcastOpConversion
     Value result = op.result();
     auto srcTy = op.src().getType().cast<RankedTensorType>();
     auto resultTy = result.getType().cast<RankedTensorType>();
-    auto srcLayout = srcTy.getEncoding().dyn_cast<BlockedEncodingAttr>();
-    auto resultLayout = resultTy.getEncoding().dyn_cast<BlockedEncodingAttr>();
-    assert(srcLayout && (srcLayout == resultLayout) &&
-           "Unexpected layout of BroadcastOp");
+    auto srcLayout = srcTy.getEncoding();
+    auto resultLayout = resultTy.getEncoding();
     auto srcShape = srcTy.getShape();
     auto resultShape = resultTy.getShape();
     unsigned rank = srcTy.getRank();
     assert(rank == resultTy.getRank());
-
-    SmallVector<int64_t, 4> srcLogicalShape(2 * rank);
-    SmallVector<int64_t, 4> resultLogicalShape(2 * rank);
-    SmallVector<unsigned, 2> broadcastDims;
-    for (unsigned d = 0; d < rank; ++d) {
-      unsigned resultShapePerCTA = resultLayout.getSizePerThread()[d] *
-                                   resultLayout.getThreadsPerWarp()[d] *
-                                   resultLayout.getWarpsPerCTA()[d];
-      int64_t numCtas = ceil<unsigned>(resultShape[d], resultShapePerCTA);
-      if (srcShape[d] != resultShape[d]) {
-        assert(srcShape[d] == 1);
-        broadcastDims.push_back(d);
-        srcLogicalShape[d] = 1;
-        srcLogicalShape[d + rank] =
-            std::max<unsigned>(1, srcLayout.getSizePerThread()[d]);
-      } else {
-        srcLogicalShape[d] = numCtas;
-        srcLogicalShape[d + rank] = resultLayout.getSizePerThread()[d];
-      }
-      resultLogicalShape[d] = numCtas;
-      resultLogicalShape[d + rank] = resultLayout.getSizePerThread()[d];
+    auto order = triton::gpu::getOrder(srcLayout);
+    auto srcOffsets = emitOffsetForLayout(srcLayout, srcShape);
+    auto resultOffsets = emitOffsetForLayout(resultLayout, resultShape);
+    SmallVector<Value> srcVals = getElementsFromStruct(loc, src, rewriter);
+    DenseMap<SmallVector<unsigned>, Value, SmallVectorKeyInfo> srcValues;
+    for (size_t i = 0; i < srcOffsets.size(); i++) {
+      srcValues[srcOffsets[i]] = srcVals[i];
     }
-    int64_t duplicates = 1;
-    SmallVector<int64_t, 2> broadcastSizes(broadcastDims.size() * 2);
-    for (auto it : llvm::enumerate(broadcastDims)) {
-      // Incase there are multiple indices in the src that is actually
-      // calculating the same element, srcLogicalShape may not need to be 1.
-      // Such as the case when src of shape [256, 1], and with a blocked
-      // layout: sizePerThread: [1, 4];  threadsPerWarp: [1, 32]; warpsPerCTA:
-      // [1, 2]
-      int64_t d = resultLogicalShape[it.value()] / srcLogicalShape[it.value()];
-      broadcastSizes[it.index()] = d;
-      duplicates *= d;
-      d = resultLogicalShape[it.value() + rank] /
-          srcLogicalShape[it.value() + rank];
-      broadcastSizes[it.index() + broadcastDims.size()] = d;
-      duplicates *= d;
-    }
-
-    unsigned srcElems = getElemsPerThread(srcTy);
-    auto srcVals = getElementsFromStruct(loc, src, rewriter);
-    unsigned resultElems = getElemsPerThread(resultTy);
-    SmallVector<Value> resultVals(resultElems);
-    for (unsigned i = 0; i < srcElems; ++i) {
-      auto srcMultiDim = getMultiDimIndex<int64_t>(i, srcLogicalShape);
-      for (int64_t j = 0; j < duplicates; ++j) {
-        auto resultMultiDim = srcMultiDim;
-        auto bcastMultiDim = getMultiDimIndex<int64_t>(j, broadcastSizes);
-        for (auto bcastDim : llvm::enumerate(broadcastDims)) {
-          resultMultiDim[bcastDim.value()] += bcastMultiDim[bcastDim.index()];
-          resultMultiDim[bcastDim.value() + rank] +=
-              bcastMultiDim[bcastDim.index() + broadcastDims.size()] *
-              srcLogicalShape[bcastDim.index() + broadcastDims.size()];
-        }
-        auto resultLinearIndex =
-            getLinearIndex<int64_t>(resultMultiDim, resultLogicalShape);
-        resultVals[resultLinearIndex] = srcVals[i];
-      }
+    SmallVector<Value> resultVals;
+    for (size_t i = 0; i < resultOffsets.size(); i++) {
+      auto offset = resultOffsets[i];
+      for (size_t j = 0; j < srcShape.size(); j++)
+        if (srcShape[j] == 1)
+          offset[j] = 0;
+      resultVals.push_back(srcValues.lookup(offset));
     }
     auto llvmStructTy = getTypeConverter()->convertType(resultTy);
-
     Value resultStruct =
         getStructFromElements(loc, resultVals, rewriter, llvmStructTy);
-
     rewriter.replaceOp(op, {resultStruct});
     return success();
   }
@@ -1268,8 +1248,9 @@ private:
   void accumulate(ConversionPatternRewriter &rewriter, Location loc,
                   RedOp redOp, Value &acc, Value cur, bool isFirst) const;
 
-  Value shflSync(ConversionPatternRewriter &rewriter, Location loc, Value val,
-                 int i) const;
+  void accumulateWithIndex(ConversionPatternRewriter &rewriter, Location loc,
+                           RedOp redOp, Value &acc, Value &accIndex, Value cur,
+                           Value curIndex, bool isFirst) const;
 
   // Use shared memory for reduction within warps and across warps
   LogicalResult matchAndRewriteBasic(triton::ReduceOp op, OpAdaptor adaptor,
@@ -1284,7 +1265,7 @@ private:
 LogicalResult
 ReduceOpConversion::matchAndRewrite(triton::ReduceOp op, OpAdaptor adaptor,
                                     ConversionPatternRewriter &rewriter) const {
-  if (op.axis() == 1) // FIXME(Qingyi): The fastest-changing dimension
+  if (ReduceOpHelper(op).isFastReduction())
     return matchAndRewriteFast(op, adaptor, rewriter);
   return matchAndRewriteBasic(op, adaptor, rewriter);
 }
@@ -1296,7 +1277,6 @@ void ReduceOpConversion::accumulate(ConversionPatternRewriter &rewriter,
     acc = cur;
     return;
   }
-  auto type = cur.getType();
   switch (redOp) {
   case RedOp::ADD:
     acc = add(acc, cur);
@@ -1325,37 +1305,78 @@ void ReduceOpConversion::accumulate(ConversionPatternRewriter &rewriter,
   case RedOp::XOR:
     acc = xor_(acc, cur);
     break;
+  case RedOp::ARGMIN:
+  case RedOp::ARGMAX:
+  case RedOp::ARGUMIN:
+  case RedOp::ARGUMAX:
+  case RedOp::ARGFMIN:
+  case RedOp::ARGFMAX:
+    llvm::report_fatal_error(
+        "This accumulate implementation is not for argmin / argmax");
   default:
     llvm::report_fatal_error("Unsupported reduce op");
   }
-};
+}
 
-Value ReduceOpConversion::shflSync(ConversionPatternRewriter &rewriter,
-                                   Location loc, Value val, int i) const {
-  unsigned bits = val.getType().getIntOrFloatBitWidth();
-
-  if (bits == 64) {
-    Type vecTy = vec_ty(f32_ty, 2);
-    Value vec = bitcast(val, vecTy);
-    Value val0 = extract_element(f32_ty, vec, i32_val(0));
-    Value val1 = extract_element(f32_ty, vec, i32_val(1));
-    val0 = shflSync(rewriter, loc, val0, i);
-    val1 = shflSync(rewriter, loc, val1, i);
-    vec = undef(vecTy);
-    vec = insert_element(vecTy, vec, val0, i32_val(0));
-    vec = insert_element(vecTy, vec, val1, i32_val(1));
-    return bitcast(vec, val.getType());
+void ReduceOpConversion::accumulateWithIndex(
+    ConversionPatternRewriter &rewriter, Location loc, RedOp redOp, Value &acc,
+    Value &accIndex, Value cur, Value curIndex, bool isFirst) const {
+  if (isFirst) {
+    acc = cur;
+    accIndex = curIndex;
+    return;
   }
-
-  PTXBuilder builder;
-  auto &shfl = builder.create("shfl.sync")->o("bfly").o("b32");
-  auto *dOpr = builder.newOperand("=r");
-  auto *aOpr = builder.newOperand(val, "r");
-  auto *bOpr = builder.newConstantOperand(i);
-  auto *cOpr = builder.newConstantOperand("0x1f");
-  auto *maskOpr = builder.newConstantOperand("0xffffffff");
-  shfl(dOpr, aOpr, bOpr, cOpr, maskOpr);
-  return builder.launch(rewriter, loc, val.getType(), false);
+  switch (redOp) {
+  case RedOp::ARGMIN:
+    accIndex =
+        select(icmp_slt(acc, cur), accIndex,
+               select(icmp_sgt(acc, cur), curIndex, smin(accIndex, curIndex)));
+    acc = smin(acc, cur);
+    break;
+  case RedOp::ARGMAX:
+    accIndex =
+        select(icmp_sgt(acc, cur), accIndex,
+               select(icmp_slt(acc, cur), curIndex, smin(accIndex, curIndex)));
+    acc = smax(acc, cur);
+    break;
+  case RedOp::ARGUMIN:
+    accIndex =
+        select(icmp_ult(acc, cur), accIndex,
+               select(icmp_ugt(acc, cur), curIndex, smin(accIndex, curIndex)));
+    acc = umin(acc, cur);
+    break;
+  case RedOp::ARGUMAX:
+    accIndex =
+        select(icmp_ugt(acc, cur), accIndex,
+               select(icmp_ult(acc, cur), curIndex, smin(accIndex, curIndex)));
+    acc = umax(acc, cur);
+    break;
+  case RedOp::ARGFMIN:
+    accIndex =
+        select(fcmp_olt(acc, cur), accIndex,
+               select(fcmp_ogt(acc, cur), curIndex, smin(accIndex, curIndex)));
+    acc = fmin(acc, cur);
+    break;
+  case RedOp::ARGFMAX:
+    accIndex =
+        select(fcmp_ogt(acc, cur), accIndex,
+               select(fcmp_olt(acc, cur), curIndex, smin(accIndex, curIndex)));
+    acc = fmax(acc, cur);
+    break;
+  case RedOp::ADD:
+  case RedOp::FADD:
+  case RedOp::MIN:
+  case RedOp::MAX:
+  case RedOp::UMIN:
+  case RedOp::UMAX:
+  case RedOp::FMIN:
+  case RedOp::FMAX:
+  case RedOp::XOR:
+    llvm::report_fatal_error(
+        "This accumulate implementation is only for argmin / argmax");
+  default:
+    llvm::report_fatal_error("Unsupported reduce op");
+  }
 }
 
 LogicalResult ReduceOpConversion::matchAndRewriteBasic(
@@ -1363,17 +1384,25 @@ LogicalResult ReduceOpConversion::matchAndRewriteBasic(
     ConversionPatternRewriter &rewriter) const {
   Location loc = op->getLoc();
   unsigned axis = op.axis();
+  bool withIndex = triton::ReduceOp::withIndex(op.redOp());
 
   auto srcTy = op.operand().getType().cast<RankedTensorType>();
   auto srcLayout = srcTy.getEncoding().cast<BlockedEncodingAttr>();
+  auto srcOrd = srcLayout.getOrder();
   auto srcShape = srcTy.getShape();
 
   auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
+  auto llvmIndexTy = getTypeConverter()->getIndexType();
   auto elemPtrTy = LLVM::LLVMPointerType::get(llvmElemTy, 3);
+  auto indexPtrTy = LLVM::LLVMPointerType::get(llvmIndexTy, 3);
   Value smemBase = getSharedMemoryBase(loc, rewriter, op.getOperation());
   smemBase = bitcast(smemBase, elemPtrTy);
 
-  auto smemShape = getScratchConfigForReduce(op);
+  ReduceOpHelper helper(op);
+  auto smemShape = helper.getScratchConfigBasic();
+  unsigned elems = product<unsigned>(smemShape);
+  Value indexSmemBase = gep(elemPtrTy, smemBase, i32_val(elems));
+  indexSmemBase = bitcast(indexSmemBase, indexPtrTy);
 
   unsigned srcElems = getElemsPerThread(srcTy);
   auto srcIndices = emitIndices(loc, rewriter, srcLayout, srcShape);
@@ -1383,6 +1412,7 @@ LogicalResult ReduceOpConversion::matchAndRewriteBasic(
       emitOffsetForBlockedLayout(srcLayout, srcShape);
 
   std::map<SmallVector<unsigned>, Value> accs;
+  std::map<SmallVector<unsigned>, Value> accIndices;
   std::map<SmallVector<unsigned>, SmallVector<Value>> indices;
 
   // reduce within threads
@@ -1390,7 +1420,13 @@ LogicalResult ReduceOpConversion::matchAndRewriteBasic(
     SmallVector<unsigned> key = offset[i];
     key[axis] = 0;
     bool isFirst = accs.find(key) == accs.end();
-    accumulate(rewriter, loc, op.redOp(), accs[key], srcValues[i], isFirst);
+    if (!withIndex) {
+      accumulate(rewriter, loc, op.redOp(), accs[key], srcValues[i], isFirst);
+    } else {
+      Value curIndex = srcIndices[i][axis];
+      accumulateWithIndex(rewriter, loc, op.redOp(), accs[key], accIndices[key],
+                          srcValues[i], curIndex, isFirst);
+    }
     if (isFirst)
       indices[key] = srcIndices[i];
   }
@@ -1406,25 +1442,45 @@ LogicalResult ReduceOpConversion::matchAndRewriteBasic(
   for (auto it : accs) {
     const SmallVector<unsigned> &key = it.first;
     Value acc = it.second;
+    Value accIndex;
+    if (withIndex)
+      accIndex = accIndices[key];
     SmallVector<Value> writeIdx = indices[key];
 
     writeIdx[axis] = udiv(writeIdx[axis], sizePerThread);
-    Value writeOffset = linearize(rewriter, loc, writeIdx, smemShape);
+    Value writeOffset = linearize(rewriter, loc, writeIdx, smemShape, srcOrd);
     Value writePtr = gep(elemPtrTy, smemBase, writeOffset);
+    Value indexWritePtr = gep(indexPtrTy, indexSmemBase, writeOffset);
     store(acc, writePtr);
+    if (withIndex)
+      store(accIndex, indexWritePtr);
 
     SmallVector<Value> readIdx(writeIdx.size(), ints[0]);
     for (int N = smemShape[axis] / 2; N > 0; N >>= 1) {
       readIdx[axis] = ints[N];
       Value readMask = icmp_slt(writeIdx[axis], ints[N]);
-      Value readOffset = select(
-          readMask, linearize(rewriter, loc, readIdx, smemShape), ints[0]);
+      Value readOffset =
+          select(readMask, linearize(rewriter, loc, readIdx, smemShape, srcOrd),
+                 ints[0]);
       Value readPtr = gep(elemPtrTy, writePtr, readOffset);
       barrier();
-      accumulate(rewriter, loc, op.redOp(), acc, load(readPtr), false);
-      store(acc, writePtr);
+      if (!withIndex) {
+        Value cur = load(readPtr);
+        accumulate(rewriter, loc, op.redOp(), acc, cur, false);
+        store(acc, writePtr);
+      } else {
+        Value cur = load(readPtr);
+        Value indexReadPtr = gep(indexPtrTy, indexWritePtr, readOffset);
+        Value curIndex = load(indexReadPtr);
+        accumulateWithIndex(rewriter, loc, op.redOp(), acc, accIndex, cur,
+                            curIndex, false);
+        store(acc, writePtr);
+        store(accIndex, indexWritePtr);
+      }
     }
   }
+
+  barrier();
 
   // set output values
   if (auto resultTy = op.getType().dyn_cast<RankedTensorType>()) {
@@ -1436,25 +1492,25 @@ LogicalResult ReduceOpConversion::matchAndRewriteBasic(
     auto resultIndices = emitIndices(loc, rewriter, resultLayout, resultShape);
     assert(resultIndices.size() == resultElems);
 
-    barrier();
     SmallVector<Value> resultVals(resultElems);
     for (unsigned i = 0; i < resultElems; ++i) {
       SmallVector<Value> readIdx = resultIndices[i];
       readIdx.insert(readIdx.begin() + axis, ints[0]);
-      Value readOffset = linearize(rewriter, loc, readIdx, smemShape);
+      Value readOffset = linearize(rewriter, loc, readIdx, smemShape, srcOrd);
       Value readPtr = gep(elemPtrTy, smemBase, readOffset);
-      resultVals[i] = load(readPtr);
+      Value indexReadPtr = gep(indexPtrTy, indexSmemBase, readOffset);
+      resultVals[i] = withIndex ? load(indexReadPtr) : load(readPtr);
     }
 
-    SmallVector<Type> resultTypes(resultElems, llvmElemTy);
+    SmallVector<Type> resultTypes(resultElems,
+                                  withIndex ? llvmIndexTy : llvmElemTy);
     Type structTy =
         LLVM::LLVMStructType::getLiteral(this->getContext(), resultTypes);
     Value ret = getStructFromElements(loc, resultVals, rewriter, structTy);
     rewriter.replaceOp(op, ret);
   } else {
     // 0d-tensor -> scalar
-    barrier();
-    Value resultVal = load(smemBase);
+    Value resultVal = withIndex ? load(indexSmemBase) : load(smemBase);
     rewriter.replaceOp(op, resultVal);
   }
 
@@ -1466,41 +1522,57 @@ LogicalResult ReduceOpConversion::matchAndRewriteFast(
     ConversionPatternRewriter &rewriter) const {
   Location loc = op->getLoc();
   unsigned axis = adaptor.axis();
+  bool withIndex = triton::ReduceOp::withIndex(op.redOp());
 
   auto srcTy = op.operand().getType().cast<RankedTensorType>();
-  auto srcLayout = srcTy.getEncoding().cast<BlockedEncodingAttr>();
+  auto srcLayout = srcTy.getEncoding();
   auto srcShape = srcTy.getShape();
+  auto srcRank = srcTy.getRank();
+  auto order = getOrder(srcLayout);
 
-  auto threadsPerWarp = srcLayout.getThreadsPerWarp();
-  auto warpsPerCTA = srcLayout.getWarpsPerCTA();
+  auto threadsPerWarp = triton::gpu::getThreadsPerWarp(srcLayout);
+  auto warpsPerCTA = triton::gpu::getWarpsPerCTA(srcLayout);
 
   auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
+  auto llvmIndexTy = getTypeConverter()->getIndexType();
   auto elemPtrTy = LLVM::LLVMPointerType::get(llvmElemTy, 3);
+  auto indexPtrTy = LLVM::LLVMPointerType::get(llvmIndexTy, 3);
   Value smemBase = getSharedMemoryBase(loc, rewriter, op.getOperation());
   smemBase = bitcast(smemBase, elemPtrTy);
 
-  auto order = srcLayout.getOrder();
-  unsigned sizeIntraWarps = threadsPerWarp[axis];
-  unsigned sizeInterWarps = warpsPerCTA[axis];
+  ReduceOpHelper helper(op);
+  auto smemShapes = helper.getScratchConfigsFast();
+  unsigned elems = product<unsigned>(smemShapes[0]);
+  unsigned maxElems = std::max(elems, product<unsigned>(smemShapes[1]));
+  Value indexSmemBase = gep(elemPtrTy, smemBase, i32_val(maxElems));
+  indexSmemBase = bitcast(indexSmemBase, indexPtrTy);
+
+  unsigned sizeIntraWarps = helper.getIntraWarpSize();
+  unsigned sizeInterWarps = helper.getInterWarpSize();
 
   unsigned srcElems = getElemsPerThread(srcTy);
   auto srcIndices = emitIndices(loc, rewriter, srcLayout, srcShape);
   auto srcValues = getElementsFromStruct(loc, adaptor.operand(), rewriter);
 
   SmallVector<SmallVector<unsigned>> offset =
-      emitOffsetForBlockedLayout(srcLayout, srcShape);
+      emitOffsetForLayout(srcLayout, srcShape);
 
   std::map<SmallVector<unsigned>, Value> accs;
+  std::map<SmallVector<unsigned>, Value> accIndices;
   std::map<SmallVector<unsigned>, SmallVector<Value>> indices;
-
-  auto smemShape = getScratchConfigForReduce(op);
 
   // reduce within threads
   for (unsigned i = 0; i < srcElems; ++i) {
     SmallVector<unsigned> key = offset[i];
     key[axis] = 0;
     bool isFirst = accs.find(key) == accs.end();
-    accumulate(rewriter, loc, op.redOp(), accs[key], srcValues[i], isFirst);
+    if (!withIndex) {
+      accumulate(rewriter, loc, op.redOp(), accs[key], srcValues[i], isFirst);
+    } else {
+      Value curIndex = srcIndices[i][axis];
+      accumulateWithIndex(rewriter, loc, op.redOp(), accs[key], accIndices[key],
+                          srcValues[i], curIndex, isFirst);
+    }
     if (isFirst)
       indices[key] = srcIndices[i];
   }
@@ -1514,6 +1586,7 @@ LogicalResult ReduceOpConversion::matchAndRewriteFast(
       delinearize(rewriter, loc, laneId, threadsPerWarp, order);
   SmallVector<Value> multiDimWarpId =
       delinearize(rewriter, loc, warpId, warpsPerCTA, order);
+
   Value laneIdAxis = multiDimLaneId[axis];
   Value warpIdAxis = multiDimWarpId[axis];
 
@@ -1524,76 +1597,120 @@ LogicalResult ReduceOpConversion::matchAndRewriteFast(
   for (auto it : accs) {
     const SmallVector<unsigned> &key = it.first;
     Value acc = it.second;
+    Value accIndex;
+    if (withIndex)
+      accIndex = accIndices[key];
 
     // reduce within warps
     for (unsigned N = sizeIntraWarps / 2; N > 0; N >>= 1) {
-      Value shfl = shflSync(rewriter, loc, acc, N);
-      accumulate(rewriter, loc, op.redOp(), acc, shfl, false);
+      Value shfl = shflSync(loc, rewriter, acc, N);
+      if (!withIndex) {
+        accumulate(rewriter, loc, op.redOp(), acc, shfl, false);
+      } else {
+        Value shflIndex = shflSync(loc, rewriter, accIndex, N);
+        accumulateWithIndex(rewriter, loc, op.redOp(), acc, accIndex, shfl,
+                            shflIndex, false);
+      }
     }
 
-    if (sizeInterWarps == 1) {
-      SmallVector<Value> writeIdx = indices[key];
-      writeIdx[axis] = zero;
-      Value writeOffset = linearize(rewriter, loc, writeIdx, smemShape);
-      Value writePtr = gep(elemPtrTy, smemBase, writeOffset);
-      storeShared(rewriter, loc, writePtr, acc, laneZero);
-    } else {
-      SmallVector<Value> writeIdx = indices[key];
-      writeIdx[axis] =
-          warpIdAxis; // axis must be the fastest-changing dimension
-      Value writeOffset = linearize(rewriter, loc, writeIdx, smemShape);
-      Value writePtr = gep(elemPtrTy, smemBase, writeOffset);
-      storeShared(rewriter, loc, writePtr, acc, laneZero);
-      barrier();
-
-      SmallVector<Value> readIdx = writeIdx;
-      readIdx[axis] = urem(laneId, i32_val(sizeInterWarps));
-      Value readOffset = linearize(rewriter, loc, readIdx, smemShape);
-      Value readPtr = gep(elemPtrTy, smemBase, readOffset);
-      acc = load(readPtr);
-
-      // reduce across warps
-      for (unsigned N = sizeInterWarps / 2; N > 0; N >>= 1) {
-        Value shfl = shflSync(rewriter, loc, acc, N);
-        accumulate(rewriter, loc, op.redOp(), acc, shfl, false);
-      }
-
-      writeIdx[axis] = zero;
-      writeOffset = linearize(rewriter, loc, writeIdx, smemShape);
-      writePtr = gep(elemPtrTy, smemBase, writeOffset);
-      storeShared(rewriter, loc, writePtr, acc, and_(laneZero, warpZero));
+    SmallVector<Value> writeIdx = indices[key];
+    writeIdx[axis] = (sizeInterWarps == 1) ? zero : warpIdAxis;
+    Value writeOffset =
+        linearize(rewriter, loc, writeIdx, smemShapes[0], order);
+    Value writePtr = gep(elemPtrTy, smemBase, writeOffset);
+    storeShared(rewriter, loc, writePtr, acc, laneZero);
+    if (withIndex) {
+      Value indexWritePtr = gep(indexPtrTy, indexSmemBase, writeOffset);
+      storeShared(rewriter, loc, indexWritePtr, accIndex, laneZero);
     }
   }
+
+  barrier();
+
+  // the second round of shuffle reduction
+  //   now the problem size: sizeInterWarps, s1, s2, .. , sn
+  //   where sizeInterWarps is 2^m
+  //
+  // each thread needs to process:
+  //   elemsPerThread = sizeInterWarps * s1 * s2 .. Sn / numThreads
+  unsigned numThreads =
+      product<unsigned>(triton::gpu::getWarpsPerCTA(srcLayout)) * 32;
+  unsigned elemsPerThread = std::max<unsigned>(elems / numThreads, 1);
+  Value readOffset = threadId;
+  for (unsigned round = 0; round < elemsPerThread; ++round) {
+    Value readPtr = gep(elemPtrTy, smemBase, readOffset);
+    // FIXME(Qingyi): need predicate icmp_slt(threadId, i32_val(sizeInerWarps))
+    Value acc = load(readPtr);
+    Value accIndex;
+    if (withIndex) {
+      Value readIndexPtr = gep(indexPtrTy, indexSmemBase, readOffset);
+      accIndex = load(readIndexPtr);
+    }
+
+    for (unsigned N = sizeInterWarps / 2; N > 0; N >>= 1) {
+      Value shfl = shflSync(loc, rewriter, acc, N);
+      if (!withIndex) {
+        accumulate(rewriter, loc, op.redOp(), acc, shfl, false);
+      } else {
+        Value shflIndex = shflSync(loc, rewriter, accIndex, N);
+        accumulateWithIndex(rewriter, loc, op.redOp(), acc, accIndex, shfl,
+                            shflIndex, false);
+      }
+    }
+
+    // only the first thread in each sizeInterWarps is writing
+    Value writeOffset = readOffset;
+    Value writePtr = gep(elemPtrTy, smemBase, writeOffset);
+    Value threadIsNeeded = icmp_slt(threadId, i32_val(elems));
+    Value laneIdModSizeInterWarps = urem(laneId, i32_val(sizeInterWarps));
+    Value laneIdModSizeInterWarpsIsZero =
+        icmp_eq(laneIdModSizeInterWarps, zero);
+    Value pred = and_(threadIsNeeded, laneIdModSizeInterWarpsIsZero);
+    storeShared(rewriter, loc, writePtr, acc, pred);
+    if (withIndex) {
+      Value writeIndexPtr = gep(indexPtrTy, indexSmemBase, writeOffset);
+      storeShared(rewriter, loc, writeIndexPtr, accIndex, pred);
+    }
+
+    if (round != elemsPerThread - 1) {
+      readOffset = add(readOffset, i32_val(numThreads));
+    }
+  }
+
+  // We could avoid this barrier in some of the layouts, however this is not
+  // the general case. TODO: optimize the barrier incase the layouts are
+  // accepted.
+  barrier();
 
   // set output values
   if (auto resultTy = op.getType().dyn_cast<RankedTensorType>()) {
     // nd-tensor where n >= 1
     auto resultLayout = resultTy.getEncoding().cast<SliceEncodingAttr>();
     auto resultShape = resultTy.getShape();
-
     unsigned resultElems = getElemsPerThread(resultTy);
     auto resultIndices = emitIndices(loc, rewriter, resultLayout, resultShape);
     assert(resultIndices.size() == resultElems);
 
-    barrier();
     SmallVector<Value> resultVals(resultElems);
     for (size_t i = 0; i < resultElems; ++i) {
       SmallVector<Value> readIdx = resultIndices[i];
       readIdx.insert(readIdx.begin() + axis, i32_val(0));
-      Value readOffset = linearize(rewriter, loc, readIdx, smemShape);
+      Value readOffset =
+          linearize(rewriter, loc, readIdx, smemShapes[0], order);
       Value readPtr = gep(elemPtrTy, smemBase, readOffset);
-      resultVals[i] = load(readPtr);
+      Value indexReadPtr = gep(indexPtrTy, indexSmemBase, readOffset);
+      resultVals[i] = withIndex ? load(indexReadPtr) : load(readPtr);
     }
 
-    SmallVector<Type> resultTypes(resultElems, llvmElemTy);
+    SmallVector<Type> resultTypes(resultElems,
+                                  withIndex ? llvmIndexTy : llvmElemTy);
     Type structTy =
         LLVM::LLVMStructType::getLiteral(this->getContext(), resultTypes);
     Value ret = getStructFromElements(loc, resultVals, rewriter, structTy);
     rewriter.replaceOp(op, ret);
   } else {
     // 0d-tensor -> scalar
-    barrier();
-    Value resultVal = load(smemBase);
+    Value resultVal = withIndex ? load(indexSmemBase) : load(smemBase);
     rewriter.replaceOp(op, resultVal);
   }
 
@@ -1601,6 +1718,43 @@ LogicalResult ReduceOpConversion::matchAndRewriteFast(
 }
 
 /// ====================== reduce codegen end ==========================
+
+/// ====================== cat codegen begin  ==========================
+
+struct CatOpConversion : public ConvertTritonGPUOpToLLVMPattern<CatOp> {
+  using OpAdaptor = typename CatOp::Adaptor;
+
+  explicit CatOpConversion(LLVMTypeConverter &typeConverter,
+                           PatternBenefit benefit = 1)
+      : ConvertTritonGPUOpToLLVMPattern<CatOp>(typeConverter, benefit) {}
+
+  LogicalResult
+  matchAndRewrite(CatOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    auto resultTy = op.getType().template cast<RankedTensorType>();
+    unsigned elems = getElemsPerThread(resultTy);
+    Type elemTy =
+        this->getTypeConverter()->convertType(resultTy.getElementType());
+    SmallVector<Type> types(elems, elemTy);
+    // unpack input values
+    auto lhsVals = getElementsFromStruct(loc, adaptor.lhs(), rewriter);
+    auto rhsVals = getElementsFromStruct(loc, adaptor.rhs(), rewriter);
+    // concatenate (and potentially reorder) values
+    SmallVector<Value> retVals;
+    for (Value v : lhsVals)
+      retVals.push_back(v);
+    for (Value v : rhsVals)
+      retVals.push_back(v);
+    // pack and replace
+    Type structTy = LLVM::LLVMStructType::getLiteral(this->getContext(), types);
+    Value ret = getStructFromElements(loc, retVals, rewriter, structTy);
+    rewriter.replaceOp(op, ret);
+    return success();
+  }
+};
+
+/// ====================== cat codegen end    ==========================
 
 template <typename SourceOp>
 struct ViewLikeOpConversion : public ConvertTritonGPUOpToLLVMPattern<SourceOp> {
@@ -1612,8 +1766,8 @@ struct ViewLikeOpConversion : public ConvertTritonGPUOpToLLVMPattern<SourceOp> {
   LogicalResult
   matchAndRewrite(SourceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // We cannot directly
-    //   rewriter.replaceOp(op, adaptor.src());
+    // We cannot directly run
+    //   `rewriter.replaceOp(op, adaptor.src())`
     // due to MLIR's restrictions
     Location loc = op->getLoc();
     auto resultTy = op.getType().template cast<RankedTensorType>();
@@ -1622,10 +1776,192 @@ struct ViewLikeOpConversion : public ConvertTritonGPUOpToLLVMPattern<SourceOp> {
         this->getTypeConverter()->convertType(resultTy.getElementType());
     SmallVector<Type> types(elems, elemTy);
     Type structTy = LLVM::LLVMStructType::getLiteral(this->getContext(), types);
-    auto vals = this->getElementsFromStruct(loc, adaptor.src(), rewriter);
+    auto vals = getElementsFromStruct(loc, adaptor.src(), rewriter);
     Value view = getStructFromElements(loc, vals, rewriter, structTy);
     rewriter.replaceOp(op, view);
     return success();
+  }
+};
+
+struct PrintfOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<triton::PrintfOp> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::PrintfOp>::ConvertTritonGPUOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::PrintfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op->getLoc();
+    SmallVector<Value, 16> operands;
+    for (auto operand : adaptor.getOperands()) {
+      auto sub_operands = getElementsFromStruct(loc, operand, rewriter);
+      for (auto elem : sub_operands) {
+        operands.push_back(elem);
+      }
+    }
+    std::string formatStr;
+    llvm::raw_string_ostream os(formatStr);
+    os << op.prefix();
+    if (!operands.empty()) {
+      os << getFormatSubstr(operands[0]);
+    }
+
+    for (size_t i = 1; i < operands.size(); ++i) {
+      os << ", " << getFormatSubstr(operands[i]);
+    }
+    llPrintf(formatStr, operands, rewriter);
+    rewriter.eraseOp(op);
+    return success();
+  }
+  // get format specific for each input value
+  // currently support pointer, i8, i16, i32, i64, f16, bf16, f32, f64
+  std::string getFormatSubstr(Value value) const {
+    Type type = value.getType();
+    if (type.isa<LLVM::LLVMPointerType>()) {
+      return "%p";
+    } else if (type.isBF16() || type.isF16() || type.isF32() || type.isF64()) {
+      return "%f";
+    } else if (type.isSignedInteger()) {
+      return "%i";
+    } else if (type.isUnsignedInteger() || type.isSignlessInteger()) {
+      return "%u";
+    }
+    assert(false && "not supported type");
+    return "";
+  }
+
+  // declare vprintf(i8*, i8*) as external function
+  static LLVM::LLVMFuncOp
+  getVprintfDeclaration(ConversionPatternRewriter &rewriter) {
+    auto moduleOp =
+        rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
+    StringRef funcName("vprintf");
+    Operation *funcOp = moduleOp.lookupSymbol(funcName);
+    if (funcOp)
+      return cast<LLVM::LLVMFuncOp>(*funcOp);
+
+    auto *context = rewriter.getContext();
+
+    SmallVector<Type> argsType{ptr_ty(IntegerType::get(context, 8)),
+                               ptr_ty(IntegerType::get(context, 8))};
+    auto funcType = LLVM::LLVMFunctionType::get(i32_ty, argsType);
+
+    ConversionPatternRewriter::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(moduleOp.getBody());
+
+    return rewriter.create<LLVM::LLVMFuncOp>(UnknownLoc::get(context), funcName,
+                                             funcType);
+  }
+
+  // extend integer to int32, extend float to float64
+  // this comes from vprintf alignment requirements.
+  static std::pair<Type, Value>
+  promoteValue(ConversionPatternRewriter &rewriter, Value value) {
+    auto *context = rewriter.getContext();
+    auto type = value.getType();
+    Value newOp = value;
+    Type newType = type;
+
+    bool bUnsigned = type.isUnsignedInteger();
+    if (type.isIntOrIndex() && type.getIntOrFloatBitWidth() < 32) {
+      if (bUnsigned) {
+        newType = ui32_ty;
+        newOp = rewriter.create<LLVM::ZExtOp>(UnknownLoc::get(context), newType,
+                                              value);
+      } else {
+        newType = i32_ty;
+        newOp = rewriter.create<LLVM::SExtOp>(UnknownLoc::get(context), newType,
+                                              value);
+      }
+    } else if (type.isBF16() || type.isF16() || type.isF32()) {
+      newType = f64_ty;
+      newOp = rewriter.create<LLVM::FPExtOp>(UnknownLoc::get(context), newType,
+                                             value);
+    }
+
+    return {newType, newOp};
+  }
+
+  static void llPrintf(StringRef msg, ValueRange args,
+                       ConversionPatternRewriter &rewriter) {
+    static const char formatStringPrefix[] = "printfFormat_";
+    assert(!msg.empty() && "printf with empty string not support");
+    Type int8Ptr = ptr_ty(i8_ty);
+
+    auto *context = rewriter.getContext();
+    auto moduleOp =
+        rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
+    auto funcOp = getVprintfDeclaration(rewriter);
+
+    Value one = rewriter.create<LLVM::ConstantOp>(
+        UnknownLoc::get(context), i32_ty, rewriter.getI32IntegerAttr(1));
+    Value zero = rewriter.create<LLVM::ConstantOp>(
+        UnknownLoc::get(context), i32_ty, rewriter.getI32IntegerAttr(0));
+
+    unsigned stringNumber = 0;
+    SmallString<16> stringConstName;
+    do {
+      stringConstName.clear();
+      (formatStringPrefix + Twine(stringNumber++)).toStringRef(stringConstName);
+    } while (moduleOp.lookupSymbol(stringConstName));
+
+    llvm::SmallString<64> formatString(msg);
+    formatString.push_back('\n');
+    formatString.push_back('\0');
+    size_t formatStringSize = formatString.size_in_bytes();
+    auto globalType = LLVM::LLVMArrayType::get(i8_ty, formatStringSize);
+
+    LLVM::GlobalOp global;
+    {
+      ConversionPatternRewriter::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(moduleOp.getBody());
+      global = rewriter.create<LLVM::GlobalOp>(
+          UnknownLoc::get(context), globalType,
+          /*isConstant=*/true, LLVM::Linkage::Internal, stringConstName,
+          rewriter.getStringAttr(formatString));
+    }
+
+    Value globalPtr =
+        rewriter.create<LLVM::AddressOfOp>(UnknownLoc::get(context), global);
+    Value stringStart = rewriter.create<LLVM::GEPOp>(
+        UnknownLoc::get(context), int8Ptr, globalPtr,
+        SmallVector<Value>({zero, zero}));
+
+    Value bufferPtr =
+        rewriter.create<LLVM::NullOp>(UnknownLoc::get(context), int8Ptr);
+
+    SmallVector<Value, 16> newArgs;
+    if (args.size() >= 1) {
+      SmallVector<Type> argTypes;
+      for (auto arg : args) {
+        Type newType;
+        Value newArg;
+        std::tie(newType, newArg) = promoteValue(rewriter, arg);
+        argTypes.push_back(newType);
+        newArgs.push_back(newArg);
+      }
+
+      Type structTy = LLVM::LLVMStructType::getLiteral(context, argTypes);
+      auto allocated = rewriter.create<LLVM::AllocaOp>(UnknownLoc::get(context),
+                                                       ptr_ty(structTy), one,
+                                                       /*alignment=*/0);
+
+      for (const auto &entry : llvm::enumerate(newArgs)) {
+        auto index = rewriter.create<LLVM::ConstantOp>(
+            UnknownLoc::get(context), i32_ty,
+            rewriter.getI32IntegerAttr(entry.index()));
+        auto fieldPtr = rewriter.create<LLVM::GEPOp>(
+            UnknownLoc::get(context), ptr_ty(argTypes[entry.index()]),
+            allocated, ArrayRef<Value>{zero, index});
+        rewriter.create<LLVM::StoreOp>(UnknownLoc::get(context), entry.value(),
+                                       fieldPtr);
+      }
+      bufferPtr = rewriter.create<LLVM::BitcastOp>(UnknownLoc::get(context),
+                                                   int8Ptr, allocated);
+    }
+
+    SmallVector<Value> operands{stringStart, bufferPtr};
+    rewriter.create<LLVM::CallOp>(UnknownLoc::get(context), funcOp, operands);
   }
 };
 
@@ -1650,7 +1986,10 @@ struct MakeRangeOpConversion
     auto idxs = emitIndices(loc, rewriter, layout, shape);
     unsigned elems = idxs.size();
     SmallVector<Value> retVals(elems);
-    for (auto multiDim : llvm::enumerate(idxs)) {
+    // TODO: slice layout has more elements than expected.
+    // Unexpected behavior for make range, but genereally ok when followed by
+    // expand dims + broadcast. very weird behavior otherwise potentially.
+    for (const auto multiDim : llvm::enumerate(idxs)) {
       assert(multiDim.value().size() == 1);
       retVals[multiDim.index()] = add(multiDim.value()[0], start);
     }
@@ -1671,13 +2010,43 @@ struct GetProgramIdOpConversion
   matchAndRewrite(triton::GetProgramIdOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
+    assert(op.axis() < 3);
+
     Value blockId = rewriter.create<::mlir::gpu::BlockIdOp>(
-        loc, rewriter.getIndexType(), ::mlir::gpu::Dimension::x);
+        loc, rewriter.getIndexType(), dims[op.axis()]);
     auto llvmIndexTy = getTypeConverter()->getIndexType();
     rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(
         op, TypeRange{llvmIndexTy}, ValueRange{blockId});
     return success();
   }
+
+  static constexpr mlir::gpu::Dimension dims[] = {mlir::gpu::Dimension::x,
+                                                  mlir::gpu::Dimension::y,
+                                                  mlir::gpu::Dimension::z};
+};
+
+struct GetNumProgramsOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<triton::GetNumProgramsOp> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::GetNumProgramsOp>::ConvertTritonGPUOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::GetNumProgramsOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    assert(op.axis() < 3);
+
+    Value blockId = rewriter.create<::mlir::gpu::GridDimOp>(
+        loc, rewriter.getIndexType(), dims[op.axis()]);
+    auto llvmIndexTy = getTypeConverter()->getIndexType();
+    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(
+        op, TypeRange{llvmIndexTy}, ValueRange{blockId});
+    return success();
+  }
+
+  static constexpr mlir::gpu::Dimension dims[] = {mlir::gpu::Dimension::x,
+                                                  mlir::gpu::Dimension::y,
+                                                  mlir::gpu::Dimension::z};
 };
 
 struct AddPtrOpConversion
@@ -1692,9 +2061,6 @@ struct AddPtrOpConversion
     auto resultTy = op.getType();
     auto resultTensorTy = resultTy.dyn_cast<RankedTensorType>();
     if (resultTensorTy) {
-      auto resultLayout =
-          resultTensorTy.getEncoding().dyn_cast<BlockedEncodingAttr>();
-      assert(resultLayout && "Unexpected resultLayout in AddPtrOpConversion");
       unsigned elems = getElemsPerThread(resultTy);
       Type elemTy =
           getTypeConverter()->convertType(resultTensorTy.getElementType());
@@ -1731,52 +2097,402 @@ struct AllocTensorOpConversion
     auto resultTy = op.getType().dyn_cast<RankedTensorType>();
     auto llvmElemTy =
         getTypeConverter()->convertType(resultTy.getElementType());
-    auto elemPtrTy = LLVM::LLVMPointerType::get(llvmElemTy, 3);
-    Value resultVal =
-        rewriter.create<LLVM::BitcastOp>(loc, elemPtrTy, smemBase);
-    rewriter.replaceOp(op, resultVal);
+    auto elemPtrTy = ptr_ty(llvmElemTy, 3);
+    smemBase = bitcast(smemBase, elemPtrTy);
+    auto order = resultTy.getEncoding().cast<SharedEncodingAttr>().getOrder();
+    // workaround for 3D tensors
+    // TODO: We need to modify the pipeline pass to give a proper shared
+    // encoding to 3D tensors
+    SmallVector<unsigned> newOrder;
+    if (resultTy.getShape().size() == 3)
+      newOrder = {1 + order[0], 1 + order[1], 0};
+    else
+      newOrder = SmallVector<unsigned>(order.begin(), order.end());
+
+    auto smemObj = SharedMemoryObject(smemBase, resultTy.getShape(), newOrder,
+                                      loc, rewriter);
+    auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
+    rewriter.replaceOp(op, retVal);
     return success();
   }
 };
 
 struct ExtractSliceOpConversion
-    : public ConvertTritonGPUOpToLLVMPattern<triton::gpu::ExtractSliceOp> {
+    : public ConvertTritonGPUOpToLLVMPattern<tensor::ExtractSliceOp> {
   using ConvertTritonGPUOpToLLVMPattern<
-      triton::gpu::ExtractSliceOp>::ConvertTritonGPUOpToLLVMPattern;
+      tensor::ExtractSliceOp>::ConvertTritonGPUOpToLLVMPattern;
 
   LogicalResult
-  matchAndRewrite(triton::gpu::ExtractSliceOp op, OpAdaptor adaptor,
+  matchAndRewrite(tensor::ExtractSliceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // %dst = extract_slice %src[%offsets]
     Location loc = op->getLoc();
-    auto srcTy = op.src().getType().dyn_cast<RankedTensorType>();
+    auto srcTy = op.source().getType().dyn_cast<RankedTensorType>();
     auto srcLayout = srcTy.getEncoding().dyn_cast<SharedEncodingAttr>();
     assert(srcLayout && "Unexpected resultLayout in ExtractSliceOpConversion");
+    assert(op.hasUnitStride() &&
+           "Only unit stride supported by ExtractSliceOpConversion");
 
-    // axis > 0 will result in non-contiguous memory access if the result
-    // tensor is an alias of the source tensor.
-    auto axis = op->getAttrOfType<IntegerAttr>("axis").getInt();
-    assert(axis == 0 && "extract_slice: Only axis=0 is supported for now");
+    // newBase = base + offset
+    // Triton support either static and dynamic offsets
+    auto smemObj =
+        getSharedMemoryObjectFromStruct(loc, adaptor.source(), rewriter);
+    SmallVector<Value, 4> opOffsetVals;
+    SmallVector<Value, 4> offsetVals;
+    auto mixedOffsets = op.getMixedOffsets();
+    for (auto i = 0; i < mixedOffsets.size(); ++i) {
+      if (op.isDynamicOffset(i))
+        opOffsetVals.emplace_back(adaptor.offsets()[i]);
+      else
+        opOffsetVals.emplace_back(i32_val(op.getStaticOffset(i)));
+      offsetVals.emplace_back(add(smemObj.offsets[i], opOffsetVals[i]));
+    }
+    // Compute the offset based on the original strides of the shared memory
+    // object
+    auto offset = dot(rewriter, loc, opOffsetVals, smemObj.strides);
+    // newShape = rank_reduce(shape)
+    // Triton only supports static tensor sizes
+    SmallVector<Value, 4> strideVals;
+    for (auto i = 0; i < op.static_sizes().size(); ++i) {
+      if (op.getStaticSize(i) == 1) {
+        offsetVals.erase(offsetVals.begin() + i);
+      } else {
+        strideVals.emplace_back(smemObj.strides[i]);
+      }
+    }
 
-    // Example:
-    // %dst = extract_slice %src, %index {axis = 0}
-    // src.shape = [11, 2, 3, 4, 1]
-    // offset = %index * 2 * 3 * 4 * 1
-    auto dstTy = op.getType().dyn_cast<RankedTensorType>();
-    auto base = product<int64_t>(dstTy.getShape());
-    auto baseVal = createIndexAttrConstant(
-        rewriter, loc, getTypeConverter()->getIndexType(), base);
-    Value offset = mul(adaptor.index(), baseVal);
+    // llvm::outs() << "extract slice\n";
+    // llvm::outs() << strideVals[0] << " " << smemObj.strides[1] << "\n";
+    // llvm::outs() << strideVals[1] << " " << smemObj.strides[2] << "\n";
+    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
+    auto elemPtrTy = ptr_ty(llvmElemTy, 3);
+    auto resTy = op.getType().dyn_cast<RankedTensorType>();
+    smemObj = SharedMemoryObject(gep(elemPtrTy, smemObj.base, offset),
+                                 strideVals, offsetVals);
+    auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
+    rewriter.replaceOp(op, retVal);
+    return success();
+  }
+};
 
-    auto llvmElemTy = getTypeConverter()->convertType(dstTy.getElementType());
-    auto elemPtrTy = LLVM::LLVMPointerType::get(llvmElemTy, 3);
-    Value resultVal = gep(elemPtrTy, adaptor.src(), offset);
-    rewriter.replaceOp(op, resultVal);
+struct FpToFpOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<triton::FpToFpOp> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::FpToFpOp>::ConvertTritonGPUOpToLLVMPattern;
+
+  static SmallVector<Value>
+  convertFp8x4ToFp16x4(Location loc, ConversionPatternRewriter &rewriter,
+                       const Value &v0, const Value &v1, const Value &v2,
+                       const Value &v3) {
+    auto ctx = rewriter.getContext();
+    auto fp8x4VecTy = vec_ty(i8_ty, 4);
+    Value fp8x4Vec = undef(fp8x4VecTy);
+    fp8x4Vec = insert_element(fp8x4VecTy, fp8x4Vec, v0, i32_val(0));
+    fp8x4Vec = insert_element(fp8x4VecTy, fp8x4Vec, v1, i32_val(1));
+    fp8x4Vec = insert_element(fp8x4VecTy, fp8x4Vec, v2, i32_val(2));
+    fp8x4Vec = insert_element(fp8x4VecTy, fp8x4Vec, v3, i32_val(3));
+    fp8x4Vec = bitcast(fp8x4Vec, i32_ty);
+
+    PTXBuilder builder;
+    auto *ptxAsm = "{                                      \n"
+                   ".reg .b32 a<2>, b<2>;                  \n"
+                   "prmt.b32 a0, 0, $2, 0x5040;            \n"
+                   "prmt.b32 a1, 0, $2, 0x7060;            \n"
+                   "lop3.b32 b0, a0, 0x7fff7fff, 0, 0xc0;  \n"
+                   "lop3.b32 b1, a1, 0x7fff7fff, 0, 0xc0;  \n"
+                   "shr.b32  b0, b0, 1;                    \n"
+                   "shr.b32  b1, b1, 1;                    \n"
+                   "lop3.b32 $0, b0, 0x80008000, a0, 0xf8; \n"
+                   "lop3.b32 $1, b1, 0x80008000, a1, 0xf8; \n"
+                   "}";
+    auto &call = *builder.create(ptxAsm);
+
+    auto *o0 = builder.newOperand("=r");
+    auto *o1 = builder.newOperand("=r");
+    auto *i = builder.newOperand(fp8x4Vec, "r");
+    call({o0, o1, i}, /* onlyAttachMLIRArgs */ true);
+
+    auto fp16x2VecTy = vec_ty(f16_ty, 2);
+    auto fp16x2x2StructTy =
+        struct_ty(SmallVector<Type>{fp16x2VecTy, fp16x2VecTy});
+    auto fp16x2x2Struct =
+        builder.launch(rewriter, loc, fp16x2x2StructTy, false);
+    auto fp16x2Vec0 =
+        extract_val(fp16x2VecTy, fp16x2x2Struct, rewriter.getI32ArrayAttr({0}));
+    auto fp16x2Vec1 =
+        extract_val(fp16x2VecTy, fp16x2x2Struct, rewriter.getI32ArrayAttr({1}));
+    return {extract_element(f16_ty, fp16x2Vec0, i32_val(0)),
+            extract_element(f16_ty, fp16x2Vec0, i32_val(1)),
+            extract_element(f16_ty, fp16x2Vec1, i32_val(0)),
+            extract_element(f16_ty, fp16x2Vec1, i32_val(1))};
+  }
+
+  static SmallVector<Value>
+  convertFp16x4ToFp8x4(Location loc, ConversionPatternRewriter &rewriter,
+                       const Value &v0, const Value &v1, const Value &v2,
+                       const Value &v3) {
+    auto ctx = rewriter.getContext();
+    auto fp16x2VecTy = vec_ty(f16_ty, 2);
+    Value fp16x2Vec0 = undef(fp16x2VecTy);
+    Value fp16x2Vec1 = undef(fp16x2VecTy);
+    fp16x2Vec0 = insert_element(fp16x2VecTy, fp16x2Vec0, v0, i32_val(0));
+    fp16x2Vec0 = insert_element(fp16x2VecTy, fp16x2Vec0, v1, i32_val(1));
+    fp16x2Vec1 = insert_element(fp16x2VecTy, fp16x2Vec1, v2, i32_val(0));
+    fp16x2Vec1 = insert_element(fp16x2VecTy, fp16x2Vec1, v3, i32_val(1));
+    fp16x2Vec0 = bitcast(fp16x2Vec0, i32_ty);
+    fp16x2Vec1 = bitcast(fp16x2Vec1, i32_ty);
+
+    PTXBuilder builder;
+    auto *ptxAsm = "{                                      \n"
+                   ".reg .b32 a<2>, b<2>;                  \n"
+                   "shl.b32 a0, $1, 1;                     \n"
+                   "shl.b32 a1, $2, 1;                     \n"
+                   "lop3.b32 a0, a0, 0x7fff7fff, 0, 0xc0;  \n"
+                   "lop3.b32 a1, a1, 0x7fff7fff, 0, 0xc0;  \n"
+                   "add.u32 a0, a0, 0x00800080;            \n"
+                   "add.u32 a1, a1, 0x00800080;            \n"
+                   "lop3.b32 b0, $1, 0x80008000, a0, 0xea; \n"
+                   "lop3.b32 b1, $2, 0x80008000, a1, 0xea; \n"
+                   "prmt.b32 $0, b0, b1, 0x7531;           \n"
+                   "}";
+    auto &call = *builder.create(ptxAsm);
+
+    auto *o = builder.newOperand("=r");
+    auto *i0 = builder.newOperand(fp16x2Vec0, "r");
+    auto *i1 = builder.newOperand(fp16x2Vec1, "r");
+    call({o, i0, i1}, /* onlyAttachMLIRArgs */ true);
+
+    auto fp8x4VecTy = vec_ty(i8_ty, 4);
+    auto fp8x4Vec = builder.launch(rewriter, loc, fp8x4VecTy, false);
+    return {extract_element(i8_ty, fp8x4Vec, i32_val(0)),
+            extract_element(i8_ty, fp8x4Vec, i32_val(1)),
+            extract_element(i8_ty, fp8x4Vec, i32_val(2)),
+            extract_element(i8_ty, fp8x4Vec, i32_val(3))};
+  }
+
+  static SmallVector<Value>
+  convertFp8x4ToBf16x4(Location loc, ConversionPatternRewriter &rewriter,
+                       const Value &v0, const Value &v1, const Value &v2,
+                       const Value &v3) {
+    auto ctx = rewriter.getContext();
+    auto fp8x4VecTy = vec_ty(i8_ty, 4);
+    Value fp8x4Vec = undef(fp8x4VecTy);
+    fp8x4Vec = insert_element(fp8x4VecTy, fp8x4Vec, v0, i32_val(0));
+    fp8x4Vec = insert_element(fp8x4VecTy, fp8x4Vec, v1, i32_val(1));
+    fp8x4Vec = insert_element(fp8x4VecTy, fp8x4Vec, v2, i32_val(2));
+    fp8x4Vec = insert_element(fp8x4VecTy, fp8x4Vec, v3, i32_val(3));
+    fp8x4Vec = bitcast(fp8x4Vec, i32_ty);
+
+    PTXBuilder builder;
+    auto *ptxAsm = "{                                          \n"
+                   ".reg .b32 a<2>, sign<2>, nosign<2>, b<2>;  \n"
+                   "prmt.b32 a0, 0, $2, 0x5040;                \n"
+                   "prmt.b32 a1, 0, $2, 0x7060;                \n"
+                   "and.b32 sign0, a0, 0x80008000;             \n"
+                   "and.b32 sign1, a1, 0x80008000;             \n"
+                   "and.b32 nosign0, a0, 0x7fff7fff;           \n"
+                   "and.b32 nosign1, a1, 0x7fff7fff;           \n"
+                   "shr.b32 nosign0, nosign0, 4;               \n"
+                   "shr.b32 nosign1, nosign1, 4;               \n"
+                   "add.u32 nosign0, nosign0, 0x38003800;      \n"
+                   "add.u32 nosign1, nosign1, 0x38003800;      \n"
+                   "or.b32 $0, sign0, nosign0;                 \n"
+                   "or.b32 $1, sign1, nosign1;                 \n"
+                   "}";
+    auto &call = *builder.create(ptxAsm);
+
+    auto *o0 = builder.newOperand("=r");
+    auto *o1 = builder.newOperand("=r");
+    auto *i = builder.newOperand(fp8x4Vec, "r");
+    call({o0, o1, i}, /* onlyAttachMLIRArgs */ true);
+
+    auto bf16x2VecTy = vec_ty(bf16_ty, 2);
+    auto bf16x2x2StructTy =
+        struct_ty(SmallVector<Type>{bf16x2VecTy, bf16x2VecTy});
+    auto bf16x2x2Struct =
+        builder.launch(rewriter, loc, bf16x2x2StructTy, false);
+    auto bf16x2Vec0 =
+        extract_val(bf16x2VecTy, bf16x2x2Struct, rewriter.getI32ArrayAttr({0}));
+    auto bf16x2Vec1 =
+        extract_val(bf16x2VecTy, bf16x2x2Struct, rewriter.getI32ArrayAttr({1}));
+    return {extract_element(bf16_ty, bf16x2Vec0, i32_val(0)),
+            extract_element(bf16_ty, bf16x2Vec0, i32_val(1)),
+            extract_element(bf16_ty, bf16x2Vec1, i32_val(0)),
+            extract_element(bf16_ty, bf16x2Vec1, i32_val(1))};
+  }
+
+  static SmallVector<Value>
+  convertBf16x4ToFp8x4(Location loc, ConversionPatternRewriter &rewriter,
+                       const Value &v0, const Value &v1, const Value &v2,
+                       const Value &v3) {
+    auto ctx = rewriter.getContext();
+    auto bf16x2VecTy = vec_ty(bf16_ty, 2);
+    Value bf16x2Vec0 = undef(bf16x2VecTy);
+    Value bf16x2Vec1 = undef(bf16x2VecTy);
+    bf16x2Vec0 = insert_element(bf16x2VecTy, bf16x2Vec0, v0, i32_val(0));
+    bf16x2Vec0 = insert_element(bf16x2VecTy, bf16x2Vec0, v1, i32_val(1));
+    bf16x2Vec1 = insert_element(bf16x2VecTy, bf16x2Vec1, v2, i32_val(0));
+    bf16x2Vec1 = insert_element(bf16x2VecTy, bf16x2Vec1, v3, i32_val(1));
+    bf16x2Vec0 = bitcast(bf16x2Vec0, i32_ty);
+    bf16x2Vec1 = bitcast(bf16x2Vec1, i32_ty);
+
+    PTXBuilder builder;
+    auto *ptxAsm = "{                                            \n"
+                   ".reg .u32 sign, sign<2>, nosign, nosign<2>;  \n"
+                   ".reg .u32 fp8_min, fp8_max, rn_, zero;       \n"
+                   "mov.u32 fp8_min, 0x38003800;                 \n"
+                   "mov.u32 fp8_max, 0x3ff03ff0;                 \n"
+                   "mov.u32 rn_, 0x80008;                        \n"
+                   "mov.u32 zero, 0;                             \n"
+                   "and.b32 sign0, $1, 0x80008000;               \n"
+                   "and.b32 sign1, $2, 0x80008000;               \n"
+                   "prmt.b32 sign, sign0, sign1, 0x7531;         \n"
+                   "and.b32 nosign0, $1, 0x7fff7fff;             \n"
+                   "and.b32 nosign1, $2, 0x7fff7fff;             \n"
+                   ".reg .u32 nosign_0_<2>, nosign_1_<2>;        \n"
+                   "and.b32 nosign_0_0, nosign0, 0xffff0000;     \n"
+                   "max.u32 nosign_0_0, nosign_0_0, 0x38000000;  \n"
+                   "min.u32 nosign_0_0, nosign_0_0, 0x3ff00000;  \n"
+                   "and.b32 nosign_0_1, nosign0, 0x0000ffff;     \n"
+                   "max.u32 nosign_0_1, nosign_0_1, 0x3800;      \n"
+                   "min.u32 nosign_0_1, nosign_0_1, 0x3ff0;      \n"
+                   "or.b32 nosign0, nosign_0_0, nosign_0_1;      \n"
+                   "and.b32 nosign_1_0, nosign1, 0xffff0000;     \n"
+                   "max.u32 nosign_1_0, nosign_1_0, 0x38000000;  \n"
+                   "min.u32 nosign_1_0, nosign_1_0, 0x3ff00000;  \n"
+                   "and.b32 nosign_1_1, nosign1, 0x0000ffff;     \n"
+                   "max.u32 nosign_1_1, nosign_1_1, 0x3800;      \n"
+                   "min.u32 nosign_1_1, nosign_1_1, 0x3ff0;      \n"
+                   "or.b32 nosign1, nosign_1_0, nosign_1_1;      \n"
+                   "add.u32 nosign0, nosign0, rn_;               \n"
+                   "add.u32 nosign1, nosign1, rn_;               \n"
+                   "sub.u32 nosign0, nosign0, 0x38003800;        \n"
+                   "sub.u32 nosign1, nosign1, 0x38003800;        \n"
+                   "shr.u32 nosign0, nosign0, 4;                 \n"
+                   "shr.u32 nosign1, nosign1, 4;                 \n"
+                   "prmt.b32 nosign, nosign0, nosign1, 0x6420;   \n"
+                   "or.b32 $0, nosign, sign;                     \n"
+                   "}";
+    auto &call = *builder.create(ptxAsm);
+
+    auto *o = builder.newOperand("=r");
+    auto *i0 = builder.newOperand(bf16x2Vec0, "r");
+    auto *i1 = builder.newOperand(bf16x2Vec1, "r");
+    call({o, i0, i1}, /* onlyAttachMLIRArgs */ true);
+
+    auto fp8x4VecTy = vec_ty(i8_ty, 4);
+    auto fp8x4Vec = builder.launch(rewriter, loc, fp8x4VecTy, false);
+    return {extract_element(i8_ty, fp8x4Vec, i32_val(0)),
+            extract_element(i8_ty, fp8x4Vec, i32_val(1)),
+            extract_element(i8_ty, fp8x4Vec, i32_val(2)),
+            extract_element(i8_ty, fp8x4Vec, i32_val(3))};
+  }
+
+  static SmallVector<Value>
+  convertFp8x4ToFp32x4(Location loc, ConversionPatternRewriter &rewriter,
+                       const Value &v0, const Value &v1, const Value &v2,
+                       const Value &v3) {
+    auto fp16Values = convertFp8x4ToFp16x4(loc, rewriter, v0, v1, v2, v3);
+    return {rewriter.create<LLVM::FPExtOp>(loc, f32_ty, fp16Values[0]),
+            rewriter.create<LLVM::FPExtOp>(loc, f32_ty, fp16Values[1]),
+            rewriter.create<LLVM::FPExtOp>(loc, f32_ty, fp16Values[2]),
+            rewriter.create<LLVM::FPExtOp>(loc, f32_ty, fp16Values[3])};
+  }
+
+  static SmallVector<Value>
+  convertFp32x4ToFp8x4(Location loc, ConversionPatternRewriter &rewriter,
+                       const Value &v0, const Value &v1, const Value &v2,
+                       const Value &v3) {
+    auto c0 = rewriter.create<LLVM::FPTruncOp>(loc, f16_ty, v0);
+    auto c1 = rewriter.create<LLVM::FPTruncOp>(loc, f16_ty, v1);
+    auto c2 = rewriter.create<LLVM::FPTruncOp>(loc, f16_ty, v2);
+    auto c3 = rewriter.create<LLVM::FPTruncOp>(loc, f16_ty, v3);
+    return convertFp16x4ToFp8x4(loc, rewriter, c0, c1, c2, c3);
+  }
+
+  static SmallVector<Value>
+  convertFp8x4ToFp64x4(Location loc, ConversionPatternRewriter &rewriter,
+                       const Value &v0, const Value &v1, const Value &v2,
+                       const Value &v3) {
+    auto fp16Values = convertFp8x4ToFp16x4(loc, rewriter, v0, v1, v2, v3);
+    return {rewriter.create<LLVM::FPExtOp>(loc, f64_ty, fp16Values[0]),
+            rewriter.create<LLVM::FPExtOp>(loc, f64_ty, fp16Values[1]),
+            rewriter.create<LLVM::FPExtOp>(loc, f64_ty, fp16Values[2]),
+            rewriter.create<LLVM::FPExtOp>(loc, f64_ty, fp16Values[3])};
+  }
+
+  static SmallVector<Value>
+  convertFp64x4ToFp8x4(Location loc, ConversionPatternRewriter &rewriter,
+                       const Value &v0, const Value &v1, const Value &v2,
+                       const Value &v3) {
+    auto c0 = rewriter.create<LLVM::FPTruncOp>(loc, f16_ty, v0);
+    auto c1 = rewriter.create<LLVM::FPTruncOp>(loc, f16_ty, v1);
+    auto c2 = rewriter.create<LLVM::FPTruncOp>(loc, f16_ty, v2);
+    auto c3 = rewriter.create<LLVM::FPTruncOp>(loc, f16_ty, v3);
+    return convertFp16x4ToFp8x4(loc, rewriter, c0, c1, c2, c3);
+  }
+
+  LogicalResult
+  matchAndRewrite(triton::FpToFpOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto srcTensorType = op.from().getType().cast<mlir::RankedTensorType>();
+    auto dstTensorType = op.result().getType().cast<mlir::RankedTensorType>();
+    auto srcEltType = srcTensorType.getElementType();
+    auto dstEltType = dstTensorType.getElementType();
+    assert(srcEltType.isa<triton::Float8Type>() ||
+           dstEltType.isa<triton::Float8Type>());
+    auto convertedDstTensorType =
+        this->getTypeConverter()->convertType(dstTensorType);
+    auto convertedDstEleType =
+        this->getTypeConverter()->convertType(dstEltType);
+
+    // Select convertor
+    std::function<SmallVector<Value>(Location, ConversionPatternRewriter &,
+                                     const Value &, const Value &,
+                                     const Value &, const Value &)>
+        convertor;
+    if (srcEltType.isa<triton::Float8Type>() && dstEltType.isF16()) {
+      convertor = convertFp8x4ToFp16x4;
+    } else if (srcEltType.isF16() && dstEltType.isa<triton::Float8Type>()) {
+      convertor = convertFp16x4ToFp8x4;
+    } else if (srcEltType.isa<triton::Float8Type>() && dstEltType.isBF16()) {
+      convertor = convertFp8x4ToBf16x4;
+    } else if (srcEltType.isBF16() && dstEltType.isa<triton::Float8Type>()) {
+      convertor = convertBf16x4ToFp8x4;
+    } else if (srcEltType.isa<triton::Float8Type>() && dstEltType.isF32()) {
+      convertor = convertFp8x4ToFp32x4;
+    } else if (srcEltType.isF32() && dstEltType.isa<triton::Float8Type>()) {
+      convertor = convertFp32x4ToFp8x4;
+    } else if (srcEltType.isa<triton::Float8Type>() && dstEltType.isF64()) {
+      convertor = convertFp8x4ToFp64x4;
+    } else if (srcEltType.isF64() && dstEltType.isa<triton::Float8Type>()) {
+      convertor = convertFp64x4ToFp8x4;
+    } else {
+      assert(false && "unsupported type casting");
+    }
+
+    // Vectorized casting
+    auto loc = op->getLoc();
+    auto elems = getElemsPerThread(dstTensorType);
+    assert(elems % 4 == 0 &&
+           "FP8 casting only support tensors with 4-aligned sizes");
+    auto elements = getElementsFromStruct(loc, adaptor.from(), rewriter);
+    SmallVector<Value> resultVals;
+    for (size_t i = 0; i < elems; i += 4) {
+      auto converted = convertor(loc, rewriter, elements[i], elements[i + 1],
+                                 elements[i + 2], elements[i + 3]);
+      resultVals.append(converted);
+    }
+    assert(resultVals.size() == elems);
+    auto result = getStructFromElements(loc, resultVals, rewriter,
+                                        convertedDstTensorType);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 // A CRTP style of base class.
-template <typename SourceOp, typename DestOp, typename ConcreteT>
+template <typename SourceOp, typename ConcreteT>
 class ElementwiseOpConversionBase
     : public ConvertTritonGPUOpToLLVMPattern<SourceOp> {
 public:
@@ -1804,9 +2520,12 @@ public:
     for (unsigned i = 0; i < elems; ++i) {
       resultVals[i] = concreteThis->createDestOp(op, adaptor, rewriter, elemTy,
                                                  operands[i], loc);
+      if (!bool(resultVals[i]))
+        return failure();
     }
     Value view = getStructFromElements(loc, resultVals, rewriter, structTy);
     rewriter.replaceOp(op, view);
+
     return success();
   }
 
@@ -1816,7 +2535,7 @@ protected:
               const unsigned elems, Location loc) const {
     SmallVector<SmallVector<Value>> operands(elems);
     for (auto operand : adaptor.getOperands()) {
-      auto sub_operands = this->getElementsFromStruct(loc, operand, rewriter);
+      auto sub_operands = getElementsFromStruct(loc, operand, rewriter);
       for (size_t i = 0; i < elems; ++i) {
         operands[i].push_back(sub_operands[i]);
       }
@@ -1828,16 +2547,16 @@ protected:
 template <typename SourceOp, typename DestOp>
 struct ElementwiseOpConversion
     : public ElementwiseOpConversionBase<
-          SourceOp, DestOp, ElementwiseOpConversion<SourceOp, DestOp>> {
+          SourceOp, ElementwiseOpConversion<SourceOp, DestOp>> {
   using Base =
-      ElementwiseOpConversionBase<SourceOp, DestOp,
+      ElementwiseOpConversionBase<SourceOp,
                                   ElementwiseOpConversion<SourceOp, DestOp>>;
   using Base::Base;
   using OpAdaptor = typename Base::OpAdaptor;
 
   explicit ElementwiseOpConversion(LLVMTypeConverter &typeConverter,
                                    PatternBenefit benefit = 1)
-      : ElementwiseOpConversionBase<SourceOp, DestOp, ElementwiseOpConversion>(
+      : ElementwiseOpConversionBase<SourceOp, ElementwiseOpConversion>(
             typeConverter, benefit) {}
 
   // An interface to support variant DestOp builder.
@@ -1854,10 +2573,10 @@ struct ElementwiseOpConversion
 //
 
 struct CmpIOpConversion
-    : public ElementwiseOpConversionBase<triton::gpu::CmpIOp, LLVM::ICmpOp,
+    : public ElementwiseOpConversionBase<triton::gpu::CmpIOp,
                                          CmpIOpConversion> {
-  using Base = ElementwiseOpConversionBase<triton::gpu::CmpIOp, LLVM::ICmpOp,
-                                           CmpIOpConversion>;
+  using Base =
+      ElementwiseOpConversionBase<triton::gpu::CmpIOp, CmpIOpConversion>;
   using Base::Base;
   using Adaptor = typename Base::OpAdaptor;
 
@@ -1895,17 +2614,18 @@ struct CmpIOpConversion
 };
 
 struct CmpFOpConversion
-    : public ElementwiseOpConversionBase<triton::gpu::CmpFOp, LLVM::FCmpOp,
+    : public ElementwiseOpConversionBase<triton::gpu::CmpFOp,
                                          CmpFOpConversion> {
-  using Base = ElementwiseOpConversionBase<triton::gpu::CmpFOp, LLVM::FCmpOp,
-                                           CmpFOpConversion>;
+  using Base =
+      ElementwiseOpConversionBase<triton::gpu::CmpFOp, CmpFOpConversion>;
   using Base::Base;
   using Adaptor = typename Base::OpAdaptor;
 
   // An interface to support variant DestOp builder.
-  LLVM::FCmpOp createDestOp(triton::gpu::CmpFOp op, OpAdaptor adaptor,
-                            ConversionPatternRewriter &rewriter, Type elemTy,
-                            ValueRange operands, Location loc) const {
+  static LLVM::FCmpOp createDestOp(triton::gpu::CmpFOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, ValueRange operands,
+                                   Location loc) {
     return rewriter.create<LLVM::FCmpOp>(
         loc, elemTy, ArithCmpFPredicteToLLVM(op.predicate()), operands[0],
         operands[1]);
@@ -1972,21 +2692,263 @@ public:
          dstLayout.isa<SliceEncodingAttr>())) {
       return lowerDistributedToDistributed(op, adaptor, rewriter);
     }
+    if (srcLayout.isa<MmaEncodingAttr>() &&
+        dstLayout.isa<DotOperandEncodingAttr>()) {
+      return lowerMmaToDotOperand(op, adaptor, rewriter);
+    }
     // TODO: to be implemented
+    llvm_unreachable("unsupported layout conversion");
     return failure();
   }
 
-private:
-  template <typename T>
-  SmallVector<T> reorder(ArrayRef<T> input, ArrayRef<unsigned> order) const {
-    size_t rank = order.size();
-    assert(input.size() == rank);
-    SmallVector<T> result(rank);
-    for (auto it : llvm::enumerate(order)) {
-      result[rank - 1 - it.value()] = input[it.index()];
+  static bool isMmaToDotShortcut(MmaEncodingAttr &mmaLayout,
+                                 DotOperandEncodingAttr &dotOperandLayout) {
+    // dot_op<opIdx=0, parent=#mma> = #mma
+    // when #mma = MmaEncoding<version=2, warpsPerCTA=[..., 1]>
+    return mmaLayout.getWarpsPerCTA()[1] == 1 &&
+           dotOperandLayout.getOpIdx() == 0 &&
+           dotOperandLayout.getParent() == mmaLayout;
+  }
+
+  static void storeBlockedToShared(Value src, Value llSrc,
+                                   ArrayRef<Value> srcStrides,
+                                   ArrayRef<Value> srcIndices, Value dst,
+                                   Value smemBase, Type elemPtrTy, Location loc,
+                                   ConversionPatternRewriter &rewriter) {
+    auto srcTy = src.getType().cast<RankedTensorType>();
+    auto srcShape = srcTy.getShape();
+    assert(srcShape.size() == 2 && "Unexpected rank of insertSlice");
+
+    auto elemTy = srcTy.getElementType();
+    auto dstTy = dst.getType().cast<RankedTensorType>();
+    auto srcBlockedLayout = srcTy.getEncoding().cast<BlockedEncodingAttr>();
+    auto dstSharedLayout = dstTy.getEncoding().cast<SharedEncodingAttr>();
+    auto inOrd = srcBlockedLayout.getOrder();
+    auto outOrd = dstSharedLayout.getOrder();
+    if (inOrd != outOrd)
+      llvm_unreachable(
+          "blocked -> shared with different order not yet implemented");
+    unsigned inVec =
+        inOrd == outOrd ? srcBlockedLayout.getSizePerThread()[inOrd[0]] : 1;
+    unsigned outVec = dstSharedLayout.getVec();
+    unsigned minVec = std::min(outVec, inVec);
+    unsigned perPhase = dstSharedLayout.getPerPhase();
+    unsigned maxPhase = dstSharedLayout.getMaxPhase();
+    unsigned numElems = getElemsPerThread(srcTy);
+    auto inVals = getElementsFromStruct(loc, llSrc, rewriter);
+    auto srcAccumSizeInThreads =
+        product<unsigned>(srcBlockedLayout.getSizePerThread());
+    auto wordTy = vec_ty(elemTy, minVec);
+
+    // TODO: [goostavz] We should make a cache for the calculation of
+    // emitBaseIndexForBlockedLayout in case backend compiler not being able to
+    // optimize that
+    SmallVector<unsigned> srcShapePerCTA = getShapePerCTA(srcBlockedLayout);
+    SmallVector<unsigned> reps{ceil<unsigned>(srcShape[0], srcShapePerCTA[0]),
+                               ceil<unsigned>(srcShape[1], srcShapePerCTA[1])};
+
+    // Visit each input value in the order they are placed in inVals
+    //
+    // Please note that the order was not awaring of blockLayout.getOrder(),
+    // thus the adjacent elems may not belong to a same word. This could be
+    // improved if we update the elements order by emitIndicesForBlockedLayout()
+    SmallVector<unsigned> wordsInEachRep(2);
+    wordsInEachRep[0] = inOrd[0] == 0
+                            ? srcBlockedLayout.getSizePerThread()[0] / minVec
+                            : srcBlockedLayout.getSizePerThread()[0];
+    wordsInEachRep[1] = inOrd[0] == 0
+                            ? srcBlockedLayout.getSizePerThread()[1]
+                            : srcBlockedLayout.getSizePerThread()[1] / minVec;
+    Value outVecVal = i32_val(outVec);
+    Value minVecVal = i32_val(minVec);
+    auto numWordsEachRep = product<unsigned>(wordsInEachRep);
+    SmallVector<Value> wordVecs(numWordsEachRep);
+    for (unsigned i = 0; i < numElems; ++i) {
+      if (i % srcAccumSizeInThreads == 0) {
+        // start of a replication
+        for (unsigned w = 0; w < numWordsEachRep; ++w) {
+          wordVecs[w] = undef(wordTy);
+        }
+      }
+      unsigned linearIdxInNanoTile = i % srcAccumSizeInThreads;
+      auto multiDimIdxInNanoTile = getMultiDimIndex<unsigned>(
+          linearIdxInNanoTile, srcBlockedLayout.getSizePerThread(), inOrd);
+      unsigned pos = multiDimIdxInNanoTile[inOrd[0]] % minVec;
+      multiDimIdxInNanoTile[inOrd[0]] /= minVec;
+      auto wordVecIdx = getLinearIndex<unsigned>(multiDimIdxInNanoTile,
+                                                 wordsInEachRep, inOrd);
+      wordVecs[wordVecIdx] =
+          insert_element(wordTy, wordVecs[wordVecIdx], inVals[i], i32_val(pos));
+
+      if (i % srcAccumSizeInThreads == srcAccumSizeInThreads - 1) {
+        // end of replication, store the vectors into shared memory
+        unsigned linearRepIdx = i / srcAccumSizeInThreads;
+        auto multiDimRepIdx =
+            getMultiDimIndex<unsigned>(linearRepIdx, reps, inOrd);
+        for (unsigned linearWordIdx = 0; linearWordIdx < numWordsEachRep;
+             ++linearWordIdx) {
+          // step 1: recover the multidim_index from the index of
+          // input_elements
+          auto multiDimWordIdx =
+              getMultiDimIndex<unsigned>(linearWordIdx, wordsInEachRep, inOrd);
+          SmallVector<Value> multiDimIdx(2);
+          auto wordOffset0 = multiDimRepIdx[0] * srcShapePerCTA[0] +
+                             multiDimWordIdx[0] * (inOrd[0] == 0 ? minVec : 1);
+          auto wordOffset1 = multiDimRepIdx[1] * srcShapePerCTA[1] +
+                             multiDimWordIdx[1] * (inOrd[0] == 1 ? minVec : 1);
+          multiDimIdx[0] = add(srcIndices[0], i32_val(wordOffset0));
+          multiDimIdx[1] = add(srcIndices[1], i32_val(wordOffset1));
+
+          // step 2: do swizzling
+          Value remained = urem(multiDimIdx[outOrd[0]], outVecVal);
+          multiDimIdx[outOrd[0]] = udiv(multiDimIdx[outOrd[0]], outVecVal);
+          Value off_1 = mul(multiDimIdx[outOrd[1]], srcStrides[outOrd[1]]);
+          Value phaseId = udiv(multiDimIdx[outOrd[1]], i32_val(perPhase));
+          phaseId = urem(phaseId, i32_val(maxPhase));
+          Value off_0 = xor_(multiDimIdx[outOrd[0]], phaseId);
+          off_0 = mul(off_0, outVecVal);
+          remained = udiv(remained, minVecVal);
+          off_0 = add(off_0, mul(remained, minVecVal));
+          Value offset = add(off_1, off_0);
+
+          // step 3: store
+          Value smemAddr = gep(elemPtrTy, smemBase, offset);
+          smemAddr = bitcast(smemAddr, ptr_ty(wordTy, 3));
+          store(wordVecs[linearWordIdx], smemAddr);
+        }
+      }
     }
-    return result;
-  };
+  }
+
+private:
+  SmallVector<Value> getMultiDimOffset(Attribute layout, Location loc,
+                                       ConversionPatternRewriter &rewriter,
+                                       unsigned elemId, ArrayRef<int64_t> shape,
+                                       ArrayRef<unsigned> multiDimCTAInRepId,
+                                       ArrayRef<unsigned> shapePerCTA) const {
+    unsigned rank = shape.size();
+    if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
+      auto multiDimOffsetFirstElem =
+          emitBaseIndexForBlockedLayout(loc, rewriter, blockedLayout, shape);
+      SmallVector<Value> multiDimOffset(rank);
+      SmallVector<unsigned> multiDimElemId = getMultiDimIndex<unsigned>(
+          elemId, getSizePerThread(layout), getOrder(layout));
+      for (unsigned d = 0; d < rank; ++d) {
+        multiDimOffset[d] = add(multiDimOffsetFirstElem[d],
+                                idx_val(multiDimCTAInRepId[d] * shapePerCTA[d] +
+                                        multiDimElemId[d]));
+      }
+      return multiDimOffset;
+    }
+    if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
+      unsigned dim = sliceLayout.getDim();
+      auto multiDimOffsetParent =
+          getMultiDimOffset(sliceLayout.getParent(), loc, rewriter, elemId,
+                            sliceLayout.paddedShape(shape),
+                            sliceLayout.paddedShape(multiDimCTAInRepId),
+                            sliceLayout.paddedShape(shapePerCTA));
+      SmallVector<Value> multiDimOffset(rank);
+      for (unsigned d = 0; d < rank + 1; ++d) {
+        if (d == dim)
+          continue;
+        unsigned slicedD = d < dim ? d : (d - 1);
+        multiDimOffset[slicedD] = multiDimOffsetParent[d];
+      }
+      return multiDimOffset;
+    }
+    if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
+      SmallVector<Value> mmaColIdx(4);
+      SmallVector<Value> mmaRowIdx(2);
+      Value threadId = getThreadId(rewriter, loc);
+      Value warpSize = idx_val(32);
+      Value laneId = urem(threadId, warpSize);
+      Value warpId = udiv(threadId, warpSize);
+      // TODO: fix the bug in MMAEncodingAttr document
+      SmallVector<Value> multiDimWarpId(2);
+      multiDimWarpId[0] = urem(warpId, idx_val(mmaLayout.getWarpsPerCTA()[0]));
+      multiDimWarpId[1] = udiv(warpId, idx_val(mmaLayout.getWarpsPerCTA()[0]));
+      Value _1 = idx_val(1);
+      Value _2 = idx_val(2);
+      Value _4 = idx_val(4);
+      Value _8 = idx_val(8);
+      Value _16 = idx_val(16);
+      if (mmaLayout.isAmpere()) {
+        multiDimWarpId[0] = urem(multiDimWarpId[0], idx_val(shape[0] / 16));
+        multiDimWarpId[1] = urem(multiDimWarpId[1], idx_val(shape[1] / 8));
+        Value mmaGrpId = udiv(laneId, _4);
+        Value mmaGrpIdP8 = add(mmaGrpId, _8);
+        Value mmaThreadIdInGrp = urem(laneId, _4);
+        Value mmaThreadIdInGrpM2 = mul(mmaThreadIdInGrp, _2);
+        Value mmaThreadIdInGrpM2P1 = add(mmaThreadIdInGrpM2, _1);
+        Value rowWarpOffset = mul(multiDimWarpId[0], _16);
+        mmaRowIdx[0] = add(mmaGrpId, rowWarpOffset);
+        mmaRowIdx[1] = add(mmaGrpIdP8, rowWarpOffset);
+        Value colWarpOffset = mul(multiDimWarpId[1], _8);
+        mmaColIdx[0] = add(mmaThreadIdInGrpM2, colWarpOffset);
+        mmaColIdx[1] = add(mmaThreadIdInGrpM2P1, colWarpOffset);
+      } else if (mmaLayout.isVolta()) {
+        multiDimWarpId[0] = urem(multiDimWarpId[0], idx_val(shape[0] / 16));
+        multiDimWarpId[1] = urem(multiDimWarpId[1], idx_val(shape[1] / 16));
+        Value laneIdDiv16 = udiv(laneId, _16);
+        Value laneIdRem16 = urem(laneId, _16);
+        Value laneIdRem2 = urem(laneId, _2);
+        Value laneIdRem16Div8 = udiv(laneIdRem16, _8);
+        Value laneIdRem16Div4 = udiv(laneIdRem16, _4);
+        Value laneIdRem16Div4Rem2 = urem(laneIdRem16Div4, _2);
+        Value laneIdRem4Div2 = udiv(urem(laneId, _4), _2);
+        Value rowWarpOffset = mul(multiDimWarpId[0], _16);
+        Value colWarpOffset = mul(multiDimWarpId[1], _16);
+        mmaRowIdx[0] =
+            add(add(mul(laneIdDiv16, _8), mul(laneIdRem16Div4Rem2, _4)),
+                laneIdRem2);
+        mmaRowIdx[0] = add(mmaRowIdx[0], rowWarpOffset);
+        mmaRowIdx[1] = add(mmaRowIdx[0], _2);
+        mmaColIdx[0] = add(mul(laneIdRem16Div8, _4), mul(laneIdRem4Div2, _2));
+        mmaColIdx[0] = add(mmaColIdx[0], colWarpOffset);
+        mmaColIdx[1] = add(mmaColIdx[0], _1);
+        mmaColIdx[2] = add(mmaColIdx[0], _8);
+        mmaColIdx[3] = add(mmaColIdx[0], idx_val(9));
+      } else {
+        llvm_unreachable("Unexpected MMALayout version");
+      }
+
+      assert(rank == 2);
+      SmallVector<Value> multiDimOffset(rank);
+      if (mmaLayout.isAmpere()) {
+        multiDimOffset[0] = elemId < 2 ? mmaRowIdx[0] : mmaRowIdx[1];
+        multiDimOffset[1] = elemId % 2 == 0 ? mmaColIdx[0] : mmaColIdx[1];
+        multiDimOffset[0] = add(
+            multiDimOffset[0], idx_val(multiDimCTAInRepId[0] * shapePerCTA[0]));
+        multiDimOffset[1] = add(
+            multiDimOffset[1], idx_val(multiDimCTAInRepId[1] * shapePerCTA[1]));
+      } else if (mmaLayout.isVolta()) {
+        // the order of elements in a thread:
+        //   c0, c1, ...  c4, c5
+        //   c2, c3, ...  c6, c7
+        if (elemId < 2) {
+          multiDimOffset[0] = mmaRowIdx[0];
+          multiDimOffset[1] = mmaColIdx[elemId % 2];
+        } else if (elemId >= 2 && elemId < 4) {
+          multiDimOffset[0] = mmaRowIdx[1];
+          multiDimOffset[1] = mmaColIdx[elemId % 2];
+        } else if (elemId >= 4 && elemId < 6) {
+          multiDimOffset[0] = mmaRowIdx[0];
+          multiDimOffset[1] = mmaColIdx[elemId % 2 + 2];
+        } else if (elemId >= 6) {
+          multiDimOffset[0] = mmaRowIdx[1];
+          multiDimOffset[1] = mmaColIdx[elemId % 2 + 2];
+        }
+        multiDimOffset[0] = add(
+            multiDimOffset[0], idx_val(multiDimCTAInRepId[0] * shapePerCTA[0]));
+        multiDimOffset[1] = add(
+            multiDimOffset[1], idx_val(multiDimCTAInRepId[1] * shapePerCTA[1]));
+      } else {
+        llvm_unreachable("Unexpected MMALayout version");
+      }
+      return multiDimOffset;
+    }
+    llvm_unreachable("unexpected layout in getMultiDimOffset");
+  }
 
   // shared memory rd/st for blocked or mma layout with data padding
   void processReplica(Location loc, ConversionPatternRewriter &rewriter,
@@ -1998,7 +2960,7 @@ private:
                       Value smemBase) const;
 
   // blocked/mma -> blocked/mma.
-  // Data padding in shared memory to avoid bank confict.
+  // Data padding in shared memory to avoid bank conflict.
   LogicalResult
   lowerDistributedToDistributed(triton::gpu::ConvertLayoutOp op,
                                 OpAdaptor adaptor,
@@ -2015,6 +2977,17 @@ private:
   LogicalResult
   lowerSharedToDotOperand(triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
                           ConversionPatternRewriter &rewriter) const;
+
+  // mma -> dot_operand
+  LogicalResult lowerMmaToDotOperand(triton::gpu::ConvertLayoutOp op,
+                                     OpAdaptor adaptor,
+                                     ConversionPatternRewriter &rewriter) const;
+
+  // shared -> dot_operand if the result layout is mma
+  Value lowerSharedToDotOperandMMA(
+      triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter, const MmaEncodingAttr &mmaLayout,
+      const DotOperandEncodingAttr &dotOperandLayout, bool isOuter) const;
 };
 
 void ConvertLayoutOpConversion::processReplica(
@@ -2023,7 +2996,7 @@ void ConvertLayoutOpConversion::processReplica(
     ArrayRef<unsigned> multiDimRepId, unsigned vec,
     ArrayRef<unsigned> paddedRepShape, ArrayRef<unsigned> outOrd,
     SmallVector<Value> &vals, Value smemBase) const {
-  unsigned accumNumCTAsEachRep = product<unsigned>(numCTAsEachRep);
+  auto accumNumCTAsEachRep = product<unsigned>(numCTAsEachRep);
   auto layout = type.getEncoding();
   auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>();
   auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>();
@@ -2033,114 +3006,41 @@ void ConvertLayoutOpConversion::processReplica(
   auto accumSizePerThread = product<unsigned>(sizePerThread);
   SmallVector<unsigned> numCTAs(rank);
   auto shapePerCTA = getShapePerCTA(layout);
+  auto order = getOrder(layout);
   for (unsigned d = 0; d < rank; ++d) {
     numCTAs[d] = ceil<unsigned>(type.getShape()[d], shapePerCTA[d]);
   }
   auto elemTy = type.getElementType();
   bool isInt1 = elemTy.isInteger(1);
+  bool isPtr = elemTy.isa<triton::PointerType>();
+  auto llvmElemTyOrig = getTypeConverter()->convertType(elemTy);
   if (isInt1)
     elemTy = IntegerType::get(elemTy.getContext(), 8);
+  else if (isPtr)
+    elemTy = IntegerType::get(elemTy.getContext(), 64);
+
   auto llvmElemTy = getTypeConverter()->convertType(elemTy);
 
-  SmallVector<Value> multiDimOffsetFirstElem;
-  SmallVector<Value> mmaColIdx(2);
-  SmallVector<Value> mmaRowIdx(2);
-  if (blockedLayout) {
-    multiDimOffsetFirstElem = emitBaseIndexForBlockedLayout(
-        loc, rewriter, blockedLayout, type.getShape());
-  } else if (sliceLayout) {
-    auto parent = sliceLayout.getParent();
-    if (auto blockedParent = parent.dyn_cast<BlockedEncodingAttr>()) {
-      SmallVector<int64_t> paddedShape =
-          sliceLayout.paddedShape(type.getShape());
-      multiDimOffsetFirstElem = emitBaseIndexForBlockedLayout(
-          loc, rewriter, blockedParent, paddedShape);
-    } else {
-      assert(0 && "SliceEncodingAttr with parent other than "
-                  "BlockedEncodingAttr not implemented");
-    }
-  } else if (mmaLayout) {
-    Value threadId = getThreadId(rewriter, loc);
-    Value warpSize = idx_val(32);
-    Value laneId = urem(threadId, warpSize);
-    Value warpId = udiv(threadId, warpSize);
-    // auto multiDimWarpId =
-    //     delinearize(rewriter, loc, warpId, mmaLayout.getWarpsPerCTA());
-    // TODO: double confirm if its document bug or DotConversion's Bug
-    SmallVector<Value> multiDimWarpId(2);
-    multiDimWarpId[0] = urem(warpId, idx_val(mmaLayout.getWarpsPerCTA()[0]));
-    multiDimWarpId[1] = udiv(warpId, idx_val(mmaLayout.getWarpsPerCTA()[0]));
-    Value four = idx_val(4);
-    Value mmaGrpId = udiv(laneId, four);
-    Value mmaGrpIdP8 = add(mmaGrpId, idx_val(8));
-    Value mmaThreadIdInGrp = urem(laneId, four);
-    Value mmaThreadIdInGrpM2 = mul(mmaThreadIdInGrp, idx_val(2));
-    Value mmaThreadIdInGrpM2P1 = add(mmaThreadIdInGrpM2, idx_val(1));
-    Value colWarpOffset = mul(multiDimWarpId[0], idx_val(16));
-    mmaColIdx[0] = add(mmaGrpId, colWarpOffset);
-    mmaColIdx[1] = add(mmaGrpIdP8, colWarpOffset);
-    Value rowWarpOffset = mul(multiDimWarpId[1], idx_val(8));
-    mmaRowIdx[0] = add(mmaThreadIdInGrpM2, rowWarpOffset);
-    mmaRowIdx[1] = add(mmaThreadIdInGrpM2P1, rowWarpOffset);
-  }
   for (unsigned ctaId = 0; ctaId < accumNumCTAsEachRep; ++ctaId) {
-    auto multiDimCTAInRepId = getMultiDimIndex<unsigned>(ctaId, numCTAsEachRep);
+    auto multiDimCTAInRepId =
+        getMultiDimIndex<unsigned>(ctaId, numCTAsEachRep, order);
     SmallVector<unsigned> multiDimCTAId(rank);
-    for (auto it : llvm::enumerate(multiDimCTAInRepId)) {
+    for (const auto &it : llvm::enumerate(multiDimCTAInRepId)) {
       auto d = it.index();
       multiDimCTAId[d] = multiDimRepId[d] * numCTAsEachRep[d] + it.value();
     }
 
-    unsigned linearCTAId = getLinearIndex<unsigned>(multiDimCTAId, numCTAs);
+    auto linearCTAId = getLinearIndex<unsigned>(multiDimCTAId, numCTAs, order);
     // TODO: This is actually redundant index calculation, we should
     //       consider of caching the index calculation result in case
     //       of performance issue observed.
     for (unsigned elemId = 0; elemId < accumSizePerThread; elemId += vec) {
-      SmallVector<Value> multiDimOffset(rank);
-      if (blockedLayout) {
-        SmallVector<unsigned> multiDimElemId = getMultiDimIndex<unsigned>(
-            elemId, blockedLayout.getSizePerThread());
-        for (unsigned d = 0; d < rank; ++d) {
-          multiDimOffset[d] =
-              add(multiDimOffsetFirstElem[d],
-                  idx_val(multiDimCTAInRepId[d] * shapePerCTA[d] +
-                          multiDimElemId[d]));
-        }
-      } else if (sliceLayout) {
-        unsigned dim = sliceLayout.getDim();
-        auto parent = sliceLayout.getParent();
-        if (auto blockedParent = parent.dyn_cast<BlockedEncodingAttr>()) {
-          SmallVector<unsigned> multiDimElemId = getMultiDimIndex<unsigned>(
-              elemId, blockedParent.getSizePerThread());
-          for (unsigned d = 0; d < rank + 1; ++d) {
-            if (d == dim)
-              continue;
-            unsigned slicedD = d < dim ? d : (d - 1);
-            multiDimOffset[slicedD] =
-                add(multiDimOffsetFirstElem[d],
-                    idx_val(multiDimCTAInRepId[slicedD] * shapePerCTA[slicedD] +
-                            multiDimElemId[d]));
-          }
-        } else {
-          assert(0 && "SliceEncodingAttr with parent other than "
-                      "BlockedEncodingAttr not implemented");
-        }
-      } else if (mmaLayout) {
-        assert(rank == 2);
-        assert(mmaLayout.getVersion() == 2 &&
-               "mmaLayout ver1 not implemented yet");
-        multiDimOffset[0] = elemId < 2 ? mmaColIdx[0] : mmaColIdx[1];
-        multiDimOffset[1] = elemId % 2 == 0 ? mmaRowIdx[0] : mmaRowIdx[1];
-        multiDimOffset[0] = add(
-            multiDimOffset[0], idx_val(multiDimCTAInRepId[0] * shapePerCTA[0]));
-        multiDimOffset[1] = add(
-            multiDimOffset[1], idx_val(multiDimCTAInRepId[1] * shapePerCTA[1]));
-      } else {
-        assert(0 && "unexpected layout in processReplica");
-      }
+      SmallVector<Value> multiDimOffset =
+          getMultiDimOffset(layout, loc, rewriter, elemId, type.getShape(),
+                            multiDimCTAInRepId, shapePerCTA);
       Value offset =
-          linearize(rewriter, loc, reorder<Value>(multiDimOffset, outOrd),
-                    reorder<unsigned>(paddedRepShape, outOrd));
+          linearize(rewriter, loc, multiDimOffset, paddedRepShape, outOrd);
+
       auto elemPtrTy = ptr_ty(llvmElemTy, 3);
       Value ptr = gep(elemPtrTy, smemBase, offset);
       auto vecTy = vec_ty(llvmElemTy, vec);
@@ -2151,7 +3051,8 @@ void ConvertLayoutOpConversion::processReplica(
           auto currVal = vals[elemId + linearCTAId * accumSizePerThread + v];
           if (isInt1)
             currVal = zext(llvmElemTy, currVal);
-
+          else if (isPtr)
+            currVal = ptrtoint(llvmElemTy, currVal);
           valVec = insert_element(vecTy, valVec, currVal, idx_val(v));
         }
         store(valVec, ptr);
@@ -2163,6 +3064,8 @@ void ConvertLayoutOpConversion::processReplica(
             currVal =
                 icmp_ne(currVal, rewriter.create<LLVM::ConstantOp>(
                                      loc, i8_ty, rewriter.getI8IntegerAttr(0)));
+          else if (isPtr)
+            currVal = inttoptr(llvmElemTyOrig, currVal);
           vals[elemId + linearCTAId * accumSizePerThread + v] = currVal;
         }
       }
@@ -2205,7 +3108,7 @@ LogicalResult ConvertLayoutOpConversion::lowerDistributedToDistributed(
     outNumCTAs[d] = ceil<unsigned>(shape[d], outPerCTA);
   }
   // Potentially we need to store for multiple CTAs in this replication
-  unsigned accumNumReplicates = product<unsigned>(numReplicates);
+  auto accumNumReplicates = product<unsigned>(numReplicates);
   // unsigned elems = getElemsPerThread(srcTy);
   auto vals = getElementsFromStruct(loc, adaptor.src(), rewriter);
   unsigned inVec = 0;
@@ -2217,8 +3120,10 @@ LogicalResult ConvertLayoutOpConversion::lowerDistributedToDistributed(
   SmallVector<Value> outVals(outElems);
 
   for (unsigned repId = 0; repId < accumNumReplicates; ++repId) {
-    auto multiDimRepId = getMultiDimIndex<unsigned>(repId, numReplicates);
-    barrier();
+    auto multiDimRepId =
+        getMultiDimIndex<unsigned>(repId, numReplicates, outOrd);
+    if (repId != 0)
+      barrier();
     if (srcLayout.isa<BlockedEncodingAttr>() ||
         srcLayout.isa<SliceEncodingAttr>() ||
         srcLayout.isa<MmaEncodingAttr>()) {
@@ -2249,7 +3154,7 @@ LogicalResult ConvertLayoutOpConversion::lowerDistributedToDistributed(
   rewriter.replaceOp(op, result);
 
   return success();
-};
+}
 
 LogicalResult ConvertLayoutOpConversion::lowerBlockedToShared(
     triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
@@ -2258,532 +3163,155 @@ LogicalResult ConvertLayoutOpConversion::lowerBlockedToShared(
   Value src = op.src();
   Value dst = op.result();
   auto srcTy = src.getType().cast<RankedTensorType>();
-  auto dstTy = dst.getType().cast<RankedTensorType>();
   auto srcShape = srcTy.getShape();
+  auto dstTy = dst.getType().cast<RankedTensorType>();
+  auto dstShape = dstTy.getShape();
   assert(srcShape.size() == 2 &&
          "Unexpected rank of ConvertLayout(blocked->shared)");
   auto srcBlockedLayout = srcTy.getEncoding().cast<BlockedEncodingAttr>();
   auto dstSharedLayout = dstTy.getEncoding().cast<SharedEncodingAttr>();
   auto inOrd = srcBlockedLayout.getOrder();
   auto outOrd = dstSharedLayout.getOrder();
-  unsigned inVec =
-      inOrd == outOrd ? srcBlockedLayout.getSizePerThread()[inOrd[0]] : 1;
-  unsigned outVec = dstSharedLayout.getVec();
-  unsigned minVec = std::min(outVec, inVec);
-  unsigned perPhase = dstSharedLayout.getPerPhase();
-  unsigned maxPhase = dstSharedLayout.getMaxPhase();
-  unsigned numElems = getElemsPerThread(srcTy);
-  auto inVals = getElementsFromStruct(loc, adaptor.src(), rewriter);
-  unsigned srcAccumSizeInThreads =
-      product<unsigned>(srcBlockedLayout.getSizePerThread());
-  auto elemTy = srcTy.getElementType();
-  auto wordTy = vec_ty(elemTy, minVec);
-
-  // TODO: [goostavz] We should make a cache for the calculation of
-  // emitBaseIndexForBlockedLayout in case backend compiler not being able to
-  // optimize that
-  SmallVector<Value> multiDimOffsetFirstElem =
-      emitBaseIndexForBlockedLayout(loc, rewriter, srcBlockedLayout, srcShape);
-  SmallVector<unsigned> srcShapePerCTA = getShapePerCTA(srcBlockedLayout);
-  SmallVector<unsigned> reps{ceil<unsigned>(srcShape[0], srcShapePerCTA[0]),
-                             ceil<unsigned>(srcShape[1], srcShapePerCTA[1])};
-
-  // Visit each input value in the order they are placed in inVals
-  //
-  // Please note that the order was not awaring of blockLayout.getOrder(),
-  // thus the adjacent elems may not belong to a same word. This could be
-  // improved if we update the elements order by emitIndicesForBlockedLayout()
-  SmallVector<unsigned> wordsInEachRep(2);
-  wordsInEachRep[0] = inOrd[0] == 0
-                          ? srcBlockedLayout.getSizePerThread()[0] / minVec
-                          : srcBlockedLayout.getSizePerThread()[0];
-  wordsInEachRep[1] = inOrd[0] == 0
-                          ? srcBlockedLayout.getSizePerThread()[1]
-                          : srcBlockedLayout.getSizePerThread()[1] / minVec;
-  Value outVecVal = idx_val(outVec);
-  Value minVecVal = idx_val(minVec);
   Value smemBase = getSharedMemoryBase(loc, rewriter, dst);
+  auto elemTy = getTypeConverter()->convertType(srcTy.getElementType());
   auto elemPtrTy = ptr_ty(getTypeConverter()->convertType(elemTy), 3);
   smemBase = bitcast(smemBase, elemPtrTy);
-  unsigned numWordsEachRep = product<unsigned>(wordsInEachRep);
-  SmallVector<Value> wordVecs(numWordsEachRep);
-  // TODO: We should get less barriers if it is handled by membar pass
-  //       instead of the backend, since the later can only handle it in
-  //       the most conservative way. However just keep for now and revisit
-  //       in the future in case necessary.
-  barrier();
-  for (unsigned i = 0; i < numElems; ++i) {
-    if (i % srcAccumSizeInThreads == 0) {
-      // start of a replication
-      for (unsigned w = 0; w < numWordsEachRep; ++w) {
-        wordVecs[w] = undef(wordTy);
-      }
-    }
-    unsigned linearIdxInNanoTile = i % srcAccumSizeInThreads;
-    auto multiDimIdxInNanoTile = getMultiDimIndex<unsigned>(
-        linearIdxInNanoTile, srcBlockedLayout.getSizePerThread());
-    unsigned pos = multiDimIdxInNanoTile[inOrd[0]] % minVec;
-    multiDimIdxInNanoTile[inOrd[0]] /= minVec;
-    unsigned wordVecIdx =
-        getLinearIndex<unsigned>(multiDimIdxInNanoTile, wordsInEachRep);
-    wordVecs[wordVecIdx] =
-        insert_element(wordTy, wordVecs[wordVecIdx], inVals[i], idx_val(pos));
 
-    if (i % srcAccumSizeInThreads == srcAccumSizeInThreads - 1) {
-      // end of replication, store the vectors into shared memory
-      unsigned linearRepIdx = i / srcAccumSizeInThreads;
-      auto multiDimRepIdx = getMultiDimIndex<unsigned>(linearRepIdx, reps);
-      for (unsigned linearWordIdx = 0; linearWordIdx < numWordsEachRep;
-           ++linearWordIdx) {
-        // step 1: recover the multidim_index from the index of input_elements
-        auto multiDimWordIdx =
-            getMultiDimIndex<unsigned>(linearWordIdx, wordsInEachRep);
-        SmallVector<Value> multiDimIdx(2);
-        auto wordOffset0 = multiDimRepIdx[0] * srcShapePerCTA[0] +
-                           multiDimWordIdx[0] * (inOrd[0] == 0 ? minVec : 1);
-        auto wordOffset1 = multiDimRepIdx[1] * srcShapePerCTA[1] +
-                           multiDimWordIdx[1] * (inOrd[0] == 1 ? minVec : 1);
-        multiDimIdx[0] = add(multiDimOffsetFirstElem[0], idx_val(wordOffset0));
-        multiDimIdx[1] = add(multiDimOffsetFirstElem[1], idx_val(wordOffset1));
+  auto srcStrides = getStridesFromShapeAndOrder(srcShape, inOrd, loc, rewriter);
+  auto srcIndices =
+      emitBaseIndexForBlockedLayout(loc, rewriter, srcBlockedLayout, srcShape);
+  storeBlockedToShared(src, adaptor.src(), srcStrides, srcIndices, dst,
+                       smemBase, elemPtrTy, loc, rewriter);
 
-        // step 2: do swizzling
-        Value remained = urem(multiDimIdx[inOrd[0]], outVecVal);
-        multiDimIdx[inOrd[0]] = udiv(multiDimIdx[inOrd[0]], outVecVal);
-        Value off_1 = mul(multiDimIdx[inOrd[1]], idx_val(srcShape[inOrd[0]]));
-        Value phaseId = udiv(multiDimIdx[inOrd[1]], idx_val(perPhase));
-        phaseId = urem(phaseId, idx_val(maxPhase));
-        Value off_0 = xor_(multiDimIdx[inOrd[0]], phaseId);
-        off_0 = mul(off_0, outVecVal);
-        remained = udiv(remained, minVecVal);
-        off_0 = add(off_0, mul(remained, minVecVal));
-        Value offset = add(off_1, off_0);
-
-        // step 3: store
-        Value smemAddr = gep(elemPtrTy, smemBase, offset);
-        smemAddr = bitcast(smemAddr, ptr_ty(wordTy, 3));
-        store(wordVecs[linearWordIdx], smemAddr);
-      }
-    }
-  }
-  barrier();
-  rewriter.replaceOp(op, smemBase);
+  auto smemObj = SharedMemoryObject(smemBase, dstShape, outOrd, loc, rewriter);
+  auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
+  rewriter.replaceOp(op, retVal);
   return success();
 }
 
-/// ====================== dot codegen begin ==========================
-
-// Data loader for mma.16816 instruction.
-class MMA16816SmemLoader {
-public:
-  MMA16816SmemLoader(int wpt, ArrayRef<uint32_t> order, uint32_t kOrder,
-                     ArrayRef<int64_t> tileShape, ArrayRef<int> instrShape,
-                     ArrayRef<int> matShape, int perPhase, int maxPhase,
-                     int elemBytes, ConversionPatternRewriter &rewriter,
-                     TypeConverter *typeConverter, const Location &loc)
-      : order(order.begin(), order.end()), kOrder(kOrder),
-        tileShape(tileShape.begin(), tileShape.end()),
-        instrShape(instrShape.begin(), instrShape.end()),
-        matShape(matShape.begin(), matShape.end()), perPhase(perPhase),
-        maxPhase(maxPhase), elemBytes(elemBytes), rewriter(rewriter), loc(loc),
-        ctx(rewriter.getContext()) {
-    cMatShape = matShape[order[0]];
-    sMatShape = matShape[order[1]];
-
-    cTileStride = tileShape[order[1]];
-    sTileStride = tileShape[order[0]];
-
-    // rule: k must be the fast-changing axis.
-    needTrans = kOrder != order[0];
-    canUseLdmatrix = elemBytes == 2 || (!needTrans); // b16
-
-    if (canUseLdmatrix) {
-      // Each CTA, the warps is arranged as [1xwpt] if not transposed,
-      // otherwise [wptx1], and each warp will perform a mma.
-      numPtr =
-          tileShape[order[0]] / (needTrans ? wpt : 1) / instrShape[order[0]];
-    } else {
-      numPtr = tileShape[order[0]] / wpt / matShape[order[0]];
+LogicalResult ConvertLayoutOpConversion::lowerMmaToDotOperand(
+    triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  auto loc = op.getLoc();
+  auto srcTy = op.src().getType().cast<RankedTensorType>();
+  auto dstTy = op.result().getType().cast<RankedTensorType>();
+  auto srcLayout = srcTy.getEncoding();
+  auto dstLayout = dstTy.getEncoding();
+  auto srcMmaLayout = srcLayout.cast<MmaEncodingAttr>();
+  auto dstDotLayout = dstLayout.cast<DotOperandEncodingAttr>();
+  if (isMmaToDotShortcut(srcMmaLayout, dstDotLayout)) {
+    // get source values
+    auto vals = getElementsFromStruct(loc, adaptor.src(), rewriter);
+    unsigned elems = getElemsPerThread(srcTy);
+    Type elemTy = this->getTypeConverter()->convertType(srcTy.getElementType());
+    // for the destination type, we need to pack values together
+    // so they can be consumed by tensor core operations
+    unsigned vecSize =
+        std::max<unsigned>(32 / elemTy.getIntOrFloatBitWidth(), 1);
+    Type vecTy = vec_ty(elemTy, vecSize);
+    SmallVector<Type> types(elems / vecSize, vecTy);
+    SmallVector<Value> vecVals;
+    for (unsigned i = 0; i < elems; i += vecSize) {
+      Value packed = rewriter.create<LLVM::UndefOp>(loc, vecTy);
+      for (unsigned j = 0; j < vecSize; j++)
+        packed = insert_element(vecTy, packed, vals[i + j], i32_val(j));
+      vecVals.push_back(packed);
     }
 
-    numPtr = std::max<int>(numPtr, 2);
-
-    // Special rule for i8/u8, 4 ptrs for each matrix
-    if (!canUseLdmatrix && elemBytes == 1)
-      numPtr *= 4;
-
-    int loadStrideInMat[2];
-    loadStrideInMat[kOrder] =
-        2; // instrShape[kOrder] / matShape[kOrder], always 2
-    loadStrideInMat[kOrder ^ 1] =
-        wpt * (instrShape[kOrder ^ 1] / matShape[kOrder ^ 1]);
-
-    pLoadStrideInMat = loadStrideInMat[order[0]];
-    sMatStride =
-        loadStrideInMat[order[1]] / (instrShape[order[1]] / matShape[order[1]]);
-
-    // Each matArr contains warpOffStride matrices.
-    matArrStride = kOrder == 1 ? 1 : wpt;
-    warpOffStride = instrShape[kOrder ^ 1] / matShape[kOrder ^ 1];
-  }
-
-  // lane = thread % 32
-  // warpOff = (thread/32) % wpt(0)
-  llvm::SmallVector<Value> computeOffsets(Value warpOff, Value lane) {
-    if (canUseLdmatrix)
-      return computeLdmatrixMatOffs(warpOff, lane);
-    else if (elemBytes == 4 && needTrans)
-      return computeB32MatOffs(warpOff, lane);
-    else if (elemBytes == 1 && needTrans)
-      return computeB8MatOffs(warpOff, lane);
-    else
-      llvm::report_fatal_error("Invalid smem load config");
-
-    return {};
-  }
-
-  int getNumPtr() const { return numPtr; }
-
-  // Compute the offset to the matrix this thread(indexed by warpOff and lane)
-  // mapped to.
-  SmallVector<Value> computeLdmatrixMatOffs(Value warpId, Value lane) {
-    // 4x4 matrices
-    Value c = urem(lane, i32_val(8));
-    Value s = udiv(lane, i32_val(8)); // sub-warp-id
-
-    // Decompose s => s_0, s_1, that is the coordinate in 2x2 matrices in a
-    // warp
-    Value s0 = urem(s, i32_val(2));
-    Value s1 = udiv(s, i32_val(2));
-
-    // We use different orders for a and b for better performance.
-    Value kMatArr = kOrder == 1 ? s1 : s0;
-    Value nkMatArr = kOrder == 1 ? s0 : s1;
-
-    // matrix coordinate inside a CTA, the matrix layout is [2x2wpt] for A and
-    // [2wptx2] for B. e.g. Setting wpt=3, The data layout for A(kOrder=1) is
-    //   |0 0 1 1 2 2| -> 0,1,2 are the warpids
-    //   |0 0 1 1 2 2|
-    //
-    // for B(kOrder=0) is
-    //   |0 0|  -> 0,1,2 are the warpids
-    //   |1 1|
-    //   |2 2|
-    //   |0 0|
-    //   |1 1|
-    //   |2 2|
-    // Note, for each warp, it handles a 2x2 matrices, that is the coordinate
-    // address (s0,s1) annotates.
-
-    Value matOff[2];
-    matOff[kOrder ^ 1] = add(
-        mul(warpId, i32_val(warpOffStride)),   // warp offset
-        mul(nkMatArr, i32_val(matArrStride))); // matrix offset inside a warp
-    matOff[kOrder] = kMatArr;
-
-    // Physical offset (before swizzling)
-    Value cMatOff = matOff[order[0]];
-    Value sMatOff = matOff[order[1]];
-
-    // row offset inside a matrix, each matrix has 8 rows.
-    Value sOffInMat = c;
-
-    SmallVector<Value> offs(numPtr);
-    Value phase = urem(udiv(sOffInMat, i32_val(perPhase)), i32_val(maxPhase));
-    Value sOff = add(sOffInMat, mul(sMatOff, i32_val(sMatShape)));
-    for (int i = 0; i < numPtr; ++i) {
-      Value cMatOffI = add(cMatOff, i32_val(i * pLoadStrideInMat));
-      cMatOffI = xor_(cMatOffI, phase);
-      offs[i] = add(mul(cMatOffI, i32_val(cMatShape)),
-                    mul(sOff, i32_val(sTileStride)));
+    // This needs to be ordered the same way that
+    // ldmatrix.x4 would order it
+    // TODO: this needs to be refactor so we don't
+    // implicitly depends on how emitOffsetsForMMAV2
+    // is implemented
+    SmallVector<Value> reorderedVals;
+    for (unsigned i = 0; i < vecVals.size(); i += 4) {
+      reorderedVals.push_back(vecVals[i]);
+      reorderedVals.push_back(vecVals[i + 2]);
+      reorderedVals.push_back(vecVals[i + 1]);
+      reorderedVals.push_back(vecVals[i + 3]);
     }
 
-    return offs;
+    // return composeValuesToDotOperandLayoutStruct(ha, numRepM, numRepK);
+
+    Type structTy = LLVM::LLVMStructType::getLiteral(this->getContext(), types);
+    Value view = getStructFromElements(loc, reorderedVals, rewriter, structTy);
+    rewriter.replaceOp(op, view);
+    return success();
   }
-
-  // Compute 32-bit matrix offsets.
-  SmallVector<Value> computeB32MatOffs(Value warpOff, Value lane) {
-    assert(needTrans && "Only used in transpose mode.");
-    // Load tf32 matrices with lds32
-    Value cOffInMat = udiv(lane, i32_val(4));
-    Value sOffInMat = urem(lane, i32_val(4));
-
-    Value phase = urem(udiv(sOffInMat, i32_val(perPhase)), i32_val(maxPhase));
-    SmallVector<Value> offs(numPtr);
-
-    for (int mat = 0; mat < 4; ++mat) { // Load 4 mats each time
-      int kMatArrInt = kOrder == 1 ? mat / 2 : mat % 2;
-      int nkMatArrInt = kOrder == 1 ? mat % 2 : mat / 2;
-      if (kMatArrInt > 0) // we don't need pointers for k
-        continue;
-      Value kMatArr = i32_val(kMatArrInt);
-      Value nkMatArr = i32_val(nkMatArrInt);
-
-      Value cMatOff = add(mul(warpOff, i32_val(warpOffStride)),
-                          mul(nkMatArr, i32_val(matArrStride)));
-      Value sMatOff = kMatArr;
-      Value sOff = add(sOffInMat, mul(sMatOff, i32_val(sMatShape)));
-      // FIXME: (kOrder == 1?) is really dirty hack
-      for (int i = 0; i < numPtr / 2; ++i) {
-        Value cMatOffI =
-            add(cMatOff, i32_val(i * pLoadStrideInMat * (kOrder == 1 ? 1 : 2)));
-        cMatOffI = xor_(cMatOffI, phase);
-        Value cOff = add(cOffInMat, mul(cMatOffI, i32_val(cMatShape)));
-        cOff = urem(cOff, i32_val(tileShape[order[0]]));
-        sOff = urem(sOff, i32_val(tileShape[order[1]]));
-        offs[2 * i + nkMatArrInt] = add(cOff, mul(sOff, i32_val(sTileStride)));
-      }
-    }
-    return offs;
-  }
-
-  // compute 8-bit matrix offset.
-  SmallVector<Value> computeB8MatOffs(Value warpOff, Value lane) {
-    assert(needTrans && "Only used in transpose mode.");
-    Value cOffInMat = udiv(lane, i32_val(4));
-    Value sOffInMat =
-        mul(urem(lane, i32_val(4)), i32_val(4)); // each thread load 4 cols
-
-    SmallVector<Value> offs(numPtr);
-    for (int mat = 0; mat < 4; ++mat) {
-      int kMatArrInt = kOrder == 1 ? mat / 2 : mat % 2;
-      int nkMatArrInt = kOrder == 1 ? mat % 2 : mat / 2;
-      if (kMatArrInt > 0) // we don't need pointers for k
-        continue;
-      Value kMatArr = i32_val(kMatArrInt);
-      Value nkMatArr = i32_val(nkMatArrInt);
-
-      Value cMatOff = add(mul(warpOff, i32_val(warpOffStride)),
-                          mul(nkMatArr, i32_val(matArrStride)));
-      Value sMatOff = kMatArr;
-
-      for (int loadx4Off = 0; loadx4Off < numPtr / 8; ++loadx4Off) {
-        for (int elemOff = 0; elemOff < 4; ++elemOff) {
-          int ptrOff = loadx4Off * 8 + nkMatArrInt * 4 + elemOff;
-          Value cMatOffI = add(cMatOff, i32_val(loadx4Off * pLoadStrideInMat *
-                                                (kOrder == 1 ? 1 : 2)));
-          Value sOffInMatElem = add(sOffInMat, i32_val(elemOff));
-
-          // disable swizzling ...
-
-          Value cOff = add(cOffInMat, mul(cMatOffI, i32_val(cMatShape)));
-          Value sOff = add(sOffInMatElem, mul(sMatOff, i32_val(sMatShape)));
-          // To prevent out-of-bound access when tile is too small.
-          cOff = urem(cOff, i32_val(tileShape[order[0]]));
-          sOff = urem(sOff, i32_val(tileShape[order[1]]));
-          offs[ptrOff] = add(cOff, mul(sOff, i32_val(sTileStride)));
-        }
-      }
-    }
-    return offs;
-  }
-
-  // Load 4 matrices and returns 4 vec<2> elements.
-  std::tuple<Value, Value, Value, Value>
-  loadX4(int mat0, int mat1, ArrayRef<Value> offs, ArrayRef<Value> ptrs,
-         Type ldmatrixRetTy, Type shemPtrTy) const {
-    assert(mat0 % 2 == 0 && mat1 % 2 == 0 &&
-           "smem matrix load must be aligned");
-    int matIdx[2] = {mat0, mat1};
-
-    int ptrIdx{-1};
-
-    if (canUseLdmatrix)
-      ptrIdx = matIdx[order[0]] / (instrShape[order[0]] / matShape[order[0]]);
-    else if (elemBytes == 4 && needTrans)
-      ptrIdx = matIdx[order[0]];
-    else if (elemBytes == 1 && needTrans)
-      ptrIdx = matIdx[order[0]] * 4;
-    else
-      llvm::report_fatal_error("unsupported mma type found");
-
-    // The main difference with the original triton code is we removed the
-    // prefetch-related logic here for the upstream optimizer phase should
-    // take care with it, and that is transparent in dot conversion.
-    auto getPtr = [&](int idx) { return ptrs[idx]; };
-
-    Value ptr = getPtr(ptrIdx);
-
-    if (canUseLdmatrix) {
-      int sOffset =
-          matIdx[order[1]] * sMatStride * sMatShape * sTileStride * elemBytes;
-      PTXBuilder builder;
-
-      // ldmatrix.m8n8.x4 returns 4x2xfp16(that is 4xb32) elements for a
-      // thread.
-      auto resArgs = builder.newListOperand(4, "=r");
-      auto addrArg = builder.newAddrOperand(ptr, "r", sOffset);
-
-      auto ldmatrix = builder.create("ldmatrix.sync.aligned.m8n8.x4")
-                          ->o("trans", needTrans /*predicate*/)
-                          .o("shared.b16");
-      ldmatrix(resArgs, addrArg);
-
-      // The result type is 4xi32, each i32 is composed of 2xf16
-      // elements(adjacent two columns in a row)
-      Value resV4 = builder.launch(rewriter, loc, ldmatrixRetTy);
-
-      auto getIntAttr = [&](int v) {
-        return ArrayAttr::get(ctx, {IntegerAttr::get(i32_ty, v)});
-      };
-
-      Type fp16x2Ty = vec_ty(type::f16Ty(ctx), 2);
-
-      return {extract_val(fp16x2Ty, resV4, getIntAttr(0)),
-              extract_val(fp16x2Ty, resV4, getIntAttr(1)),
-              extract_val(fp16x2Ty, resV4, getIntAttr(2)),
-              extract_val(fp16x2Ty, resV4, getIntAttr(3))};
-    } else if (elemBytes == 4 &&
-               needTrans) { // Use lds.32 to load tf32 matrices
-      Value ptr2 = getPtr(ptrIdx + 1);
-      assert(sMatStride == 1);
-      int sOffsetElem =
-          matIdx[order[1]] * (sMatStride * sMatShape) * sTileStride;
-      int sOffsetArrElem = 1 * (sMatStride * sMatShape) * sTileStride;
-
-      Value elems[4];
-      Type elemTy = type::f32Ty(ctx);
-      if (kOrder == 1) {
-        elems[0] = load(gep(elemTy, ptr, i32_val(sOffsetElem)));
-        elems[1] = load(gep(elemTy, ptr2, i32_val(sOffsetElem)));
-        elems[2] =
-            load(gep(elemTy, ptr, i32_val(sOffsetElem + sOffsetArrElem)));
-        elems[3] =
-            load(gep(elemTy, ptr2, i32_val(sOffsetElem + sOffsetArrElem)));
-      } else {
-        elems[0] = load(gep(elemTy, ptr, i32_val(sOffsetElem)));
-        elems[2] = load(gep(elemTy, ptr2, i32_val(sOffsetElem)));
-        elems[1] =
-            load(gep(elemTy, ptr, i32_val(sOffsetElem + sOffsetArrElem)));
-        elems[3] =
-            load(gep(elemTy, ptr2, i32_val(sOffsetElem + sOffsetArrElem)));
-      }
-
-      return {elems[0], elems[1], elems[2], elems[3]};
-    } else if (elemBytes == 1 && needTrans) {
-      std::array<std::array<Value, 4>, 2> ptrs;
-      ptrs[0] = {
-          getPtr(ptrIdx),
-          getPtr(ptrIdx + 1),
-          getPtr(ptrIdx + 2),
-          getPtr(ptrIdx + 3),
-      };
-
-      ptrs[1] = {
-          getPtr(ptrIdx + 4),
-          getPtr(ptrIdx + 5),
-          getPtr(ptrIdx + 6),
-          getPtr(ptrIdx + 7),
-      };
-
-      assert(sMatStride == 1);
-      int sOffsetElem =
-          matIdx[order[1]] * (sMatStride * sMatShape) * sTileStride;
-      int sOffsetArrElem = 1 * (sMatStride * sMatShape) * sTileStride;
-
-      std::array<Value, 4> i8v4Elems;
-      std::array<Value, 4> i32Elems;
-      i8v4Elems.fill(
-          rewriter.create<LLVM::UndefOp>(loc, vec_ty(type::i8Ty(ctx), 4)));
-
-      Value i8Elems[4][4];
-      Type elemTy = type::i8Ty(ctx);
-      if (kOrder == 1) {
-        Value offset = i32_val(sOffsetElem);
-
-        for (int i = 0; i < 2; ++i)
-          for (int j = 0; j < 4; ++j)
-            i8Elems[i][j] = load(gep(elemTy, ptrs[i][j], offset));
-
-        offset = i32_val(sOffsetElem + sOffsetArrElem);
-        for (int i = 2; i < 4; ++i)
-          for (int j = 0; j < 4; ++j)
-            i8Elems[i][j] = load(gep(elemTy, ptrs[i - 2][j], offset));
-
-        for (int m = 0; m < 4; ++m) {
-          for (int e = 0; e < 4; ++e)
-            i8v4Elems[m] = insert_element(i8v4Elems[m].getType(), i8v4Elems[m],
-                                          i8Elems[m][e], i32_val(e));
-          i32Elems[m] = bitcast(i8v4Elems[m], i32_ty);
-        }
-      } else { // k first
-        Value offset = i32_val(sOffsetElem);
-        for (int j = 0; j < 4; ++j)
-          i8Elems[0][j] = load(gep(elemTy, ptrs[0][j], offset));
-        for (int j = 0; j < 4; ++j)
-          i8Elems[2][j] = load(gep(elemTy, ptrs[1][j], offset));
-        offset = i32_val(sOffsetElem + sOffsetArrElem);
-        for (int j = 0; j < 4; ++j)
-          i8Elems[1][j] = load(gep(elemTy, ptrs[0][j], offset));
-        for (int j = 0; j < 4; ++j)
-          i8Elems[3][j] = load(gep(elemTy, ptrs[1][j], offset));
-
-        for (int m = 0; m < 4; ++m) {
-          for (int e = 0; e < 4; ++e)
-            i8v4Elems[m] = insert_element(i8v4Elems[m].getType(), i8v4Elems[m],
-                                          i8Elems[m][e], i32_val(e));
-          i32Elems[m] = bitcast(i8v4Elems[m], i32_ty);
-        }
-      }
-
-      return {i32Elems[0], i32Elems[1], i32Elems[2], i32Elems[3]};
-    }
-
-    assert(false && "Invalid smem load");
-    return {Value{}, Value{}, Value{}, Value{}};
-  }
-
-private:
-  SmallVector<uint32_t> order;
-  int kOrder;
-  SmallVector<int64_t> tileShape;
-  SmallVector<int> instrShape;
-  SmallVector<int> matShape;
-  int perPhase;
-  int maxPhase;
-  int elemBytes;
-  ConversionPatternRewriter &rewriter;
-  const Location &loc;
-  MLIRContext *ctx{};
-
-  int cMatShape;
-  int sMatShape;
-
-  int cTileStride;
-  int sTileStride;
-
-  bool needTrans;
-  bool canUseLdmatrix;
-
-  int numPtr;
-
-  int pLoadStrideInMat;
-  int sMatStride;
-
-  int matArrStride;
-  int warpOffStride;
-};
-
-bool isSplatLike(Value value) {
-  if (auto constv = dyn_cast<arith::ConstantOp>(value.getDefiningOp()))
-    if (auto attr = constv.getValue().dyn_cast<SplatElementsAttr>())
-      return attr.isSplat();
-  return false;
+  return failure();
 }
 
-struct DotOpConversion : public ConvertTritonGPUOpToLLVMPattern<triton::DotOp> {
-  enum class TensorCoreType : uint8_t {
-    // floating-point tensor core instr
-    FP32_FP16_FP16_FP32 = 0, // default
-    FP32_BF16_BF16_FP32,
-    FP32_TF32_TF32_FP32,
-    // integer tensor core instr
-    INT32_INT1_INT1_INT32, // Not implemented
-    INT32_INT4_INT4_INT32, // Not implemented
-    INT32_INT8_INT8_INT32, // Not implemented
-    //
-    NOT_APPLICABLE,
-  };
+struct InsertSliceOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<tensor::InsertSliceOp> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      tensor::InsertSliceOp>::ConvertTritonGPUOpToLLVMPattern;
 
+  LogicalResult
+  matchAndRewrite(tensor::InsertSliceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // %dst = insert_slice %src into %dst[%offsets]
+    Location loc = op->getLoc();
+    Value dst = op.dest();
+    Value src = op.source();
+    Value res = op.result();
+    assert(allocation->getBufferId(res) == Allocation::InvalidBufferId &&
+           "Only support in-place insert_slice for now");
+
+    auto srcTy = src.getType().dyn_cast<RankedTensorType>();
+    auto srcLayout = srcTy.getEncoding().dyn_cast<BlockedEncodingAttr>();
+    auto srcShape = srcTy.getShape();
+    assert(srcLayout && "Unexpected srcLayout in InsertSliceOpConversion");
+
+    auto dstTy = dst.getType().dyn_cast<RankedTensorType>();
+    auto dstLayout = dstTy.getEncoding().dyn_cast<SharedEncodingAttr>();
+    auto llDst = adaptor.dest();
+    assert(dstLayout && "Unexpected dstLayout in InsertSliceOpConversion");
+    assert(op.hasUnitStride() &&
+           "Only unit stride supported by InsertSliceOpConversion");
+
+    // newBase = base + offset
+    // Triton support either static and dynamic offsets
+    auto smemObj = getSharedMemoryObjectFromStruct(loc, llDst, rewriter);
+    SmallVector<Value, 4> offsets;
+    SmallVector<Value, 4> srcStrides;
+    auto mixedOffsets = op.getMixedOffsets();
+    for (auto i = 0; i < mixedOffsets.size(); ++i) {
+      if (op.isDynamicOffset(i)) {
+        offsets.emplace_back(adaptor.offsets()[i]);
+      } else {
+        offsets.emplace_back(i32_val(op.getStaticOffset(i)));
+      }
+      // Like insert_slice_async, we only support slice from one dimension,
+      // which has a slice size of 1
+      if (op.getStaticSize(i) != 1) {
+        srcStrides.emplace_back(smemObj.strides[i]);
+      }
+    }
+
+    // Compute the offset based on the original strides of the shared memory
+    // object
+    auto offset = dot(rewriter, loc, offsets, smemObj.strides);
+    auto llvmElemTy = getTypeConverter()->convertType(dstTy.getElementType());
+    auto elemPtrTy = ptr_ty(llvmElemTy, 3);
+    auto smemBase = gep(elemPtrTy, smemObj.base, offset);
+
+    auto llSrc = adaptor.source();
+    auto srcIndices =
+        emitBaseIndexForBlockedLayout(loc, rewriter, srcLayout, srcShape);
+    ConvertLayoutOpConversion::storeBlockedToShared(src, llSrc, srcStrides,
+                                                    srcIndices, dst, smemBase,
+                                                    elemPtrTy, loc, rewriter);
+    // Barrier is not necessary.
+    // The membar pass knows that it writes to shared memory and will handle it
+    // properly.
+    rewriter.replaceOp(op, llDst);
+    return success();
+  }
+};
+
+/// ====================== dot codegen begin ==========================
+
+struct DotOpConversion : public ConvertTritonGPUOpToLLVMPattern<triton::DotOp> {
   using ConvertTritonGPUOpToLLVMPattern<
       triton::DotOp>::ConvertTritonGPUOpToLLVMPattern;
 
@@ -2799,6 +3327,7 @@ struct DotOpConversion : public ConvertTritonGPUOpToLLVMPattern<triton::DotOp> {
     size_t reduceAxis = 1;
     unsigned K = AShape[reduceAxis];
     bool isOuter = K == 1;
+
     bool isMMA = D.getType()
                      .cast<RankedTensorType>()
                      .getEncoding()
@@ -2810,21 +3339,67 @@ struct DotOpConversion : public ConvertTritonGPUOpToLLVMPattern<triton::DotOp> {
                       .getEncoding()
                       .cast<MmaEncodingAttr>();
 
-    if (!isOuter && isMMA) {
-      if (mmaLayout.getVersion() == 1)
+    bool isHMMA = isDotHMMA(op);
+    if (!isOuter && isMMA && isHMMA) {
+      if (mmaLayout.isVolta())
         return convertMMA884(op, adaptor, rewriter);
-      if (mmaLayout.getVersion() == 2)
+      if (mmaLayout.isAmpere())
         return convertMMA16816(op, adaptor, rewriter);
+
       llvm::report_fatal_error(
           "Unsupported MMA kind found when converting DotOp to LLVM.");
     }
 
     if (op.getType().cast<RankedTensorType>().getElementType().isF32() &&
-        A.getType().cast<RankedTensorType>().getElementType().isF32())
+        A.getType().cast<RankedTensorType>().getElementType().isF32() &&
+        !op.allowTF32())
       return convertFMADot(op, adaptor, rewriter);
 
     llvm::report_fatal_error(
         "Unsupported DotOp found when converting TritonGPU to LLVM.");
+  }
+
+  // Tell whether a DotOp support HMMA.
+  // This is port from the master branch, the original logic is retained.
+  static bool isDotHMMA(DotOp op) {
+    auto a = op.a();
+    auto b = op.b();
+    auto c = op.c();
+    auto d = op.getResult();
+    auto aTensorTy = a.getType().cast<RankedTensorType>();
+    auto bTensorTy = b.getType().cast<RankedTensorType>();
+    auto cTensorTy = c.getType().cast<RankedTensorType>();
+    auto dTensorTy = d.getType().cast<RankedTensorType>();
+
+    if (!dTensorTy.getEncoding().isa<MmaEncodingAttr>())
+      return false;
+
+    auto mmaLayout = dTensorTy.getEncoding().cast<MmaEncodingAttr>();
+    auto aElemTy = aTensorTy.getElementType();
+    auto bElemTy = bTensorTy.getElementType();
+
+    assert((mmaLayout.isVolta() || mmaLayout.isAmpere()) &&
+           "Unexpected MMA layout version found");
+    // Refer to mma section for the data type supported by Volta and Hopper
+    // Tensor Core in
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-884-f16
+    return (aElemTy.isF16() && bElemTy.isF16()) ||
+           (aElemTy.isBF16() && bElemTy.isBF16()) ||
+           (aElemTy.isF32() && bElemTy.isF32() && op.allowTF32() &&
+            mmaLayout.getVersionMajor() >= 2) ||
+           (aElemTy.isInteger(8) && bElemTy.isInteger(8) &&
+            mmaLayout.getVersionMajor() >= 2);
+  }
+
+  // Tell whether a DotOp support HMMA by the operand type(either $a or $b).
+  // We cannot get both the operand types(in TypeConverter), here we assume the
+  // types of both the operands are identical here.
+  // TODO[Superjomn]: Find a better way to implement it.
+  static bool isDotHMMA(TensorType operand, int mmaVersion) {
+    auto elemTy = operand.getElementType();
+    return elemTy.isF16() || elemTy.isBF16() ||
+           (elemTy.isF32() && mmaVersion >= 2) ||
+           (elemTy.isInteger(8) && mmaVersion >= 2);
   }
 
 private:
@@ -2836,762 +3411,67 @@ private:
                               ConversionPatternRewriter &rewriter) const;
 
   LogicalResult convertFMADot(triton::DotOp op, OpAdaptor adaptor,
-                              ConversionPatternRewriter &rewriter) const {
-    assert(false && "Not implemented yet.");
-    return failure();
-  }
+                              ConversionPatternRewriter &rewriter) const;
 };
 
-// Helper for conversion of DotOp with mma<version=1>, that is sm<80
-struct DotOpMmaV1ConversionHelper {
-  MmaEncodingAttr mmaLayout;
-  ArrayRef<unsigned> wpt;
+Value ConvertLayoutOpConversion::lowerSharedToDotOperandMMA(
+    triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter, const MmaEncodingAttr &mmaLayout,
+    const DotOperandEncodingAttr &dotOperandLayout, bool isOuter) const {
+  auto loc = op.getLoc();
+  Value src = op.src();
+  Value dst = op.result();
+  auto dstTensorTy = dst.getType().cast<RankedTensorType>();
+  bool isHMMA =
+      DotOpConversion::isDotHMMA(dstTensorTy, mmaLayout.getVersionMajor());
 
-  using ValueTable = std::map<std::pair<int, int>, std::pair<Value, Value>>;
+  auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.src(), rewriter);
+  Value res;
 
-  explicit DotOpMmaV1ConversionHelper(MmaEncodingAttr mmaLayout)
-      : mmaLayout(mmaLayout), wpt(mmaLayout.getWarpsPerCTA()) {}
+  if (!isOuter && mmaLayout.isAmpere() && isHMMA) { // tensor core v2
+    MMA16816ConversionHelper mmaHelper(src.getType(), mmaLayout,
+                                       getThreadId(rewriter, loc), rewriter,
+                                       getTypeConverter(), op.getLoc());
 
-  int getRepM(int M) const {
-    return std::max<int>(M / (wpt[0] * instrShape[0]), 1);
-  }
-  int getRepN(int N) const {
-    return std::max<int>(N / (wpt[1] * instrShape[1]), 1);
-  }
-  int getRepK(int K) const { return std::max<int>(K / instrShape[2], 1); }
-
-  static ArrayRef<unsigned> getMmaInstrShape() { return instrShape; }
-
-  static Type getMmaRetType(TensorType operand) {
-    auto *ctx = operand.getContext();
-    Type fp32Ty = type::f32Ty(ctx);
-    // f16*f16+f32->f32
-    return struct_ty(SmallVector<Type>{8, fp32Ty});
-  }
-
-  // number of fp16x2 elements for $a.
-  int numElemsPerThreadA(RankedTensorType tensorTy) const {
-    auto shape = tensorTy.getShape();
-    auto order = getOrder();
-
-    bool isARow = order[0] != 0;
-    bool isAVec4 = !isARow && shape[order[0]] <= 16; // fp16*4 = 16bytes
-    int packSize0 = (isARow || isAVec4) ? 1 : 2;
-
-    SmallVector<int> fpw({2, 2, 1});
-    int repM = 2 * packSize0;
-    int repK = 1;
-    int spwM = fpw[0] * 4 * repM;
-    SmallVector<int> rep({repM, 0, repK}); // pad N with 0
-    SmallVector<int> spw({spwM, 0, 1});    // pad N with 0
-
-    int NK = shape[1];
-    unsigned numM = rep[0] * shape[0] / (spw[0] * wpt[0]);
-
-    // NOTE We cound't get the vec from the shared layout.
-    // int vecA = sharedLayout.getVec();
-    // TODO[Superjomn]: Consider the case when vecA > 4
-    bool vecGt4 = false;
-    int elemsPerLd = vecGt4 ? 4 : 2;
-    return (numM / 2) * (NK / 4) * elemsPerLd;
-  }
-
-  // number of fp16x2 elements for $b.
-  int numElemsPerThreadB(RankedTensorType tensorTy) const {
-    auto shape = tensorTy.getShape();
-    auto order = getOrder();
-    bool isBRow = order[0] != 0;
-    bool isBVec4 = isBRow && shape[order[0]] <= 16;
-    int packSize1 = (isBRow && !isBVec4) ? 2 : 1;
-    SmallVector<int> fpw({2, 2, 1});
-    SmallVector<int> rep({0, 2 * packSize1, 1});       // pad M with 0
-    SmallVector<int> spw({0, fpw[1] * 4 * rep[1], 1}); // pad M with 0
-    // NOTE We cound't get the vec from the shared layout.
-    // int vecB = sharedLayout.getVec();
-    // TODO[Superjomn]: Consider the case when vecA > 4
-    bool vecGt4 = false;
-    int elemsPerLd = vecGt4 ? 4 : 2;
-    int NK = shape[0];
-
-    unsigned numN = rep[1] * shape[1] / (spw[1] * wpt[0]);
-    return (numN / 2) * (NK / 4) * elemsPerLd;
-  }
-
-  // Loading $a from smem to registers, returns a LLVM::Struct.
-  Value loadA(Value A, Value llA, Value thread, Value smem, Location loc,
-              ConversionPatternRewriter &rewriter) const;
-
-  // Loading $b from smem to registers, returns a LLVM::Struct.
-  Value loadB(Value B, Value llB, Value thread, Value smem, Location loc,
-              ConversionPatternRewriter &rewriter) const;
-
-  // Loading $c to registers, returns a LLVM::Struct.
-  Value loadC(Value C, Value llC, ConversionPatternRewriter &rewriter) const;
-
-  static ArrayRef<unsigned> getOrder() { return mmaOrder; }
-
-  // Compute the offset of the matrix to load.
-  // Returns offsetAM, offsetAK, offsetBN, offsetBK.
-  // NOTE, the information M(from $a) and N(from $b) couldn't be retrieved at
-  // the same time in the usage in convert_layout[shared->dot_op], we leave the
-  // noexist info to be 0 and only use the desired argument from the composed
-  // result. In this way we want to retain the original code structure in
-  // convert_mma884 method for easier debugging.
-  std::tuple<Value, Value, Value, Value>
-  computeOffsets(Value threadId, bool isARow, bool isBRow, ArrayRef<int> fpw,
-                 ArrayRef<int> spw, ArrayRef<int> rep,
-                 ConversionPatternRewriter &rewriter, Location loc) const;
-
-  // Extract values belong to $a or $b from a LLVMStruct, the shape is n0xn1.
-  ValueTable extractLoadedOperand(Value llStruct, int n0, int n1,
-                                  ConversionPatternRewriter &rewriter) const;
-
-private:
-  static constexpr unsigned instrShape[] = {16, 16, 4};
-  static constexpr unsigned mmaOrder[] = {0, 1};
-};
-
-// Helper for conversion of DotOp with mma<version=2>, that is sm>=80
-struct DotOpMmaV2ConversionHelper {
-  using TensorCoreType = DotOpConversion::TensorCoreType;
-
-  MmaEncodingAttr mmaLayout;
-  MLIRContext *ctx{};
-
-  explicit DotOpMmaV2ConversionHelper(MmaEncodingAttr mmaLayout)
-      : mmaLayout(mmaLayout) {
-    ctx = mmaLayout.getContext();
-  }
-
-  void deduceMmaType(DotOp op) const { mmaType = getMmaType(op); }
-  void deduceMmaType(Type operandTy) const {
-    mmaType = getTensorCoreTypeFromOperand(operandTy);
-  }
-
-  // Get the M and N of mat instruction shape.
-  static std::tuple<int, int> getMatShapeMN() {
-    // According to DotOpMmaV2ConversionHelper::mmaMatShape, all the matrix
-    // shape's M,N are {8,8}
-    return {8, 8};
-  }
-
-  // Get the M and N of mma instruction shape.
-  static std::tuple<int, int> getInstrShapeMN() {
-    // According to DotOpConversionHelper::mmaInstrShape, all the M,N are
-    // {16,8}
-    return {16, 8};
-  }
-
-  static std::tuple<int, int> getRepMN(const RankedTensorType &tensorTy) {
-    auto mmaLayout = tensorTy.getEncoding().cast<MmaEncodingAttr>();
-    auto wpt = mmaLayout.getWarpsPerCTA();
-
-    int M = tensorTy.getShape()[0];
-    int N = tensorTy.getShape()[1];
-    auto [instrM, instrN] = getInstrShapeMN();
-    int repM = std::max<int>(M / (wpt[0] * instrM), 1);
-    int repN = std::max<int>(N / (wpt[1] * instrN), 1);
-    return {repM, repN};
-  }
-
-  Type getShemPtrTy() const {
-    switch (mmaType) {
-    case TensorCoreType::FP32_FP16_FP16_FP32:
-      return ptr_ty(type::f16Ty(ctx), 3);
-    case TensorCoreType::FP32_BF16_BF16_FP32:
-      return ptr_ty(type::bf16Ty(ctx), 3);
-    case TensorCoreType::FP32_TF32_TF32_FP32:
-      return ptr_ty(type::f32Ty(ctx), 3);
-    case TensorCoreType::INT32_INT8_INT8_INT32:
-      return ptr_ty(type::i8Ty(ctx), 3);
-    default:
-      llvm::report_fatal_error("mma16816 data type not supported");
+    if (dotOperandLayout.getOpIdx() == 0) {
+      // operand $a
+      res = mmaHelper.loadA(src, smemObj);
+    } else if (dotOperandLayout.getOpIdx() == 1) {
+      // operand $b
+      res = mmaHelper.loadB(src, smemObj);
     }
-    return Type{};
-  }
+  } else if (!isOuter && mmaLayout.isVolta() && isHMMA) { // tensor core v1
+    DotOpMmaV1ConversionHelper helper(mmaLayout);
+    bool isMMAv1Row =
+        dotOperandLayout.getIsMMAv1Row().cast<BoolAttr>().getValue();
+    auto srcSharedLayout = src.getType()
+                               .cast<RankedTensorType>()
+                               .getEncoding()
+                               .cast<SharedEncodingAttr>();
 
-  // The type of a matrix that loaded by either a ldmatrix or composed lds.
-  Type getMatType() const {
-    Type fp32Ty = type::f32Ty(ctx);
-    Type fp16x2Ty = vec_ty(type::f16Ty(ctx), 2);
-    Type bf16x2Ty = vec_ty(type::bf16Ty(ctx), 2);
-    // floating point types
-    Type fp16x2Pack4Ty =
-        LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(4, fp16x2Ty));
-    Type bf16x2Pack4Ty =
-        LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(4, bf16x2Ty));
-    Type fp32Pack4Ty =
-        LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(4, fp32Ty));
-    // integer types
-    Type i8x4Ty = vec_ty(type::i8Ty(ctx), 4);
-    Type i8x4Pack4Ty =
-        LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(4, i8x4Ty));
-
-    switch (mmaType) {
-    case TensorCoreType::FP32_FP16_FP16_FP32:
-      return fp16x2Pack4Ty;
-    case TensorCoreType::FP32_BF16_BF16_FP32:
-      return bf16x2Pack4Ty;
-    case TensorCoreType::FP32_TF32_TF32_FP32:
-      return fp32Pack4Ty;
-    case TensorCoreType::INT32_INT8_INT8_INT32:
-      return i8x4Pack4Ty;
-    default:
-      llvm::report_fatal_error("Unsupported mma type found");
+    // Can only convert [1, 0] to row or [0, 1] to col for now
+    if ((srcSharedLayout.getOrder()[0] == 1 && !isMMAv1Row) ||
+        (srcSharedLayout.getOrder()[0] == 0 && isMMAv1Row)) {
+      llvm::errs() << "Unsupported Shared -> DotOperand[MMAv1] conversion\n";
+      return Value();
     }
 
-    return Type{};
-  }
-
-  Type getLoadElemTy() {
-    switch (mmaType) {
-    case TensorCoreType::FP32_FP16_FP16_FP32:
-      return vec_ty(type::f16Ty(ctx), 2);
-    case TensorCoreType::FP32_BF16_BF16_FP32:
-      return vec_ty(type::bf16Ty(ctx), 2);
-    case TensorCoreType::FP32_TF32_TF32_FP32:
-      return type::f32Ty(ctx);
-    case TensorCoreType::INT32_INT8_INT8_INT32:
-      return type::i32Ty(ctx);
-    default:
-      llvm::report_fatal_error("Unsupported mma type found");
+    if (dotOperandLayout.getOpIdx() == 0) { // operand $a
+      // TODO[Superjomn]: transA is not available here.
+      bool transA = false;
+      res = helper.loadA(src, transA, smemObj, getThreadId(rewriter, loc), loc,
+                         rewriter);
+    } else if (dotOperandLayout.getOpIdx() == 1) { // operand $b
+      // TODO[Superjomn]: transB is not available here.
+      bool transB = false;
+      res = helper.loadB(src, transB, smemObj, getThreadId(rewriter, loc), loc,
+                         rewriter);
     }
-
-    return Type{};
+  } else {
+    assert(false && "Unsupported mma layout found");
   }
-
-  Type getMmaRetType() const {
-    Type fp32Ty = type::f32Ty(ctx);
-    Type i32Ty = type::i32Ty(ctx);
-    Type fp32x4Ty =
-        LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(4, fp32Ty));
-    Type i32x4Ty =
-        LLVM::LLVMStructType::getLiteral(ctx, SmallVector<Type>(4, i32Ty));
-    switch (mmaType) {
-    case TensorCoreType::FP32_FP16_FP16_FP32:
-      return fp32x4Ty;
-    case TensorCoreType::FP32_BF16_BF16_FP32:
-      return fp32x4Ty;
-    case TensorCoreType::FP32_TF32_TF32_FP32:
-      return fp32x4Ty;
-    case TensorCoreType::INT32_INT8_INT8_INT32:
-      return i32x4Ty;
-    default:
-      llvm::report_fatal_error("Unsupported mma type found");
-    }
-
-    return Type{};
-  }
-
-  ArrayRef<int> getMmaInstrShape() const {
-    assert(mmaType != TensorCoreType::NOT_APPLICABLE &&
-           "Unknown mma type found.");
-    return mmaInstrShape.at(mmaType);
-  }
-
-  static ArrayRef<int> getMmaInstrShape(TensorCoreType tensorCoreType) {
-    assert(tensorCoreType != TensorCoreType::NOT_APPLICABLE &&
-           "Unknown mma type found.");
-    return mmaInstrShape.at(tensorCoreType);
-  }
-
-  ArrayRef<int> getMmaMatShape() const {
-    assert(mmaType != TensorCoreType::NOT_APPLICABLE &&
-           "Unknown mma type found.");
-    return mmaMatShape.at(mmaType);
-  }
-
-  // Deduce the TensorCoreType from either $a or $b's type.
-  static TensorCoreType getTensorCoreTypeFromOperand(Type operandTy) {
-    auto tensorTy = operandTy.cast<RankedTensorType>();
-    auto elemTy = tensorTy.getElementType();
-    if (elemTy.isF16())
-      return TensorCoreType::FP32_FP16_FP16_FP32;
-    if (elemTy.isF32())
-      return TensorCoreType::FP32_TF32_TF32_FP32;
-    if (elemTy.isBF16())
-      return TensorCoreType::FP32_BF16_BF16_FP32;
-    if (elemTy.isInteger(8))
-      return TensorCoreType::INT32_INT8_INT8_INT32;
-    return TensorCoreType::NOT_APPLICABLE;
-  }
-
-  int getVec() const {
-    assert(mmaType != TensorCoreType::NOT_APPLICABLE &&
-           "Unknown mma type found.");
-    return mmaInstrVec.at(mmaType);
-  }
-
-  StringRef getMmaInstr() const {
-    assert(mmaType != TensorCoreType::NOT_APPLICABLE &&
-           "Unknown mma type found.");
-    return mmaInstrPtx.at(mmaType);
-  }
-
-  static TensorCoreType getMmaType(triton::DotOp op) {
-    Value A = op.a();
-    Value B = op.b();
-    auto aTy = A.getType().cast<RankedTensorType>();
-    auto bTy = B.getType().cast<RankedTensorType>();
-    // d = a*b + c
-    auto dTy = op.d().getType().cast<RankedTensorType>();
-
-    if (dTy.getElementType().isF32()) {
-      if (aTy.getElementType().isF16() && bTy.getElementType().isF16())
-        return TensorCoreType::FP32_FP16_FP16_FP32;
-      if (aTy.getElementType().isBF16() && bTy.getElementType().isBF16())
-        return TensorCoreType::FP32_BF16_BF16_FP32;
-      if (aTy.getElementType().isF32() && bTy.getElementType().isF32() &&
-          op.allowTF32())
-        return TensorCoreType::FP32_TF32_TF32_FP32;
-    } else if (dTy.getElementType().isInteger(32)) {
-      if (aTy.getElementType().isInteger(8) &&
-          bTy.getElementType().isInteger(8))
-        return TensorCoreType::INT32_INT8_INT8_INT32;
-    }
-
-    return TensorCoreType::NOT_APPLICABLE;
-  }
-
-private:
-  mutable TensorCoreType mmaType{TensorCoreType::NOT_APPLICABLE};
-
-  // Used on nvidia GPUs mma layout .version == 2
-  // Refer to
-  // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-storage
-  // for more details.
-  inline static const std::map<TensorCoreType, llvm::SmallVector<int>>
-      mmaInstrShape = {
-          {TensorCoreType::FP32_FP16_FP16_FP32, {16, 8, 16}},
-          {TensorCoreType::FP32_BF16_BF16_FP32, {16, 8, 16}},
-          {TensorCoreType::FP32_TF32_TF32_FP32, {16, 8, 8}},
-
-          {TensorCoreType::INT32_INT1_INT1_INT32, {16, 8, 256}},
-          {TensorCoreType::INT32_INT4_INT4_INT32, {16, 8, 64}},
-          {TensorCoreType::INT32_INT8_INT8_INT32, {16, 8, 32}},
-  };
-
-  // shape of matrices loaded by ldmatrix (m-n-k, for mxk & kxn matrices)
-  // Refer to
-  // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix
-  // for more details.
-  inline static const std::map<TensorCoreType, llvm::SmallVector<int>>
-      mmaMatShape = {
-          {TensorCoreType::FP32_FP16_FP16_FP32, {8, 8, 8}},
-          {TensorCoreType::FP32_BF16_BF16_FP32, {8, 8, 8}},
-          {TensorCoreType::FP32_TF32_TF32_FP32, {8, 8, 4}},
-
-          {TensorCoreType::INT32_INT1_INT1_INT32, {8, 8, 64}},
-          {TensorCoreType::INT32_INT4_INT4_INT32, {8, 8, 32}},
-          {TensorCoreType::INT32_INT8_INT8_INT32, {8, 8, 16}},
-  };
-
-  // Supported mma instruction in PTX.
-  // Refer to
-  // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-for-mma
-  // for more details.
-  inline static const std::map<TensorCoreType, std::string> mmaInstrPtx = {
-      {TensorCoreType::FP32_FP16_FP16_FP32,
-       "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"},
-      {TensorCoreType::FP32_BF16_BF16_FP32,
-       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"},
-      {TensorCoreType::FP32_TF32_TF32_FP32,
-       "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32"},
-
-      {TensorCoreType::INT32_INT1_INT1_INT32,
-       "mma.sync.aligned.m16n8k256.row.col.s32.b1.b1.s32.xor.popc"},
-      {TensorCoreType::INT32_INT4_INT4_INT32,
-       "mma.sync.aligned.m16n8k64.row.col.satfinite.s32.s4.s4.s32"},
-      {TensorCoreType::INT32_INT8_INT8_INT32,
-       "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32"},
-  };
-
-  // vector length per ldmatrix (16*8/elelment_size_in_bits)
-  inline static const std::map<TensorCoreType, uint8_t> mmaInstrVec = {
-      {TensorCoreType::FP32_FP16_FP16_FP32, 8},
-      {TensorCoreType::FP32_BF16_BF16_FP32, 8},
-      {TensorCoreType::FP32_TF32_TF32_FP32, 4},
-
-      {TensorCoreType::INT32_INT1_INT1_INT32, 128},
-      {TensorCoreType::INT32_INT4_INT4_INT32, 32},
-      {TensorCoreType::INT32_INT8_INT8_INT32, 16},
-  };
-};
-
-// This class helps to adapt the existing DotOpConversion to the latest
-// DotOpOperand layout design. It decouples the exising implementation to two
-// parts:
-// 1. loading the specific operand matrix(for $a, $b, $c) from smem
-// 2. passing the loaded value and perform the mma codegen
-struct MMA16816ConversionHelper {
-  MmaEncodingAttr mmaLayout;
-  ArrayRef<unsigned int> wpt;
-
-  Value thread, lane, warp, warpMN, warpN, warpM;
-
-  DotOpMmaV2ConversionHelper helper;
-  ConversionPatternRewriter &rewriter;
-  TypeConverter *typeConverter;
-  Location loc;
-  MLIRContext *ctx{};
-
-  using ValueTable = std::map<std::pair<unsigned, unsigned>, Value>;
-
-  MMA16816ConversionHelper(MmaEncodingAttr mmaLayout, Value thread,
-                           ConversionPatternRewriter &rewriter,
-                           TypeConverter *typeConverter, Location loc)
-      : mmaLayout(mmaLayout), thread(thread), helper(mmaLayout),
-        rewriter(rewriter), typeConverter(typeConverter), loc(loc),
-        ctx(mmaLayout.getContext()) {
-    wpt = mmaLayout.getWarpsPerCTA();
-
-    Value _32 = i32_val(32);
-    lane = urem(thread, _32);
-    warp = udiv(thread, _32);
-    warpMN = udiv(warp, i32_val(wpt[0]));
-    warpM = urem(warp, i32_val(wpt[0]));
-    warpN = urem(warpMN, i32_val(wpt[1]));
-  }
-
-  // Get the mmaInstrShape from either $a or $b.
-  std::tuple<int, int, int> getMmaInstrShape(Type operand) const {
-    helper.deduceMmaType(operand);
-    auto mmaInstrShape = helper.getMmaInstrShape();
-    int mmaInstrM = mmaInstrShape[0];
-    int mmaInstrN = mmaInstrShape[1];
-    int mmaInstrK = mmaInstrShape[2];
-    return std::make_tuple(mmaInstrM, mmaInstrN, mmaInstrK);
-  }
-
-  std::tuple<int, int, int> getMmaMatShape(Type operand) const {
-    helper.deduceMmaType(operand);
-    auto matShape = helper.getMmaMatShape();
-    int matShapeM = matShape[0];
-    int matShapeN = matShape[1];
-    int matShapeK = matShape[2];
-    return std::make_tuple(matShapeM, matShapeN, matShapeK);
-  }
-
-  // \param operand is either $a or $b's type.
-  inline int getNumRepM(Type operand, int M) const {
-    return getNumRepM(operand, M, wpt[0]);
-  }
-
-  // \param operand is either $a or $b's type.
-  inline int getNumRepN(Type operand, int N) const {
-    return getNumRepN(operand, N, wpt[1]);
-  }
-
-  // \param operand is either $a or $b's type.
-  inline int getNumRepK(Type operand, int K) const {
-    return getNumRepK_(operand, K);
-  }
-
-  static int getNumRepM(Type operand, int M, int wpt) {
-    auto tensorCoreType =
-        DotOpMmaV2ConversionHelper::getTensorCoreTypeFromOperand(operand);
-    int mmaInstrM =
-        DotOpMmaV2ConversionHelper::getMmaInstrShape(tensorCoreType)[0];
-    return std::max<int>(M / (wpt * mmaInstrM), 1);
-  }
-
-  static int getNumRepN(Type operand, int N, int wpt) {
-    auto tensorCoreType =
-        DotOpMmaV2ConversionHelper::getTensorCoreTypeFromOperand(operand);
-    int mmaInstrN =
-        DotOpMmaV2ConversionHelper::getMmaInstrShape(tensorCoreType)[1];
-    return std::max<int>(N / (wpt * mmaInstrN), 1);
-  }
-
-  static int getNumRepK_(Type operand, int K) {
-    auto tensorCoreType =
-        DotOpMmaV2ConversionHelper::getTensorCoreTypeFromOperand(operand);
-    int mmaInstrK =
-        DotOpMmaV2ConversionHelper::getMmaInstrShape(tensorCoreType)[2];
-    return std::max<int>(K / mmaInstrK, 1);
-  }
-
-  // Get number of elements per thread for $a operand.
-  static size_t getANumElemsPerThread(RankedTensorType operand,
-                                      ArrayRef<unsigned> wpt) {
-    auto shape = operand.getShape();
-    int repM = getNumRepM(operand, shape[0], wpt[0]);
-    int repK = getNumRepK_(operand, shape[1]);
-    return 4 * repM * repK;
-  }
-
-  // Get number of elements per thread for $b operand.
-  static size_t getBNumElemsPerThread(RankedTensorType operand,
-                                      ArrayRef<unsigned> wpt) {
-    auto shape = operand.getShape();
-    int repK = getNumRepK_(operand, shape[0]);
-    int repN = getNumRepN(operand, shape[1], wpt[1]);
-    return 4 * std::max(repN / 2, 1) * repK;
-  }
-
-  // Loading $a from smem to registers, returns a LLVM::Struct.
-  Value loadA(Value tensor, Value llTensor) const {
-    auto aTensorTy = tensor.getType().cast<RankedTensorType>();
-    auto shape = aTensorTy.getShape();
-
-    ValueTable ha;
-    std::function<void(int, int)> loadFn;
-    auto [matShapeM, matShapeN, matShapeK] = getMmaMatShape(aTensorTy);
-    auto [mmaInstrM, mmaInstrN, mmaInstrK] = getMmaInstrShape(aTensorTy);
-    int numRepM = getNumRepM(aTensorTy, shape[0]);
-    int numRepK = getNumRepK(aTensorTy, shape[1]);
-
-    if (aTensorTy.getEncoding().isa<SharedEncodingAttr>()) {
-      // load from smem
-      loadFn = getLoadMatrixFn(
-          tensor, llTensor, mmaLayout, mmaLayout.getWarpsPerCTA()[0] /*wpt*/,
-          1 /*kOrder*/, {mmaInstrM, mmaInstrK} /*instrShpae*/,
-          {matShapeM, matShapeK} /*matShape*/, warpM /*warpId*/, ha /*vals*/);
-    } else if (aTensorTy.getEncoding().isa<BlockedEncodingAttr>()) {
-      // load from registers, used in gemm fuse
-      // TODO(Superjomn) Port the logic.
-      assert(false && "Loading A from register is not supported yet.");
-    } else {
-      assert(false && "A's layout is not supported.");
-    }
-
-    // step1. Perform loading.
-    for (int m = 0; m < numRepM; ++m)
-      for (int k = 0; k < numRepK; ++k)
-        loadFn(2 * m, 2 * k);
-
-    // step2. Format the values to LLVM::Struct to passing to mma codegen.
-    Value result = composeValuesToDotOperandLayoutStruct(ha, numRepM, numRepK);
-    return result;
-  }
-
-  // Loading $b from smem to registers, returns a LLVM::Struct.
-  Value loadB(Value tensor, Value llTensor) {
-    ValueTable hb;
-    auto tensorTy = tensor.getType().cast<RankedTensorType>();
-    auto shape = tensorTy.getShape();
-    auto [matShapeM, matShapeN, matShapeK] = getMmaMatShape(tensorTy);
-    auto [mmaInstrM, mmaInstrN, mmaInstrK] = getMmaInstrShape(tensorTy);
-    int numRepK = getNumRepK(tensorTy, shape[0]);
-    int numRepN = getNumRepN(tensorTy, shape[1]);
-
-    auto loadFn = getLoadMatrixFn(
-        tensor, llTensor, mmaLayout, mmaLayout.getWarpsPerCTA()[1] /*wpt*/,
-        0 /*kOrder*/, {mmaInstrK, mmaInstrN} /*instrShpae*/,
-        {matShapeK, matShapeN} /*matShape*/, warpN /*warpId*/, hb /*vals*/);
-
-    for (int n = 0; n < std::max(numRepN / 2, 1); ++n) {
-      for (int k = 0; k < numRepK; ++k)
-        loadFn(2 * n, 2 * k);
-    }
-
-    Value result = composeValuesToDotOperandLayoutStruct(
-        hb, std::max(numRepN / 2, 1), numRepK);
-    return result;
-  }
-
-  // Loading $c to registers, returns a Value.
-  Value loadC(Value tensor, Value llTensor) const {
-    auto tensorTy = tensor.getType().cast<RankedTensorType>();
-    auto [repM, repN] = DotOpMmaV2ConversionHelper::getRepMN(tensorTy);
-    size_t fcSize = 4 * repM * repN;
-
-    assert(tensorTy.getEncoding().isa<MmaEncodingAttr>() &&
-           "Currently, we only support $c with a mma layout.");
-    // Load a normal C tensor with mma layout, that should be a
-    // LLVM::struct with fcSize elements.
-    auto structTy = llTensor.getType().cast<LLVM::LLVMStructType>();
-    assert(structTy.getBody().size() == fcSize &&
-           "DotOp's $c operand should pass the same number of values as $d in "
-           "mma layout.");
-    return llTensor;
-  }
-
-  // Conduct the Dot conversion.
-  // \param a, \param b, \param c and \param d are DotOp operands.
-  // \param loadedA, \param loadedB, \param loadedC, all of them are result of
-  // loading.
-  LogicalResult convertDot(Value a, Value b, Value c, Value d, Value loadedA,
-                           Value loadedB, Value loadedC, DotOp op,
-                           DotOpAdaptor adaptor) const {
-    helper.deduceMmaType(op);
-
-    auto aTensorTy = a.getType().cast<RankedTensorType>();
-    auto dTensorTy = d.getType().cast<RankedTensorType>();
-
-    auto aShape = aTensorTy.getShape();
-    auto dShape = dTensorTy.getShape();
-
-    // shape / shape_per_cta
-    int numRepM = getNumRepM(aTensorTy, dShape[0]);
-    int numRepN = getNumRepN(aTensorTy, dShape[1]);
-    int numRepK = getNumRepK(aTensorTy, aShape[1]);
-
-    ValueTable ha =
-        getValuesFromDotOperandLayoutStruct(loadedA, numRepM, numRepK);
-    ValueTable hb = getValuesFromDotOperandLayoutStruct(
-        loadedB, std::max(numRepN / 2, 1), numRepK);
-    auto fc = ConvertTritonGPUOpToLLVMPatternBase::getElementsFromStruct(
-        loc, loadedC, rewriter);
-
-    auto callMma = [&](unsigned m, unsigned n, unsigned k) {
-      unsigned colsPerThread = numRepN * 2;
-      PTXBuilder builder;
-      auto &mma = *builder.create(helper.getMmaInstr().str());
-      auto retArgs = builder.newListOperand(4, "=r");
-      auto aArgs = builder.newListOperand({
-          {ha[{m, k}], "r"},
-          {ha[{m + 1, k}], "r"},
-          {ha[{m, k + 1}], "r"},
-          {ha[{m + 1, k + 1}], "r"},
-      });
-      auto bArgs =
-          builder.newListOperand({{hb[{n, k}], "r"}, {hb[{n, k + 1}], "r"}});
-      auto cArgs = builder.newListOperand();
-      for (int i = 0; i < 4; ++i) {
-        cArgs->listAppend(builder.newOperand(fc[m * colsPerThread + 4 * n + i],
-                                             std::to_string(i)));
-        // reuse the output registers
-      }
-      mma(retArgs, aArgs, bArgs, cArgs);
-      Value mmaOut = builder.launch(rewriter, loc, helper.getMmaRetType());
-
-      auto getIntAttr = [&](int v) {
-        return ArrayAttr::get(ctx, {IntegerAttr::get(i32_ty, v)});
-      };
-
-      for (int i = 0; i < 4; ++i)
-        fc[m * colsPerThread + 4 * n + i] =
-            extract_val(type::f32Ty(ctx), mmaOut, getIntAttr(i));
-    };
-
-    for (int k = 0; k < numRepK; ++k)
-      for (int m = 0; m < numRepM; ++m)
-        for (int n = 0; n < numRepN; ++n)
-          callMma(2 * m, n, 2 * k);
-
-    // replace with new packed result
-    Type structTy = LLVM::LLVMStructType::getLiteral(
-        ctx, SmallVector<Type>(fc.size(), type::f32Ty(ctx)));
-    Value res = getStructFromElements(loc, fc, rewriter, structTy);
-    rewriter.replaceOp(op, res);
-
-    return success();
-  }
-
-private:
-  std::function<void(int, int)>
-  getLoadMatrixFn(Value tensor, Value llTensor, MmaEncodingAttr mmaLayout,
-                  int wpt, uint32_t kOrder, ArrayRef<int> instrShape,
-                  ArrayRef<int> matShape, Value warpId,
-                  ValueTable &vals) const {
-    auto tensorTy = tensor.getType().cast<RankedTensorType>();
-    // We assumes that the input operand of Dot should be from shared layout.
-    // TODO(Superjomn) Consider other layouts if needed later.
-    auto sharedLayout = tensorTy.getEncoding().cast<SharedEncodingAttr>();
-    const int perPhase = sharedLayout.getPerPhase();
-    const int maxPhase = sharedLayout.getMaxPhase();
-    const int elemBytes = tensorTy.getElementTypeBitWidth() / 8;
-    auto order = sharedLayout.getOrder();
-
-    bool needTrans = kOrder != order[0];
-
-    // the original register_lds2, but discard the prefetch logic.
-    auto ld2 = [](ValueTable &vals, int mn, int k, Value val) {
-      vals[{mn, k}] = val;
-    };
-
-    // (a, b) is the coordinate.
-    auto load = [=, &vals, &ld2](int a, int b) {
-      MMA16816SmemLoader loader(wpt, sharedLayout.getOrder(), kOrder,
-                                tensorTy.getShape() /*tileShape*/, instrShape,
-                                matShape, perPhase, maxPhase, elemBytes,
-                                rewriter, typeConverter, loc);
-      SmallVector<Value> offs = loader.computeOffsets(warpId, lane);
-
-      const int numPtrs = loader.getNumPtr();
-
-      SmallVector<Value> ptrs(numPtrs);
-
-      Type smemPtrTy = helper.getShemPtrTy();
-      for (int i = 0; i < numPtrs; ++i) {
-        ptrs[i] =
-            bitcast(gep(smemPtrTy, llTensor, ValueRange({offs[i]})), smemPtrTy);
-      }
-
-      auto [ha0, ha1, ha2, ha3] = loader.loadX4(
-          (kOrder == 1) ? a : b /*mat0*/, (kOrder == 1) ? b : a /*mat1*/, offs,
-          ptrs, helper.getMatType(), helper.getShemPtrTy());
-      if (!needTrans) {
-        ld2(vals, a, b, ha0);
-        ld2(vals, a + 1, b, ha1);
-        ld2(vals, a, b + 1, ha2);
-        ld2(vals, a + 1, b + 1, ha3);
-      } else {
-        ld2(vals, a, b, ha0);
-        ld2(vals, a + 1, b, ha2);
-        ld2(vals, a, b + 1, ha1);
-        ld2(vals, a + 1, b + 1, ha3);
-      }
-    };
-
-    return load;
-  }
-
-  // Compose a map of Values to a LLVM::Struct.
-  // The layout is a list of Value with coordinate of (i,j), the order is as
-  // the follows:
-  // [
-  //  (0,0), (0,1), (1,0), (1,1), # i=0, j=0
-  //  (0,2), (0,3), (1,2), (1,3), # i=0, j=1
-  //  (0,4), (0,5), (1,4), (1,5), # i=0, j=2
-  //  ...
-  //  (2,0), (2,1), (3,0), (3,1), # i=1, j=0
-  //  (2,2), (2,3), (3,2), (3,3), # i=1, j=1
-  //  (2,4), (2,5), (2,4), (2,5), # i=1, j=2
-  //  ...
-  // ]
-  // i \in [0, n0) and j \in [0, n1)
-  // There should be \param n0 * \param n1 elements in the output Struct.
-  Value composeValuesToDotOperandLayoutStruct(const ValueTable &vals, int n0,
-                                              int n1) const {
-    std::vector<Value> elems;
-    for (int m = 0; m < n0; ++m)
-      for (int k = 0; k < n1; ++k) {
-        elems.push_back(vals.at({2 * m, 2 * k}));
-        elems.push_back(vals.at({2 * m, 2 * k + 1}));
-        elems.push_back(vals.at({2 * m + 1, 2 * k}));
-        elems.push_back(vals.at({2 * m + 1, 2 * k + 1}));
-      }
-
-    assert(!elems.empty());
-
-    Type fp16Ty = type::f16Ty(ctx);
-    Type fp16x2Ty = vec_ty(fp16Ty, 2);
-    Type structTy = LLVM::LLVMStructType::getLiteral(
-        ctx, SmallVector<Type>(elems.size(), fp16x2Ty));
-    auto result = getStructFromElements(loc, elems, rewriter, structTy);
-    return result;
-  }
-
-  ValueTable getValuesFromDotOperandLayoutStruct(Value value, int n0,
-                                                 int n1) const {
-    auto elems = ConvertTritonGPUOpToLLVMPatternBase::getElementsFromStruct(
-        loc, value, rewriter);
-
-    int offset{};
-    ValueTable vals;
-    for (int i = 0; i < n0; ++i) {
-      for (int j = 0; j < n1; j++) {
-        vals[{2 * i, 2 * j}] = elems[offset++];
-        vals[{2 * i, 2 * j + 1}] = elems[offset++];
-        vals[{2 * i + 1, 2 * j}] = elems[offset++];
-        vals[{2 * i + 1, 2 * j + 1}] = elems[offset++];
-      }
-    }
-    return vals;
-  }
-};
+  return res;
+}
 
 LogicalResult ConvertLayoutOpConversion::lowerSharedToDotOperand(
     triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
@@ -3600,40 +3480,39 @@ LogicalResult ConvertLayoutOpConversion::lowerSharedToDotOperand(
   Value src = op.src();
   Value dst = op.result();
   auto dstTensorTy = dst.getType().cast<RankedTensorType>();
-
+  auto srcTensorTy = src.getType().cast<RankedTensorType>();
   auto dotOperandLayout =
       dstTensorTy.getEncoding().cast<DotOperandEncodingAttr>();
+  auto sharedLayout = srcTensorTy.getEncoding().cast<SharedEncodingAttr>();
 
-  MmaEncodingAttr mmaLayout =
-      dotOperandLayout.getParent().dyn_cast_or_null<MmaEncodingAttr>();
-  assert(mmaLayout);
+  bool isOuter{};
+  int K{};
+  if (dotOperandLayout.getOpIdx() == 0) // $a
+    K = dstTensorTy.getShape()[sharedLayout.getOrder()[0]];
+  else // $b
+    K = dstTensorTy.getShape()[sharedLayout.getOrder()[1]];
+  isOuter = K == 1;
 
   Value res;
-  if (mmaLayout.getVersion() == 2) {
-    MMA16816ConversionHelper mmaHelper(mmaLayout, getThreadId(rewriter, loc),
-                                       rewriter, getTypeConverter(),
-                                       op.getLoc());
-
-    if (dotOperandLayout.getOpIdx() == 0) {
-      // operand $a
-      res = mmaHelper.loadA(src, adaptor.src());
-    } else if (dotOperandLayout.getOpIdx() == 1) {
-      // operand $b
-      res = mmaHelper.loadB(src, adaptor.src());
-    }
-  } else if (mmaLayout.getVersion() == 1) {
-    DotOpMmaV1ConversionHelper helper(mmaLayout);
-    if (dotOperandLayout.getOpIdx() == 0) {
-      // operand $a
-      res = helper.loadA(src, adaptor.src(), getThreadId(rewriter, loc),
-                         adaptor.src(), loc, rewriter);
-    } else if (dotOperandLayout.getOpIdx() == 1) {
-      // operand $b
-      res = helper.loadB(src, adaptor.src(), getThreadId(rewriter, loc),
-                         adaptor.src(), loc, rewriter);
+  if (auto mmaLayout =
+          dotOperandLayout.getParent().dyn_cast_or_null<MmaEncodingAttr>()) {
+    res = lowerSharedToDotOperandMMA(op, adaptor, rewriter, mmaLayout,
+                                     dotOperandLayout, isOuter);
+  } else if (auto blockedLayout =
+                 dotOperandLayout.getParent()
+                     .dyn_cast_or_null<BlockedEncodingAttr>()) {
+    auto dotOpLayout = dstTensorTy.getEncoding().cast<DotOperandEncodingAttr>();
+    DotOpFMAConversionHelper helper(blockedLayout);
+    auto thread = getThreadId(rewriter, loc);
+    if (dotOpLayout.getOpIdx() == 0) { // $a
+      res = helper.loadA(src, adaptor.src(), blockedLayout, thread, loc,
+                         rewriter);
+    } else { // $b
+      res = helper.loadB(src, adaptor.src(), blockedLayout, thread, loc,
+                         rewriter);
     }
   } else {
-    assert(false && "Unsupported mma layout found");
+    assert(false && "Unsupported dot operand layout found");
   }
 
   rewriter.replaceOp(op, res);
@@ -3649,28 +3528,25 @@ DotOpConversion::convertMMA16816(triton::DotOp op, OpAdaptor adaptor,
                        .cast<RankedTensorType>()
                        .getEncoding()
                        .cast<MmaEncodingAttr>();
-  MMA16816ConversionHelper mmaHelper(mmaLayout, getThreadId(rewriter, loc),
-                                     rewriter, getTypeConverter(), loc);
 
   Value A = op.a();
   Value B = op.b();
   Value C = op.c();
+
+  MMA16816ConversionHelper mmaHelper(A.getType(), mmaLayout,
+                                     getThreadId(rewriter, loc), rewriter,
+                                     getTypeConverter(), loc);
+
   auto ATensorTy = A.getType().cast<RankedTensorType>();
   auto BTensorTy = B.getType().cast<RankedTensorType>();
 
-  Value loadedA, loadedB, loadedC;
-  // We support two kinds of operand layouts: 1. both $a, $b are dot_operand
-  // layout, 2. both of them are shared layout.
-  if (ATensorTy.getEncoding().isa<DotOperandEncodingAttr>()) {
-    assert(BTensorTy.getEncoding().isa<DotOperandEncodingAttr>() &&
-           "Both $a and %b should be DotOperand layout.");
-    loadedA = adaptor.a();
-    loadedB = adaptor.b();
-  } else {
-    loadedA = mmaHelper.loadA(op.a(), adaptor.a());
-    loadedB = mmaHelper.loadB(op.b(), adaptor.b());
-  }
+  assert(ATensorTy.getEncoding().isa<DotOperandEncodingAttr>() &&
+         BTensorTy.getEncoding().isa<DotOperandEncodingAttr>() &&
+         "Both $a and %b should be DotOperand layout.");
 
+  Value loadedA, loadedB, loadedC;
+  loadedA = adaptor.a();
+  loadedB = adaptor.b();
   loadedC = mmaHelper.loadC(op.c(), adaptor.c());
 
   return mmaHelper.convertDot(A, B, C, op.d(), loadedA, loadedB, loadedC, op,
@@ -3692,6 +3568,14 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
                        .cast<RankedTensorType>()
                        .getEncoding()
                        .cast<MmaEncodingAttr>();
+  auto ALayout = A.getType()
+                     .cast<RankedTensorType>()
+                     .getEncoding()
+                     .cast<DotOperandEncodingAttr>();
+  auto BLayout = B.getType()
+                     .cast<RankedTensorType>()
+                     .getEncoding()
+                     .cast<DotOperandEncodingAttr>();
 
   auto ATensorTy = A.getType().cast<RankedTensorType>();
   auto BTensorTy = B.getType().cast<RankedTensorType>();
@@ -3701,39 +3585,30 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
   auto DShape = DTensorTy.getShape();
   auto wpt = mmaLayout.getWarpsPerCTA();
 
-  bool transA = op.transA();
-  bool transB = op.transB();
+  bool isARow = ALayout.getIsMMAv1Row().cast<BoolAttr>().getValue();
+  bool isBRow = BLayout.getIsMMAv1Row().cast<BoolAttr>().getValue();
 
-  bool isARow = !transA;
-  bool isBRow = !transB;
-  bool isAVec4 = !isARow && AShape[isARow] <= 16; // fp16*4 = 16bytes
-  bool isBVec4 = isBRow && BShape[isBRow] <= 16;
-  int packSize0 = (isARow || isAVec4) ? 1 : 2;
-  int packSize1 = (isBRow && !isBVec4) ? 2 : 1;
-  SmallVector<int> fpw({2, 2, 1});
-  SmallVector<int> rep({2 * packSize0, 2 * packSize1, 1});
-  SmallVector<int> spw({fpw[0] * 4 * rep[0], fpw[1] * 4 * rep[1], 1});
-
-  Value loadedA = adaptor.a();
-  Value loadedB = adaptor.b();
-  Value loadedC = adaptor.c();
   DotOpMmaV1ConversionHelper helper(mmaLayout);
 
-  unsigned numM = rep[0] * DShape[0] / (spw[0] * wpt[0]);
-  unsigned numN = rep[1] * DShape[1] / (spw[1] * wpt[0]);
+  unsigned numM = helper.getNumM(AShape, isARow);
+  unsigned numN = helper.getNumN(BShape, isBRow);
   unsigned NK = AShape[1];
 
-  auto has = helper.extractLoadedOperand(loadedA, numM / 2, NK, rewriter);
-  auto hbs = helper.extractLoadedOperand(loadedB, numN / 2, NK, rewriter);
+  auto has = helper.extractLoadedOperand(adaptor.a(), NK, rewriter);
+  auto hbs = helper.extractLoadedOperand(adaptor.b(), NK, rewriter);
 
-  size_t accSize = numM * numN;
+  // Initialize accumulators with external values, the acc holds the accumulator
+  // value that is shared between the MMA instructions inside a DotOp, we can
+  // call the order of the values the accumulator-internal order.
+  SmallVector<Value> acc = getElementsFromStruct(loc, adaptor.c(), rewriter);
+  size_t resSize = acc.size();
 
-  // initialize accumulators
-  SmallVector<Value> acc = getElementsFromStruct(loc, loadedC, rewriter);
+  // The resVals holds the final result of the DotOp.
+  // NOTE The current order of resVals is different from acc, we call it the
+  // accumulator-external order. and
+  SmallVector<Value> resVals(resSize);
 
-  auto callMMA = [&](unsigned m, unsigned n, unsigned k) {
-    auto ha = has[{m, k}];
-    auto hb = hbs[{n, k}];
+  auto getIdx = [&](int m, int n) {
     std::vector<size_t> idx{{
         (m * 2 + 0) + (n * 4 + 0) * numM, // row0
         (m * 2 + 0) + (n * 4 + 1) * numM,
@@ -3744,18 +3619,39 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
         (m * 2 + 1) + (n * 4 + 2) * numM, // row3
         (m * 2 + 1) + (n * 4 + 3) * numM,
     }};
+    return idx;
+  };
+
+  { // convert the acc's value from accumuator-external order to
+    // accumulator-internal order.
+    SmallVector<Value> accInit(acc.size());
+
+    for (unsigned m = 0; m < numM / 2; ++m)
+      for (unsigned n = 0; n < numN / 2; ++n) {
+        auto idx = getIdx(m, n);
+        for (unsigned i = 0; i < 8; ++i)
+          accInit[idx[i]] = acc[(m * numN / 2 + n) * 8 + i];
+      }
+
+    acc = accInit;
+  }
+
+  auto callMMA = [&](unsigned m, unsigned n, unsigned k) {
+    auto ha = has.at({m, k});
+    auto hb = hbs.at({n, k});
 
     PTXBuilder builder;
+    auto idx = getIdx(m, n);
 
     auto *resOprs = builder.newListOperand(8, "=f");
     auto *AOprs = builder.newListOperand({
-        {ha.first, "f"},
-        {ha.second, "f"},
+        {ha.first, "r"},
+        {ha.second, "r"},
     });
 
     auto *BOprs = builder.newListOperand({
-        {hb.first, "f"},
-        {hb.second, "f"},
+        {hb.first, "r"},
+        {hb.second, "r"},
     });
     auto *COprs = builder.newListOperand();
     for (int i = 0; i < 8; ++i)
@@ -3764,7 +3660,7 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
     auto mma = builder.create("mma.sync.aligned.m8n8k4")
                    ->o(isARow ? "row" : "col")
                    .o(isBRow ? "row" : "col")
-                   .o(".f32.f16.f16.f32");
+                   .o("f32.f16.f16.f32");
 
     mma(resOprs, AOprs, BOprs, COprs);
 
@@ -3773,8 +3669,12 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
     auto getIntAttr = [&](int v) {
       return ArrayAttr::get(ctx, {IntegerAttr::get(i32_ty, v)});
     };
-    for (unsigned i = 0; i < 8; i++)
-      acc[idx[i]] = extract_val(f32_ty, res, getIntAttr(i));
+
+    for (unsigned i = 0; i < 8; i++) {
+      Value elem = extract_val(f32_ty, res, getIntAttr(i));
+      acc[idx[i]] = elem;
+      resVals[(m * numN / 2 + n) * 8 + i] = elem;
+    }
   };
 
   for (unsigned k = 0; k < NK; k += 4)
@@ -3783,319 +3683,120 @@ DotOpConversion::convertMMA884(triton::DotOp op, DotOpAdaptor adaptor,
         callMMA(m, n, k);
       }
 
-  // replace with new packed result
   Type structTy = LLVM::LLVMStructType::getLiteral(
-      ctx, SmallVector<Type>(acc.size(), type::f32Ty(ctx)));
-  Value res = getStructFromElements(loc, acc, rewriter, structTy);
+      ctx, SmallVector<Type>(resSize, type::f32Ty(ctx)));
+  Value res = getStructFromElements(loc, resVals, rewriter, structTy);
+  rewriter.replaceOp(op, res);
+  return success();
+}
+
+LogicalResult
+DotOpConversion::convertFMADot(triton::DotOp op, OpAdaptor adaptor,
+                               ConversionPatternRewriter &rewriter) const {
+  auto *ctx = rewriter.getContext();
+  auto loc = op.getLoc();
+  auto threadId = getThreadId(rewriter, loc);
+
+  using ValueTable = std::map<std::pair<int, int>, Value>;
+
+  auto A = op.a();
+  auto B = op.b();
+  auto C = op.c();
+  auto D = op.getResult();
+
+  auto aTensorTy = A.getType().cast<RankedTensorType>();
+  auto bTensorTy = B.getType().cast<RankedTensorType>();
+  auto cTensorTy = C.getType().cast<RankedTensorType>();
+  auto dTensorTy = D.getType().cast<RankedTensorType>();
+
+  auto aShape = aTensorTy.getShape();
+  auto bShape = bTensorTy.getShape();
+  auto cShape = cTensorTy.getShape();
+
+  BlockedEncodingAttr dLayout =
+      dTensorTy.getEncoding().cast<BlockedEncodingAttr>();
+  auto order = dLayout.getOrder();
+  auto cc = getElementsFromStruct(loc, adaptor.c(), rewriter);
+
+  DotOpFMAConversionHelper helper(dLayout);
+  auto aDotOpLayout = aTensorTy.getEncoding().cast<DotOperandEncodingAttr>();
+  auto bDotOpLayout = bTensorTy.getEncoding().cast<DotOperandEncodingAttr>();
+  auto aLayout = aDotOpLayout.getParent().cast<BlockedEncodingAttr>();
+  auto bLayout = bDotOpLayout.getParent().cast<BlockedEncodingAttr>();
+
+  Value llA = adaptor.a();
+  Value llB = adaptor.b();
+
+  auto sizePerThread = getSizePerThread(dLayout);
+  auto shapePerCTA = getShapePerCTA(dLayout);
+
+  int K = aShape[1];
+  int M = aShape[0];
+  int N = bShape[1];
+
+  int mShapePerCTA =
+      order[0] == 1 ? shapePerCTA[order[1]] : shapePerCTA[order[0]];
+  int mSizePerThread =
+      order[0] == 1 ? sizePerThread[order[1]] : sizePerThread[order[0]];
+  int nShapePerCTA =
+      order[0] == 0 ? shapePerCTA[order[1]] : shapePerCTA[order[0]];
+  int nSizePerThread =
+      order[0] == 0 ? sizePerThread[order[1]] : sizePerThread[order[0]];
+
+  auto has = helper.getValueTableFromStruct(llA, K, M, mShapePerCTA,
+                                            mSizePerThread, rewriter, loc);
+  auto hbs = helper.getValueTableFromStruct(llB, K, N, nShapePerCTA,
+                                            nSizePerThread, rewriter, loc);
+
+  SmallVector<Value> ret = cc;
+  for (unsigned k = 0; k < K; k++) {
+    int z = 0;
+    for (unsigned m = 0; m < M; m += mShapePerCTA)
+      for (unsigned n = 0; n < N; n += nShapePerCTA)
+        for (unsigned mm = 0; mm < mSizePerThread; ++mm)
+          for (unsigned nn = 0; nn < nSizePerThread; ++nn) {
+            ret[z] = rewriter.create<LLVM::FMulAddOp>(loc, has[{m + mm, k}],
+                                                      hbs[{n + nn, k}], ret[z]);
+            ++z;
+          }
+  }
+
+  auto res = getStructFromElements(
+      loc, ret, rewriter,
+      struct_ty(SmallVector<Type>(ret.size(), ret[0].getType())));
   rewriter.replaceOp(op, res);
 
   return success();
 }
 
-Value DotOpMmaV1ConversionHelper::loadA(
-    Value tensor, Value llTensor, Value thread, Value smem, Location loc,
-    ConversionPatternRewriter &rewriter) const {
-  auto *ctx = rewriter.getContext();
-  auto tensorTy = tensor.getType().cast<RankedTensorType>();
-  auto shape = tensorTy.getShape();
-  auto sharedLayout = tensorTy.getEncoding().cast<SharedEncodingAttr>();
-  auto order = sharedLayout.getOrder();
-
-  bool isARow = order[0] != 0;
-  bool isAVec4 = !isARow && shape[order[0]] <= 16; // fp16*4 = 16bytes
-  int packSize0 = (isARow || isAVec4) ? 1 : 2;
-
-  SmallVector<int> fpw({2, 2, 1});
-  int repM = 2 * packSize0;
-  int repK = 1;
-  int spwM = fpw[0] * 4 * repM;
-  SmallVector<int> rep({repM, 0, repK}); // pad N with 0
-  SmallVector<int> spw({spwM, 0, 1});    // pad N with 0
-
-  int vecA = sharedLayout.getVec();
-
-  int strideAM = isARow ? shape[1] : 1;
-  int strideAK = isARow ? 1 : shape[0];
-  int strideA0 = isARow ? strideAK : strideAM;
-  int strideA1 = isARow ? strideAM : strideAK;
-
-  int strideRepM = wpt[0] * fpw[0] * 8;
-  int strideRepK = 1;
-
-  auto [offsetAM, offsetAK, _0, _1] =
-      computeOffsets(thread, isARow, false, fpw, spw, rep, rewriter, loc);
-
-  // swizzling
-  int perPhaseA = sharedLayout.getPerPhase();
-  int maxPhaseA = sharedLayout.getMaxPhase();
-  int stepA0 = isARow ? strideRepK : strideRepM;
-  int numPtrA = std::max(2 * perPhaseA * maxPhaseA / stepA0, 1);
-  int NK = shape[1];
-
-  // pre-compute pointer lanes
-  Value offA0 = isARow ? offsetAK : offsetAM;
-  Value offA1 = isARow ? offsetAM : offsetAK;
-  Value phaseA = urem(udiv(offA1, i32_val(perPhaseA)), i32_val(maxPhaseA));
-  SmallVector<Value> offA(numPtrA);
-
-  for (int i = 0; i < numPtrA; i++) {
-    Value offA0I = add(offA0, i32_val(i * (isARow ? 4 : strideRepM)));
-    offA0I = udiv(offA0I, i32_val(vecA));
-    offA0I = xor_(offA0I, phaseA);
-    offA0I = xor_(offA0I, i32_val(vecA));
-    offA[i] =
-        add(mul(offA0I, i32_val(strideA0)), mul(offA1, i32_val(strideA1)));
-  }
-
-  Type f16x2Ty = vec_ty(f16_ty, 2);
-  // One thread get 8 elements as result
-  Type retTy =
-      LLVM::LLVMStructType::getLiteral(ctx, SmallVector(8, type::f32Ty(ctx)));
-
-  // prepare arguments
-  SmallVector<Value> ptrA(numPtrA);
-
-  std::map<std::pair<int, int>, std::pair<Value, Value>> has;
-  for (int i = 0; i < numPtrA; i++)
-    ptrA[i] = gep(ptr_ty(f16_ty), smem, offA[i]);
-
-  auto instrShape = getMmaInstrShape();
-  unsigned numM = rep[0] * shape[0] / (spw[0] * wpt[0]);
-
-  Type f16PtrTy = ptr_ty(f16_ty);
-
-  auto ld = [&](decltype(has) &vals, int m, int k, Value val0, Value val1) {
-    vals[{m, k}] = {val0, val1};
-  };
-  auto loadA = [&](int m, int k) {
-    int offidx = (isARow ? k / 4 : m) % numPtrA;
-    Value thePtrA = gep(f16PtrTy, smem, offA[offidx]);
-
-    int stepAM = isARow ? m : m / numPtrA * numPtrA;
-    int stepAK = isARow ? k / (numPtrA * vecA) * (numPtrA * vecA) : k;
-    Value pa = gep(f16PtrTy, thePtrA,
-                   i32_val(stepAM * strideRepM * strideAM + stepAK * strideAK));
-    Type aPtrTy = ptr_ty(vec_ty(i32_ty, std::max<int>(vecA / 2, 1)), 3);
-    Value ha = load(bitcast(pa, aPtrTy));
-    // record lds that needs to be moved
-    Value ha00 = bitcast(extract_element(ha, i32_val(0)), f16x2Ty);
-    Value ha01 = bitcast(extract_element(ha, i32_val(1)), f16x2Ty);
-    ld(has, m, k, ha00, ha01);
-
-    if (vecA > 4) {
-      Value ha10 = bitcast(extract_element(ha, i32_val(2)), f16x2Ty);
-      Value ha11 = bitcast(extract_element(ha, i32_val(3)), f16x2Ty);
-      if (isARow)
-        ld(has, m, k + 4, ha10, ha11);
-      else
-        ld(has, m + 1, k, ha10, ha11);
-    }
-  };
-
-  for (unsigned k = 0; k < NK; k += 4)
-    for (unsigned m = 0; m < numM / 2; ++m)
-      if (!has.count({m, k}))
-        loadA(m, k);
-
-  SmallVector<Value> elems;
-  elems.reserve(has.size() * 2);
-  auto vecTy = vec_ty(f16_ty, 2);
-  for (auto item : has) { // has is a map, the key should be ordered.
-    elems.push_back(item.second.first);
-    elems.push_back(item.second.second);
-  }
-
-  Type resTy = struct_ty(SmallVector<Type>(elems.size(), f16x2Ty));
-  Value res = getStructFromElements(loc, elems, rewriter, resTy);
-  return res;
-}
-
-Value DotOpMmaV1ConversionHelper::loadB(
-    Value tensor, Value llTensor, Value thread, Value smem, Location loc,
-    ConversionPatternRewriter &rewriter) const {
-  auto *ctx = rewriter.getContext();
-  auto tensorTy = tensor.getType().cast<RankedTensorType>();
-  auto shape = tensorTy.getShape();
-  auto sharedLayout = tensorTy.getEncoding().cast<SharedEncodingAttr>();
-  auto order = sharedLayout.getOrder();
-  bool isBRow = order[0] != 0;
-  bool isBVec4 = isBRow && shape[order[0]] <= 16;
-  int packSize1 = (isBRow && !isBVec4) ? 2 : 1;
-  SmallVector<int> fpw({2, 2, 1});
-  SmallVector<int> rep({0, 2 * packSize1, 1});       // pad M with 0
-  SmallVector<int> spw({0, fpw[1] * 4 * rep[1], 1}); // pad M with 0
-  int vecB = sharedLayout.getVec();
-  int strideBN = isBRow ? 1 : shape[0];
-  int strideBK = isBRow ? shape[1] : 1;
-  int strideB0 = isBRow ? strideBN : strideBK;
-  int strideB1 = isBRow ? strideBK : strideBN;
-  int strideRepN = wpt[1] * fpw[1] * 8;
-  int strideRepK = 1;
-
-  // swizzling
-  int perPhaseA = sharedLayout.getPerPhase();
-  int maxPhaseA = sharedLayout.getMaxPhase();
-  int perPhaseB = sharedLayout.getPerPhase();
-  int maxPhaseB = sharedLayout.getMaxPhase();
-  int stepB0 = isBRow ? strideRepN : strideRepK;
-  int numPtrB = std::max(2 * perPhaseB * maxPhaseB / stepB0, 1);
-  int NK = shape[0];
-
-  auto [_0, _1, offsetBN, offsetBK] =
-      computeOffsets(thread, false, isBRow, fpw, spw, rep, rewriter, loc);
-
-  Value offB0 = isBRow ? offsetBN : offsetBK;
-  Value offB1 = isBRow ? offsetBK : offsetBN;
-  Value phaseB = urem(udiv(offB1, i32_val(perPhaseB)), i32_val(maxPhaseB));
-  SmallVector<Value> offB(numPtrB);
-  for (int i = 0; i < numPtrB; ++i) {
-    Value offB0I = add(offB0, i32_val(i * (isBRow ? strideRepN : 4)));
-    offB0I = udiv(offB0I, i32_val(vecB));
-    offB0I = xor_(offB0I, phaseB);
-    offB0I = mul(offB0I, i32_val(vecB));
-    offB[i] =
-        add(mul(offB0I, i32_val(strideB0)), mul(offB1, i32_val(strideB1)));
-  }
-
-  Type f16PtrTy = ptr_ty(f16_ty);
-  Type f16x2Ty = vec_ty(f16_ty, 2);
-
-  SmallVector<Value> ptrB(numPtrB);
-  ValueTable hbs;
-  for (int i = 0; i < numPtrB; ++i)
-    ptrB[i] = gep(ptr_ty(f16_ty), smem, offB[i]);
-
-  auto ld = [&](decltype(hbs) &vals, int m, int k, Value val0, Value val1) {
-    vals[{m, k}] = {val0, val1};
-  };
-
-  auto loadB = [&](int n, int K) {
-    int offidx = (isBRow ? n : K / 4) % numPtrB;
-    Value thePtrB = ptrB[offidx];
-
-    int stepBN = isBRow ? n / numPtrB * numPtrB : n;
-    int stepBK = isBRow ? K : K / (numPtrB * vecB) * (numPtrB * vecB);
-    Value pb = gep(f16PtrTy, thePtrB,
-                   i32_val(stepBN * strideRepN * strideBN + stepBK * strideBK));
-    Value hb =
-        load(bitcast(pb, ptr_ty(vec_ty(i32_ty, std::max(vecB / 2, 1)), 3)));
-    // record lds that needs to be moved
-    Value hb00 = bitcast(extract_element(hb, i32_val(0)), f16x2Ty);
-    Value hb01 = bitcast(extract_element(hb, i32_val(1)), f16x2Ty);
-    ld(hbs, n, K, hb00, hb01);
-    if (vecB > 4) {
-      Value hb10 = bitcast(extract_element(hb, i32_val(2)), f16x2Ty);
-      Value hb11 = bitcast(extract_element(hb, i32_val(3)), f16x2Ty);
-      if (isBRow)
-        ld(hbs, n + 1, K, hb10, hb11);
-      else
-        ld(hbs, n, K + 4, hb10, hb11);
-    }
-  };
-
-  unsigned numN = rep[1] * shape[1] / (spw[1] * wpt[0]);
-  for (unsigned k = 0; k < NK; k += 4)
-    for (unsigned n = 0; n < numN / 2; ++n) {
-      if (!hbs.count({n, k}))
-        loadB(n, k);
-    }
-
-  SmallVector<Value> elems;
-  for (auto &item : hbs) { // has is a map, the key should be ordered.
-    elems.push_back(item.second.first);
-    elems.push_back(item.second.second);
-  }
-  Type fp16x2Ty = vec_ty(type::f16Ty(ctx), 2);
-  Type resTy = struct_ty(SmallVector<Type>(elems.size(), fp16x2Ty));
-  Value res = getStructFromElements(loc, elems, rewriter, resTy);
-  return res;
-}
-
-Value DotOpMmaV1ConversionHelper::loadC(
-    Value tensor, Value llTensor, ConversionPatternRewriter &rewriter) const {
-  return llTensor;
-}
-
-std::tuple<Value, Value, Value, Value>
-DotOpMmaV1ConversionHelper::computeOffsets(Value threadId, bool isARow,
-                                           bool isBRow, ArrayRef<int> fpw,
-                                           ArrayRef<int> spw, ArrayRef<int> rep,
-                                           ConversionPatternRewriter &rewriter,
-                                           Location loc) const {
-  auto *ctx = rewriter.getContext();
-  Value _1 = i32_val(1);
-  Value _3 = i32_val(3);
-  Value _4 = i32_val(4);
-  Value _16 = i32_val(16);
-  Value _32 = i32_val(32);
-
-  Value lane = urem(threadId, _32);
-  Value warp = udiv(threadId, _32);
-
-  // warp offset
-  Value warp0 = urem(warp, i32_val(wpt[0]));
-  Value warp12 = udiv(warp, i32_val(wpt[0]));
-  Value warp1 = urem(warp12, i32_val(wpt[1]));
-  Value warpMOff = mul(warp0, i32_val(spw[0]));
-  Value warpNOff = mul(warp1, i32_val(spw[1]));
-  // Quad offset
-  Value quadMOff = mul(udiv(and_(lane, _16), _4), i32_val(fpw[0]));
-  Value quadNOff = mul(udiv(and_(lane, _16), _4), i32_val(fpw[1]));
-  // Pair offset
-  Value pairMOff = udiv(urem(lane, _16), _4);
-  pairMOff = urem(pairMOff, i32_val(fpw[0]));
-  pairMOff = mul(pairMOff, _4);
-  Value pairNOff = udiv(urem(lane, _16), _4);
-  pairNOff = udiv(pairNOff, i32_val(fpw[0]));
-  pairNOff = urem(pairNOff, i32_val(fpw[1]));
-  pairNOff = mul(pairNOff, _4);
-  // scale
-  pairMOff = mul(pairMOff, i32_val(rep[0] / 2));
-  quadMOff = mul(quadMOff, i32_val(rep[0] / 2));
-  pairNOff = mul(pairNOff, i32_val(rep[1] / 2));
-  quadNOff = mul(quadNOff, i32_val(rep[1] / 2));
-  // Quad pair offset
-  Value laneMOff = add(pairMOff, quadMOff);
-  Value laneNOff = add(pairNOff, quadNOff);
-  // A offset
-  Value offsetAM = add(warpMOff, laneMOff);
-  Value offsetAK = and_(lane, _3);
-  // B offset
-  Value offsetBN = add(warpNOff, laneNOff);
-  Value offsetBK = and_(lane, _3);
-  // i indices
-  Value offsetCM = add(and_(lane, _1), offsetAM);
-  if (isARow) {
-    offsetAM = add(offsetAM, urem(threadId, _4));
-    offsetAK = i32_val(0);
-  }
-  if (!isBRow) {
-    offsetBN = add(offsetBN, urem(threadId, _4));
-    offsetBK = i32_val(0);
-  }
-
-  return std::make_tuple(offsetAM, offsetAK, offsetBN, offsetBK);
-}
-
-DotOpMmaV1ConversionHelper::ValueTable
-DotOpMmaV1ConversionHelper::extractLoadedOperand(
-    Value llStruct, int n0, int n1, ConversionPatternRewriter &rewriter) const {
-  ValueTable rcds;
-  SmallVector<Value> elems =
-      ConvertTritonGPUOpToLLVMPatternBase::getElementsFromStruct(
-          llStruct.getLoc(), llStruct, rewriter);
-
-  int offset = 0;
-  for (int i = 0; i < n0; ++i)
-    for (int k = 0; k < n1; k += 4) {
-      rcds[{i, k}] = std::make_pair(elems[offset], elems[offset + 1]);
-      offset += 2;
-    }
-
-  return rcds;
-}
-
 /// ====================== mma codegen end ============================
+
+/// ====================== trans codegen begin ============================
+
+struct TransOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<triton::TransOp> {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::TransOp>::ConvertTritonGPUOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::TransOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    auto srcSmemObj =
+        getSharedMemoryObjectFromStruct(loc, adaptor.src(), rewriter);
+    SmallVector<Value> dstStrides = {srcSmemObj.strides[1],
+                                     srcSmemObj.strides[0]};
+    SmallVector<Value> dstOffsets = {srcSmemObj.offsets[1],
+                                     srcSmemObj.offsets[0]};
+    auto dstSmemObj =
+        SharedMemoryObject(srcSmemObj.base, dstStrides, dstOffsets);
+    auto retVal = getStructFromSharedMemoryObject(loc, dstSmemObj, rewriter);
+    rewriter.replaceOp(op, retVal);
+    return success();
+  }
+};
+
+/// ====================== trans codegen end ============================
 
 Value convertSplatLikeOpWithMmaLayout(const MmaEncodingAttr &layout,
                                       Type resType, Type elemType,
@@ -4105,7 +3806,7 @@ Value convertSplatLikeOpWithMmaLayout(const MmaEncodingAttr &layout,
                                       Location loc) {
   auto tensorTy = resType.cast<RankedTensorType>();
   auto shape = tensorTy.getShape();
-  if (layout.getVersion() == 2) {
+  if (layout.isAmpere()) {
     auto [repM, repN] = DotOpMmaV2ConversionHelper::getRepMN(tensorTy);
     size_t fcSize = 4 * repM * repN;
 
@@ -4114,7 +3815,7 @@ Value convertSplatLikeOpWithMmaLayout(const MmaEncodingAttr &layout,
     return getStructFromElements(loc, SmallVector<Value>(fcSize, constVal),
                                  rewriter, structTy);
   }
-  if (layout.getVersion() == 1) {
+  if (layout.isVolta()) {
     DotOpMmaV1ConversionHelper helper(layout);
     int repM = helper.getRepM(shape[0]);
     int repN = helper.getRepN(shape[1]);
@@ -4128,6 +3829,7 @@ Value convertSplatLikeOpWithMmaLayout(const MmaEncodingAttr &layout,
   }
 
   assert(false && "Unsupported mma layout found");
+  return {};
 }
 
 class TritonGPUToLLVMTypeConverter : public LLVMTypeConverter {
@@ -4143,21 +3845,23 @@ public:
     addConversion([&](RankedTensorType type) -> llvm::Optional<Type> {
       return convertTritonTensorType(type);
     });
-    // internally store bfloat16 as int16
-    addConversion([&](BFloat16Type type) -> llvm::Optional<Type> {
-      return IntegerType::get(type.getContext(), 16);
+    // Internally store float8 as int8
+    addConversion([&](triton::Float8Type type) -> llvm::Optional<Type> {
+      return IntegerType::get(type.getContext(), 8);
     });
   }
 
   Type convertTritonPointerType(triton::PointerType type) {
-    return LLVM::LLVMPointerType::get(type.getPointeeType(),
+    // Recursively translate pointee type
+    return LLVM::LLVMPointerType::get(convertType(type.getPointeeType()),
                                       type.getAddressSpace());
   }
 
   llvm::Optional<Type> convertTritonTensorType(RankedTensorType type) {
     auto ctx = type.getContext();
     Attribute layout = type.getEncoding();
-    auto shape = type.getShape();
+    SmallVector<int64_t> shape(type.getShape().begin(), type.getShape().end());
+
     if (layout &&
         (layout.isa<BlockedEncodingAttr>() || layout.isa<SliceEncodingAttr>() ||
          layout.isa<MmaEncodingAttr>())) {
@@ -4167,62 +3871,78 @@ public:
       return LLVM::LLVMStructType::getLiteral(ctx, types);
     } else if (auto shared_layout =
                    layout.dyn_cast_or_null<SharedEncodingAttr>()) {
-      return LLVM::LLVMPointerType::get(convertType(type.getElementType()), 3);
-    } else if (auto mmaLayout = layout.dyn_cast_or_null<MmaEncodingAttr>()) {
-      if (mmaLayout.getVersion() == 2) {
-        auto [repM, repN] = DotOpMmaV2ConversionHelper::getRepMN(type);
-        size_t fcSize = 4 * repM * repN;
-        return LLVM::LLVMStructType::getLiteral(
-            ctx, SmallVector<Type>(fcSize, type.getElementType()));
+      SmallVector<Type, 4> types;
+      // base ptr
+      auto ptrType =
+          LLVM::LLVMPointerType::get(convertType(type.getElementType()), 3);
+      types.push_back(ptrType);
+      // shape dims
+      auto rank = type.getRank();
+      // offsets + strides
+      for (auto i = 0; i < rank * 2; i++) {
+        types.push_back(IntegerType::get(ctx, 32));
       }
-
-      if (mmaLayout.getVersion() == 1) {
-        DotOpMmaV1ConversionHelper helper(mmaLayout);
-        int repM = helper.getRepM(shape[0]);
-        int repN = helper.getRepN(shape[1]);
-        int elems = 8 * repM * repN;
-        return LLVM::LLVMStructType::getLiteral(
-            ctx, SmallVector<Type>(elems, type.getElementType()));
-      }
-
-      llvm::errs()
-          << "Unexpected mma layout detected in TritonToLLVMTypeConverter";
-      return llvm::None;
-
-    } else if (auto dot_op_layout =
+      return LLVM::LLVMStructType::getLiteral(ctx, types);
+    } else if (auto dotOpLayout =
                    layout.dyn_cast_or_null<DotOperandEncodingAttr>()) {
-      auto mmaLayout = dot_op_layout.getParent().cast<MmaEncodingAttr>();
-      auto wpt = mmaLayout.getWarpsPerCTA();
-      Type elemTy = type.getElementType();
-      if (mmaLayout.getVersion() == 2) {
+      if (dotOpLayout.getParent()
+              .isa<BlockedEncodingAttr>()) { // for parent is blocked layout
+        int numElemsPerThread =
+            DotOpFMAConversionHelper::getNumElemsPerThread(shape, dotOpLayout);
 
-        if (dot_op_layout.getOpIdx() == 0) { // $a
-          int elems =
-              MMA16816ConversionHelper::getANumElemsPerThread(type, wpt);
-          Type x2Ty = vec_ty(elemTy, 2);
-          return LLVM::LLVMStructType::getLiteral(
-              ctx, SmallVector<Type>(elems, x2Ty));
+        return LLVM::LLVMStructType::getLiteral(
+            ctx, SmallVector<Type>(numElemsPerThread, type::f32Ty(ctx)));
+      } else { // for parent is MMA layout
+        auto mmaLayout = dotOpLayout.getParent().cast<MmaEncodingAttr>();
+        auto wpt = mmaLayout.getWarpsPerCTA();
+        Type elemTy = convertType(type.getElementType());
+        if (mmaLayout.isAmpere()) {
+          const llvm::DenseMap<int, Type> targetTyMap = {
+              {32, elemTy},
+              {16, vec_ty(elemTy, 2)},
+              {8, vec_ty(elemTy, 4)},
+          };
+          Type targetTy;
+          if (targetTyMap.count(elemTy.getIntOrFloatBitWidth())) {
+            targetTy = targetTyMap.lookup(elemTy.getIntOrFloatBitWidth());
+          } else {
+            assert(false && "Unsupported element type");
+          }
+          if (dotOpLayout.getOpIdx() == 0) { // $a
+            int elems =
+                MMA16816ConversionHelper::getANumElemsPerThread(type, wpt[0]);
+            return LLVM::LLVMStructType::getLiteral(
+                ctx, SmallVector<Type>(elems, targetTy));
+          }
+          if (dotOpLayout.getOpIdx() == 1) { // $b
+            int elems =
+                MMA16816ConversionHelper::getBNumElemsPerThread(type, wpt[1]);
+            return struct_ty(SmallVector<Type>(elems, targetTy));
+          }
         }
-        if (dot_op_layout.getOpIdx() == 1) { // $b
-          int elems =
-              MMA16816ConversionHelper::getBNumElemsPerThread(type, wpt);
-          Type x2Ty = vec_ty(elemTy, 2);
-          return struct_ty(SmallVector<Type>(elems, x2Ty));
-        }
-      }
 
-      if (mmaLayout.getVersion() == 1) {
-        DotOpMmaV1ConversionHelper helper(mmaLayout);
+        if (mmaLayout.isVolta()) {
+          DotOpMmaV1ConversionHelper helper(mmaLayout);
 
-        if (dot_op_layout.getOpIdx() == 0) { // $a
-          int elems = helper.numElemsPerThreadA(type);
-          Type x2Ty = vec_ty(elemTy, 2);
-          return struct_ty(SmallVector<Type>(elems, x2Ty));
-        }
-        if (dot_op_layout.getOpIdx() == 1) { // $b
-          int elems = helper.numElemsPerThreadB(type);
-          Type x2Ty = vec_ty(elemTy, 2);
-          return struct_ty(SmallVector<Type>(elems, x2Ty));
+          // TODO[Superjomn]: Both transA and transB are not available here.
+          bool trans = false;
+          // TODO[Superjomn]: The order of A and B are not available here.
+          SmallVector<unsigned> order({1, 0});
+          if (trans) {
+            std::swap(shape[0], shape[1]);
+            std::swap(order[0], order[1]);
+          }
+
+          if (dotOpLayout.getOpIdx() == 0) { // $a
+            int elems = helper.numElemsPerThreadA(shape, order);
+            Type x2Ty = vec_ty(elemTy, 2);
+            return struct_ty(SmallVector<Type>(elems, x2Ty));
+          }
+          if (dotOpLayout.getOpIdx() == 1) { // $b
+            int elems = helper.numElemsPerThreadB(shape, order);
+            Type x2Ty = vec_ty(elemTy, 2);
+            return struct_ty(SmallVector<Type>(elems, x2Ty));
+          }
         }
       }
 
@@ -4244,7 +3964,7 @@ struct AsyncWaitOpConversion
   matchAndRewrite(triton::gpu::AsyncWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     PTXBuilder ptxBuilder;
-    auto &asyncWaitOp = *ptxBuilder.create<PTXCpAsyncWaitGroupInstr>();
+    auto &asyncWaitOp = *ptxBuilder.create<>("cp.async.wait_group");
     auto num = op->getAttrOfType<IntegerAttr>("num").getInt();
     asyncWaitOp(ptxBuilder.newConstantOperand(num));
 
@@ -4305,15 +4025,26 @@ struct InsertSliceAsyncOpConversion
     auto srcElems = getLLVMElems(src, llSrc, rewriter, loc);
 
     // %dst
+    auto dstTy = dst.getType().cast<RankedTensorType>();
+    auto dstShape = dstTy.getShape();
+    auto smemObj = getSharedMemoryObjectFromStruct(loc, llDst, rewriter);
     auto axis = op->getAttrOfType<IntegerAttr>("axis").getInt();
-    assert(axis == 0 && "insert_slice_async: Only axis=0 is supported for now");
-    auto dstBase = createIndexAttrConstant(rewriter, loc,
-                                           getTypeConverter()->getIndexType(),
-                                           product<int64_t>(srcTy.getShape()));
-    Value offset = mul(llIndex, dstBase);
-    auto dstPtrTy = LLVM::LLVMPointerType::get(
-        getTypeConverter()->convertType(resTy.getElementType()), 3);
-    Value dstPtrBase = gep(dstPtrTy, llDst, offset);
+    SmallVector<Value, 4> offsetVals;
+    SmallVector<Value, 4> srcStrides;
+    for (auto i = 0; i < dstShape.size(); ++i) {
+      if (i == axis) {
+        offsetVals.emplace_back(llIndex);
+      } else {
+        offsetVals.emplace_back(i32_val(0));
+        srcStrides.emplace_back(smemObj.strides[i]);
+      }
+    }
+    // Compute the offset based on the original dimensions of the shared
+    // memory object
+    auto dstOffset = dot(rewriter, loc, offsetVals, smemObj.strides);
+    auto dstPtrTy =
+        ptr_ty(getTypeConverter()->convertType(resTy.getElementType()), 3);
+    Value dstPtrBase = gep(dstPtrTy, smemObj.base, dstOffset);
 
     // %mask
     SmallVector<Value> maskElems;
@@ -4325,10 +4056,10 @@ struct InsertSliceAsyncOpConversion
     // %other
     SmallVector<Value> otherElems;
     if (llOther) {
-      // TODO(Keren): support "other" tensor.
+      // FIXME(Keren): always assume other is 0 for now
       // It's not necessary for now because the pipeline pass will skip
       // generating insert_slice_async if the load op has any "other" tensor.
-      assert(false && "insert_slice_async: Other value not supported yet");
+      // assert(false && "insert_slice_async: Other value not supported yet");
       otherElems = getLLVMElems(other, llOther, rewriter, loc);
       assert(srcElems.size() == otherElems.size());
     }
@@ -4341,12 +4072,11 @@ struct InsertSliceAsyncOpConversion
     unsigned maxPhase = resSharedLayout.getMaxPhase();
     auto sizePerThread = srcBlockedLayout.getSizePerThread();
     auto threadsPerCTA = getThreadsPerCTA(srcBlockedLayout);
-
     auto inOrder = srcBlockedLayout.getOrder();
 
-    // If perPhase * maxPhase > threadsPerCTA, we need to swizzle over
-    // elements across phases. If perPhase * maxPhase == threadsPerCTA,
-    // swizzle is not allowd
+    // If perPhase * maxPhase > threadsPerCTA, we will have elements
+    // that share the same tile indices. The index calculation will
+    // be cached.
     auto numSwizzleRows = std::max<unsigned>(
         (perPhase * maxPhase) / threadsPerCTA[inOrder[1]], 1);
     // A sharedLayout encoding has a "vec" parameter.
@@ -4355,7 +4085,7 @@ struct InsertSliceAsyncOpConversion
     auto numVecCols = std::max<unsigned>(inVec / outVec, 1);
 
     auto srcIndices = emitIndices(loc, rewriter, srcBlockedLayout, srcShape);
-    // <<tileVecIdxRow, tileVecIdxCol>, TileOffset>
+    //  <<tileVecIdxRow, tileVecIdxCol>, TileOffset>
     DenseMap<std::pair<unsigned, unsigned>, Value> tileOffsetMap;
     for (unsigned elemIdx = 0; elemIdx < numElems; elemIdx += minVec) {
       // minVec = 2, inVec = 4, outVec = 2
@@ -4373,7 +4103,6 @@ struct InsertSliceAsyncOpConversion
           vecIdxCol / numVecCols * numVecCols * threadsPerCTA[inOrder[0]];
       auto baseOffsetRow = vecIdxRow / numSwizzleRows * numSwizzleRows *
                            threadsPerCTA[inOrder[1]];
-      auto baseOffset = (baseOffsetRow * srcShape[inOrder[0]] + baseOffsetCol);
       auto tileVecIdxCol = vecIdxCol % numVecCols;
       auto tileVecIdxRow = vecIdxRow % numSwizzleRows;
 
@@ -4386,17 +4115,21 @@ struct InsertSliceAsyncOpConversion
         // Example1:
         // outVec = 2, inVec = 2, minVec = 2
         // outVec = 2, inVec = 4, minVec = 2
-        //     | [1 2] [3 4]  ... [15 16] |
-        //     | [3 4] [5 6]  ... [1 2]   |
+        //     | [1 2] [3 4] [5 6] ... |
+        //     | [3 4] [1 2] [7 8] ... |
+        //     | [5 6] [7 8] [1 2] ... |
         // Example2:
         // outVec = 4, inVec = 2, minVec = 2
-        //     | [1 2 3 4] [5 6 7 8] ... [13 14 15 16] |
-        //     | [5 6 7 8] [9 10 11 12] ... [1 2 3 4]  |
+        //     | [1 2 3 4] [5 6 7 8] [9 10 11 12] ... |
+        //     | [5 6 7 8] [1 2 3 4] [13 14 15 16] ... |
+        //     | [9 10 11 12] [13 14 15 16] [1 2 3 4] ... |
         auto srcIdx = srcIndices[tileVecIdxRow * sizePerThread[inOrder[0]]];
         Value phase = urem(udiv(srcIdx[inOrder[1]], i32_val(perPhase)),
                            i32_val(maxPhase));
-        Value rowOffset =
-            mul(srcIdx[inOrder[1]], i32_val(srcShape[inOrder[0]]));
+        // srcShape and smemObj.shape maybe different if smemObj is a
+        // slice of the original shared memory object.
+        // So we need to use the original shape to compute the offset
+        Value rowOffset = mul(srcIdx[inOrder[1]], srcStrides[inOrder[1]]);
         Value colOffset =
             add(srcIdx[inOrder[0]], i32_val(tileVecIdxCol * minVec));
         Value swizzleIdx = udiv(colOffset, i32_val(outVec));
@@ -4416,21 +4149,25 @@ struct InsertSliceAsyncOpConversion
       auto numWords = vecBitWidth / bitWidth;
       auto numWordElems = bitWidth / resElemTy.getIntOrFloatBitWidth();
 
-      // XXX(Keren): Tune CG and CA here.
+      // Tune CG and CA here.
       auto byteWidth = bitWidth / 8;
       CacheModifier srcCacheModifier =
           byteWidth == 16 ? CacheModifier::CG : CacheModifier::CA;
       assert(byteWidth == 16 || byteWidth == 8 || byteWidth == 4);
       auto resByteWidth = resElemTy.getIntOrFloatBitWidth() / 8;
 
-      auto tileOffset = tileOffsetMap[{tileVecIdxRow, tileVecIdxCol}];
+      Value tileOffset = tileOffsetMap[{tileVecIdxRow, tileVecIdxCol}];
+      Value baseOffset =
+          add(mul(i32_val(baseOffsetRow), srcStrides[inOrder[1]]),
+              i32_val(baseOffsetCol));
+      Value basePtr = gep(dstPtrTy, tileOffset, baseOffset);
       for (size_t wordIdx = 0; wordIdx < numWords; ++wordIdx) {
         PTXBuilder ptxBuilder;
         auto wordElemIdx = wordIdx * numWordElems;
         auto &copyAsyncOp =
             *ptxBuilder.create<PTXCpAsyncLoadInstr>(srcCacheModifier);
-        auto *dstOperand = ptxBuilder.newAddrOperand(
-            tileOffset, "r", (wordElemIdx + baseOffset) * resByteWidth);
+        auto *dstOperand =
+            ptxBuilder.newAddrOperand(basePtr, "r", wordElemIdx * resByteWidth);
         auto *srcOperand =
             ptxBuilder.newAddrOperand(srcElems[elemIdx + wordElemIdx], "l");
         auto *copySize = ptxBuilder.newConstantOperand(byteWidth);
@@ -4450,7 +4187,7 @@ struct InsertSliceAsyncOpConversion
     }
 
     PTXBuilder ptxBuilder;
-    ptxBuilder.create<PTXCpAsyncCommitGroupInstr>()->operator()();
+    ptxBuilder.create<>("cp.async.commit_group")->operator()();
     ptxBuilder.launch(rewriter, loc, void_ty(getContext()));
     rewriter.replaceOp(op, llDst);
     return success();
@@ -4458,11 +4195,10 @@ struct InsertSliceAsyncOpConversion
 };
 
 struct ExtElemwiseOpConversion
-    : public ElementwiseOpConversionBase<
-          triton::ExtElemwiseOp, LLVM::LLVMFuncOp, ExtElemwiseOpConversion> {
-  using Base =
-      ElementwiseOpConversionBase<triton::ExtElemwiseOp, LLVM::LLVMFuncOp,
-                                  ExtElemwiseOpConversion>;
+    : public ElementwiseOpConversionBase<triton::ExtElemwiseOp,
+                                         ExtElemwiseOpConversion> {
+  using Base = ElementwiseOpConversionBase<triton::ExtElemwiseOp,
+                                           ExtElemwiseOpConversion>;
   using Base::Base;
   using Adaptor = typename Base::OpAdaptor;
 
@@ -4506,10 +4242,9 @@ private:
 };
 
 struct FDivOpConversion
-    : ElementwiseOpConversionBase<mlir::arith::DivFOp, LLVM::InlineAsmOp,
-                                  FDivOpConversion> {
-  using Base = ElementwiseOpConversionBase<mlir::arith::DivFOp,
-                                           LLVM::InlineAsmOp, FDivOpConversion>;
+    : ElementwiseOpConversionBase<mlir::arith::DivFOp, FDivOpConversion> {
+  using Base =
+      ElementwiseOpConversionBase<mlir::arith::DivFOp, FDivOpConversion>;
   using Base::Base;
   using Adaptor = typename Base::OpAdaptor;
 
@@ -4522,24 +4257,280 @@ struct FDivOpConversion
     unsigned bitwidth = elemTy.getIntOrFloatBitWidth();
     if (32 == bitwidth) {
       fdiv.o("full").o("f32");
-      auto res = ptxBuilder.newOperand("=r");
-      auto lhs = ptxBuilder.newOperand(operands[0], "r");
-      auto rhs = ptxBuilder.newOperand(operands[1], "r");
-      fdiv(res, lhs, rhs);
     } else if (64 == bitwidth) {
       fdiv.o("rn").o("f64");
-      auto res = ptxBuilder.newOperand("=l");
-      auto lhs = ptxBuilder.newOperand(operands[0], "l");
-      auto rhs = ptxBuilder.newOperand(operands[1], "l");
-      fdiv(res, lhs, rhs);
     } else {
       assert(0 && bitwidth && "not supported");
     }
+
+    auto res = ptxBuilder.newOperand(bitwidth == 32 ? "=r" : "=l");
+    auto lhs = ptxBuilder.newOperand(operands[0], bitwidth == 32 ? "r" : "l");
+    auto rhs = ptxBuilder.newOperand(operands[1], bitwidth == 32 ? "r" : "l");
+    fdiv(res, lhs, rhs);
 
     Value ret = ptxBuilder.launch(rewriter, loc, elemTy, false);
     return ret;
   }
 };
+
+struct ExpOpConversionApprox
+    : ElementwiseOpConversionBase<mlir::math::ExpOp, ExpOpConversionApprox> {
+  using Base =
+      ElementwiseOpConversionBase<mlir::math::ExpOp, ExpOpConversionApprox>;
+  using Base::Base;
+  using Adaptor = typename Base::OpAdaptor;
+
+  Value createDestOp(mlir::math::ExpOp op, OpAdaptor adaptor,
+                     ConversionPatternRewriter &rewriter, Type elemTy,
+                     ValueRange operands, Location loc) const {
+    // For FP64 input, call __nv_expf for higher-precision calculation
+    if (elemTy.getIntOrFloatBitWidth() == 64)
+      return {};
+
+    const double log2e = 1.4426950408889634;
+    Value prod = fmul(f32_ty, operands[0], f32_val(log2e));
+
+    PTXBuilder ptxBuilder;
+    auto &exp2 = ptxBuilder.create<PTXInstr>("ex2")->o("approx").o("f32");
+    auto output = ptxBuilder.newOperand("=f");
+    auto input = ptxBuilder.newOperand(prod, "f");
+    exp2(output, input);
+    return ptxBuilder.launch(rewriter, loc, f32_ty, false);
+  }
+};
+/// ====================== atomic_cas codegen begin ==========================
+struct AtomicCASOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<triton::AtomicCASOp>,
+      public LoadStoreConversionBase {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::AtomicCASOp>::ConvertTritonGPUOpToLLVMPattern;
+
+  AtomicCASOpConversion(LLVMTypeConverter &converter,
+                        const Allocation *allocation, Value smem,
+                        AxisInfoAnalysis &axisAnalysisPass,
+                        PatternBenefit benefit)
+      : ConvertTritonGPUOpToLLVMPattern<triton::AtomicCASOp>(
+            converter, allocation, smem, benefit),
+        LoadStoreConversionBase(axisAnalysisPass) {}
+
+  LogicalResult
+  matchAndRewrite(triton::AtomicCASOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+    Value ptr = op.ptr();
+
+    Value llPtr = adaptor.ptr();
+    Value llCmp = adaptor.cmp();
+    Value llVal = adaptor.val();
+
+    auto ptrElements = getElementsFromStruct(loc, llPtr, rewriter);
+    auto cmpElements = getElementsFromStruct(loc, llCmp, rewriter);
+    auto valElements = getElementsFromStruct(loc, llVal, rewriter);
+
+    auto valueTy = op.getResult().getType().dyn_cast<RankedTensorType>();
+    Type valueElemTy =
+        valueTy ? getTypeConverter()->convertType(valueTy.getElementType())
+                : op.getResult().getType();
+    auto tid = tid_val();
+    Value pred = icmp_eq(tid, i32_val(0));
+    PTXBuilder ptxBuilderMemfence;
+    auto memfenc = ptxBuilderMemfence.create<PTXInstr>("membar")->o("gl");
+    memfenc();
+    auto ASMReturnTy = void_ty(ctx);
+    ptxBuilderMemfence.launch(rewriter, loc, ASMReturnTy);
+
+    Value atomPtr = getSharedMemoryBase(loc, rewriter, op.getOperation());
+    atomPtr = bitcast(atomPtr, ptr_ty(valueElemTy, 3));
+
+    Value casPtr = ptrElements[0];
+    Value casCmp = cmpElements[0];
+    Value casVal = valElements[0];
+
+    PTXBuilder ptxBuilderAtomicCAS;
+    auto *dstOpr = ptxBuilderAtomicCAS.newOperand("=r");
+    auto *ptrOpr = ptxBuilderAtomicCAS.newAddrOperand(casPtr, "l");
+    auto *cmpOpr = ptxBuilderAtomicCAS.newOperand(casCmp, "r");
+    auto *valOpr = ptxBuilderAtomicCAS.newOperand(casVal, "r");
+    auto &atom = *ptxBuilderAtomicCAS.create<PTXInstr>("atom");
+    atom.global().o("cas").o("b32");
+    atom(dstOpr, ptrOpr, cmpOpr, valOpr).predicate(pred);
+    auto old = ptxBuilderAtomicCAS.launch(rewriter, loc, valueElemTy);
+    barrier();
+
+    PTXBuilder ptxBuilderStore;
+    auto *dstOprStore = ptxBuilderStore.newAddrOperand(atomPtr, "l");
+    auto *valOprStore = ptxBuilderStore.newOperand(old, "r");
+    auto &st = *ptxBuilderStore.create<PTXInstr>("st");
+    st.shared().o("b32");
+    st(dstOprStore, valOprStore).predicate(pred);
+    ptxBuilderStore.launch(rewriter, loc, ASMReturnTy);
+    ptxBuilderMemfence.launch(rewriter, loc, ASMReturnTy);
+    barrier();
+    Value ret = load(atomPtr);
+    barrier();
+    rewriter.replaceOp(op, {ret});
+    return success();
+  }
+};
+/// ====================== atomic_cas codegen end ==========================
+
+/// ====================== atomic_rmw codegen begin ==========================
+struct AtomicRMWOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<triton::AtomicRMWOp>,
+      public LoadStoreConversionBase {
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::AtomicRMWOp>::ConvertTritonGPUOpToLLVMPattern;
+
+  AtomicRMWOpConversion(LLVMTypeConverter &converter,
+                        const Allocation *allocation, Value smem,
+                        AxisInfoAnalysis &axisAnalysisPass,
+                        PatternBenefit benefit)
+      : ConvertTritonGPUOpToLLVMPattern<triton::AtomicRMWOp>(
+            converter, allocation, smem, benefit),
+        LoadStoreConversionBase(axisAnalysisPass) {}
+
+  LogicalResult
+  matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+
+    auto atomicRmwAttr = op.atomic_rmw_op();
+    Value ptr = op.ptr();
+    Value val = op.val();
+
+    Value llPtr = adaptor.ptr();
+    Value llVal = adaptor.val();
+    Value llMask = adaptor.mask();
+
+    auto valElements = getElementsFromStruct(loc, llVal, rewriter);
+    auto ptrElements = getElementsFromStruct(loc, llPtr, rewriter);
+    auto maskElements = getElementsFromStruct(loc, llMask, rewriter);
+
+    auto valueTy = op.getResult().getType().dyn_cast<RankedTensorType>();
+    Type valueElemTy =
+        valueTy ? getTypeConverter()->convertType(valueTy.getElementType())
+                : op.getResult().getType();
+    const size_t valueElemNbits = valueElemTy.getIntOrFloatBitWidth();
+    auto elemsPerThread = getElemsPerThread(val.getType());
+    // vec = 1 for scalar
+    auto vec = getVectorSize(ptr);
+    Value mask = int_val(1, 1);
+    auto tid = tid_val();
+    // tensor
+    if (valueTy) {
+      auto valTy = val.getType().cast<RankedTensorType>();
+      vec = std::min<unsigned>(vec, valTy.getElementType().isF16() ? 2 : 1);
+      // mask
+      auto shape = valueTy.getShape();
+      auto numElements = product(shape);
+      mask = and_(mask, icmp_slt(mul(tid, i32_val(elemsPerThread)),
+                                 i32_val(numElements)));
+    }
+
+    auto vecTy = vec_ty(valueElemTy, vec);
+    SmallVector<Value> resultVals(elemsPerThread);
+    for (size_t i = 0; i < elemsPerThread; i += vec) {
+      Value rmwVal = undef(vecTy);
+      for (int ii = 0; ii < vec; ++ii) {
+        Value iiVal = createIndexAttrConstant(
+            rewriter, loc, getTypeConverter()->getIndexType(), ii);
+        rmwVal = insert_element(vecTy, rmwVal, valElements[i + ii], iiVal);
+      }
+
+      Value rmwPtr = ptrElements[i];
+      Value rmwMask = maskElements[i];
+      rmwMask = and_(rmwMask, mask);
+      std::string sTy;
+      PTXBuilder ptxBuilderAtomicRMW;
+      std::string tyId = valueElemNbits * vec == 64
+                             ? "l"
+                             : (valueElemNbits * vec == 32 ? "r" : "h");
+      auto *dstOpr = ptxBuilderAtomicRMW.newOperand("=" + tyId);
+      auto *ptrOpr = ptxBuilderAtomicRMW.newAddrOperand(rmwPtr, "l");
+      auto *valOpr = ptxBuilderAtomicRMW.newOperand(rmwVal, tyId);
+
+      auto &atom = ptxBuilderAtomicRMW.create<>("atom")->global().o("gpu");
+      auto rmwOp = stringifyRMWOp(atomicRmwAttr).str();
+      auto sBits = std::to_string(valueElemNbits);
+      switch (atomicRmwAttr) {
+      case RMWOp::AND:
+        sTy = "b" + sBits;
+        break;
+      case RMWOp::OR:
+        sTy = "b" + sBits;
+        break;
+      case RMWOp::XOR:
+        sTy = "b" + sBits;
+        break;
+      case RMWOp::ADD:
+        sTy = "s" + sBits;
+        break;
+      case RMWOp::FADD:
+        rmwOp = "add";
+        rmwOp += (valueElemNbits == 16 ? ".noftz" : "");
+        sTy = "f" + sBits;
+        sTy += (vec == 2 && valueElemNbits == 16) ? "x2" : "";
+        break;
+      case RMWOp::MAX:
+        sTy = "s" + sBits;
+        break;
+      case RMWOp::MIN:
+        sTy = "s" + sBits;
+        break;
+      case RMWOp::UMAX:
+        rmwOp = "max";
+        sTy = "u" + sBits;
+        break;
+      case RMWOp::UMIN:
+        rmwOp = "min";
+        sTy = "u" + sBits;
+        break;
+      case RMWOp::XCHG:
+        sTy = "b" + sBits;
+        break;
+      default:
+        return failure();
+      }
+      atom.o(rmwOp).o(sTy);
+      if (valueTy) {
+        atom(dstOpr, ptrOpr, valOpr).predicate(rmwMask);
+        auto retType = vec == 1 ? valueElemTy : vecTy;
+        auto ret = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
+        for (int ii = 0; ii < vec; ++ii) {
+          resultVals[i + ii] =
+              vec == 1 ? ret : extract_element(valueElemTy, ret, idx_val(ii));
+        }
+      } else {
+        PTXBuilder ptxBuilderMemfence;
+        auto memfenc = ptxBuilderMemfence.create<PTXInstr>("membar")->o("gl");
+        memfenc();
+        auto ASMReturnTy = void_ty(ctx);
+        ptxBuilderMemfence.launch(rewriter, loc, ASMReturnTy);
+        rmwMask = and_(rmwMask, icmp_eq(tid, i32_val(0)));
+        atom(dstOpr, ptrOpr, valOpr).predicate(rmwMask);
+        auto old = ptxBuilderAtomicRMW.launch(rewriter, loc, valueElemTy);
+        Value atomPtr = getSharedMemoryBase(loc, rewriter, op.getOperation());
+        atomPtr = bitcast(atomPtr, ptr_ty(valueElemTy, 3));
+        store(old, atomPtr);
+        barrier();
+        Value ret = load(atomPtr);
+        barrier();
+        rewriter.replaceOp(op, {ret});
+      }
+    }
+    if (valueTy) {
+      Type structTy = getTypeConverter()->convertType(valueTy);
+      Value resultStruct =
+          getStructFromElements(loc, resultVals, rewriter, structTy);
+      rewriter.replaceOp(op, {resultStruct});
+    }
+    return success();
+  }
+};
+/// ====================== atomic_rmw codegen end ==========================
 
 void populateTritonToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
                                   RewritePatternSet &patterns, int numWarps,
@@ -4582,6 +4573,13 @@ void populateTritonToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
 
   patterns.add<CmpIOpConversion>(typeConverter, benefit);
   patterns.add<CmpFOpConversion>(typeConverter, benefit);
+
+  // ExpOpConversionApprox will try using ex2.approx if the input type is FP32.
+  // For FP64 input type, ExpOpConversionApprox will return failure and
+  // ElementwiseOpConversion<math::ExpOp, math::ExpOp> defined below will call
+  // __nv_expf for higher-precision calculation
+  patterns.add<ExpOpConversionApprox>(typeConverter, benefit);
+
 #define POPULATE_UNARY_OP(SRC_OP, DST_OP)                                      \
   patterns.add<ElementwiseOpConversion<SRC_OP, DST_OP>>(typeConverter, benefit);
 
@@ -4604,6 +4602,8 @@ void populateTritonToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
   POPULATE_UNARY_OP(triton::PtrToIntOp, LLVM::PtrToIntOp)
 #undef POPULATE_UNARY_OP
 
+  patterns.add<FpToFpOpConversion>(typeConverter, benefit);
+
   patterns.add<FDivOpConversion>(typeConverter, benefit);
 
   patterns.add<ExtElemwiseOpConversion>(typeConverter, benefit);
@@ -4612,10 +4612,16 @@ void populateTritonToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
   patterns.add<ReduceOpConversion>(typeConverter, allocation, smem, benefit);
   patterns.add<ConvertLayoutOpConversion>(typeConverter, allocation, smem,
                                           benefit);
-
+  patterns.add<AtomicCASOpConversion>(typeConverter, allocation, smem,
+                                      axisInfoAnalysis, benefit);
+  patterns.add<AtomicRMWOpConversion>(typeConverter, allocation, smem,
+                                      axisInfoAnalysis, benefit);
   patterns.add<ExtractSliceOpConversion>(typeConverter, allocation, smem,
                                          benefit);
   patterns.add<GetProgramIdOpConversion>(typeConverter, benefit);
+  patterns.add<GetNumProgramsOpConversion>(typeConverter, benefit);
+  patterns.add<InsertSliceOpConversion>(typeConverter, allocation, smem,
+                                        benefit);
   patterns.add<InsertSliceAsyncOpConversion>(typeConverter, allocation, smem,
                                              axisInfoAnalysis, benefit);
   patterns.add<LoadOpConversion>(typeConverter, axisInfoAnalysis, benefit);
@@ -4627,12 +4633,168 @@ void populateTritonToLLVMPatterns(mlir::LLVMTypeConverter &typeConverter,
   patterns.add<ViewLikeOpConversion<triton::ExpandDimsOp>>(typeConverter,
                                                            benefit);
   patterns.add<DotOpConversion>(typeConverter, allocation, smem, benefit);
+  patterns.add<TransOpConversion>(typeConverter, benefit);
+  patterns.add<CatOpConversion>(typeConverter, benefit);
+  patterns.add<PrintfOpConversion>(typeConverter, benefit);
 }
 
 class ConvertTritonGPUToLLVM
     : public ConvertTritonGPUToLLVMBase<ConvertTritonGPUToLLVM> {
+
+private:
+  void decomposeMmaToDotOperand(ModuleOp mod, int numWarps) {
+    // replace `mma -> dot_op` with `mma -> blocked -> dot_op`
+    // unless certain conditions are met
+    mod.walk([&](triton::gpu::ConvertLayoutOp cvtOp) -> void {
+      OpBuilder builder(cvtOp);
+      auto srcType = cvtOp.getOperand().getType().cast<RankedTensorType>();
+      auto dstType = cvtOp.getType().cast<RankedTensorType>();
+      auto srcMma =
+          srcType.getEncoding().dyn_cast<triton::gpu::MmaEncodingAttr>();
+      auto dstDotOp =
+          dstType.getEncoding().dyn_cast<triton::gpu::DotOperandEncodingAttr>();
+      if (srcMma && dstDotOp &&
+          !ConvertLayoutOpConversion::isMmaToDotShortcut(srcMma, dstDotOp)) {
+        auto tmpType = RankedTensorType::get(
+            dstType.getShape(), dstType.getElementType(),
+            triton::gpu::BlockedEncodingAttr::get(
+                mod.getContext(), srcType.getShape(), getSizePerThread(srcMma),
+                getOrder(srcMma), numWarps));
+        auto tmp = builder.create<triton::gpu::ConvertLayoutOp>(
+            cvtOp.getLoc(), tmpType, cvtOp.getOperand());
+        auto newConvert = builder.create<triton::gpu::ConvertLayoutOp>(
+            cvtOp.getLoc(), dstType, tmp);
+        cvtOp.replaceAllUsesWith(newConvert.getResult());
+        cvtOp.erase();
+      }
+    });
+  }
+
+  void decomposeBlockedToDotOperand(ModuleOp mod) {
+    // replace `blocked -> dot_op` with `blocked -> shared -> dot_op`
+    // because the codegen doesn't handle `blocked -> dot_op` directly
+    mod.walk([&](triton::gpu::ConvertLayoutOp cvtOp) -> void {
+      OpBuilder builder(cvtOp);
+      auto srcType = cvtOp.getOperand().getType().cast<RankedTensorType>();
+      auto dstType = cvtOp.getType().cast<RankedTensorType>();
+      auto srcBlocked =
+          srcType.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
+      auto dstDotOp =
+          dstType.getEncoding().dyn_cast<triton::gpu::DotOperandEncodingAttr>();
+      if (srcBlocked && dstDotOp) {
+        auto tmpType = RankedTensorType::get(
+            dstType.getShape(), dstType.getElementType(),
+            triton::gpu::SharedEncodingAttr::get(
+                mod.getContext(), dstDotOp, srcType.getShape(),
+                getOrder(srcBlocked), srcType.getElementType()));
+        auto tmp = builder.create<triton::gpu::ConvertLayoutOp>(
+            cvtOp.getLoc(), tmpType, cvtOp.getOperand());
+        auto newConvert = builder.create<triton::gpu::ConvertLayoutOp>(
+            cvtOp.getLoc(), dstType, tmp);
+        cvtOp.replaceAllUsesWith(newConvert.getResult());
+        cvtOp.erase();
+      }
+    });
+  }
+
+  void decomposeInsertSliceAsyncOp(ModuleOp mod) {
+    AxisInfoAnalysis axisInfoAnalysis(mod.getContext());
+    axisInfoAnalysis.run(mod);
+    // TODO(Keren): This is a hacky knob that may cause performance regression
+    // when decomposition has been performed. We should remove this knob once we
+    // have thorough analysis on async wait. Currently, we decompose
+    // `insert_slice_async` into `load` and `insert_slice` without knowing which
+    // `async_wait` is responsible for the `insert_slice_async`. To guarantee
+    // correctness, we blindly set the `async_wait` to wait for all async ops.
+    //
+    // There are two options to improve this:
+    // 1. We can perform a dataflow analysis to find the `async_wait` that is
+    // responsible for the `insert_slice_async` in the backend.
+    // 2. We can modify the pipeline to perform the decomposition before the
+    // `async_wait` is inserted. However, it is also risky because we don't know
+    // the correct vectorized shape yet in the pipeline pass. Making the
+    // pipeline pass aware of the vectorization could introduce additional
+    // dependencies on the AxisInfoAnalysis and the Coalesce analysis.
+    bool decomposed = false;
+    // insert_slice_async %src, %dst, %idx, %mask, %other
+    // =>
+    // %tmp = load %src, %mask, %other
+    // %res = insert_slice %tmp into %dst[%idx]
+    mod.walk([&](triton::gpu::InsertSliceAsyncOp insertSliceAsyncOp) -> void {
+      OpBuilder builder(insertSliceAsyncOp);
+
+      // Get the vectorized load size
+      auto src = insertSliceAsyncOp.src();
+      auto dst = insertSliceAsyncOp.dst();
+      auto srcTy = src.getType().cast<RankedTensorType>();
+      auto dstTy = dst.getType().cast<RankedTensorType>();
+      auto srcBlocked =
+          srcTy.getEncoding().dyn_cast<triton::gpu::BlockedEncodingAttr>();
+      auto resSharedLayout =
+          dstTy.getEncoding().dyn_cast<triton::gpu::SharedEncodingAttr>();
+      auto resElemTy = dstTy.getElementType();
+      unsigned inVec = axisInfoAnalysis.getPtrVectorSize(src);
+      unsigned outVec = resSharedLayout.getVec();
+      unsigned minVec = std::min(outVec, inVec);
+      auto maxBitWidth =
+          std::max<unsigned>(128, resElemTy.getIntOrFloatBitWidth());
+      auto vecBitWidth = resElemTy.getIntOrFloatBitWidth() * minVec;
+      auto bitWidth = std::min<unsigned>(maxBitWidth, vecBitWidth);
+      auto byteWidth = bitWidth / 8;
+
+      // If the load byte width is not eligible or the current compute
+      // capability does not support async copy, then we do decompose
+      if (triton::gpu::InsertSliceAsyncOp::getEligibleLoadByteWidth(
+              computeCapability)
+              .contains(byteWidth))
+        return;
+
+      // load
+      auto tmpTy =
+          RankedTensorType::get(srcTy.getShape(), resElemTy, srcBlocked);
+      auto loadOp = builder.create<triton::LoadOp>(
+          insertSliceAsyncOp.getLoc(), tmpTy, insertSliceAsyncOp.src(),
+          insertSliceAsyncOp.mask(), insertSliceAsyncOp.other(),
+          insertSliceAsyncOp.cache(), insertSliceAsyncOp.evict(),
+          insertSliceAsyncOp.isVolatile());
+
+      // insert_slice
+      auto axis = insertSliceAsyncOp.axis();
+      auto intAttr = [&](int64_t v) { return builder.getI64IntegerAttr(v); };
+      auto offsets = SmallVector<OpFoldResult>(dstTy.getRank(), intAttr(0));
+      auto sizes = SmallVector<OpFoldResult>(dstTy.getRank(), intAttr(1));
+      auto strides = SmallVector<OpFoldResult>(dstTy.getRank(), intAttr(1));
+      offsets[axis] = insertSliceAsyncOp.index();
+      for (size_t i = 0; i < dstTy.getRank(); i++) {
+        if (i != axis)
+          sizes[i] = intAttr(dstTy.getShape()[i]);
+      }
+      auto insertSliceOp = builder.create<tensor::InsertSliceOp>(
+          insertSliceAsyncOp.getLoc(), loadOp, insertSliceAsyncOp.dst(),
+          offsets, sizes, strides);
+      // Replace
+      insertSliceAsyncOp.replaceAllUsesWith(insertSliceOp.getResult());
+      insertSliceAsyncOp.erase();
+      decomposed = true;
+    });
+
+    mod.walk([&](triton::gpu::AsyncWaitOp asyncWaitOp) -> void {
+      if (!triton::gpu::AsyncWaitOp::isSupported(computeCapability)) {
+        // async wait is supported in Ampere and later
+        asyncWaitOp.erase();
+      } else if (decomposed) {
+        // Wait for all previous async ops
+        OpBuilder builder(asyncWaitOp);
+        auto newAsyncWaitOp =
+            builder.create<triton::gpu::AsyncWaitOp>(asyncWaitOp.getLoc(), 0);
+        asyncWaitOp.erase();
+      }
+    });
+  }
+
 public:
-  ConvertTritonGPUToLLVM() = default;
+  explicit ConvertTritonGPUToLLVM(int computeCapability)
+      : computeCapability(computeCapability) {}
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -4647,17 +4809,27 @@ public:
 
     int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
 
-    // step 1: Allocate shared memories and insert barriers
-    // setp 2: Convert SCF to CFG
-    // step 3: Convert FuncOp to LLVMFuncOp via partial conversion
-    // step 4: Convert the rest of ops via partial conversion
-    // The reason for putting step 1 before step 2 is that the membar analysis
-    // currently only supports SCF but not CFG.
-    // The reason for a seperation between 1/4 is that, step 3 is out of
-    // the scope of Dialect Conversion, thus we need to make sure the smem
-    // is not revised during the conversion of step 4.
+    // step 1: Decompose unoptimized layout conversions to use shared memory
+    // step 2: Decompose insert_slice_async to use load + insert_slice for
+    // pre-Ampere architectures or unsupported vectorized load sizes
+    // step 3: Allocate shared memories and insert barriers
+    // step 4: Convert SCF to CFG
+    // step 5: Convert FuncOp to LLVMFuncOp via partial conversion
+    // step 6: Convert the rest of ops via partial
+    // conversion The reason for putting step 1 before step 2 is that the membar
+    // analysis currently only supports SCF but not CFG. The reason for a
+    // separation between 1/4 is that, step 3 is out of the scope of Dialect
+    // Conversion, thus we need to make sure the smem is not revised during the
+    // conversion of step 4.
+    decomposeMmaToDotOperand(mod, numWarps);
+
+    decomposeBlockedToDotOperand(mod);
+
+    decomposeInsertSliceAsyncOp(mod);
+
     Allocation allocation(mod);
-    MembarAnalysis membar(&allocation);
+    MembarAnalysis membarPass(&allocation);
+    membarPass.run();
 
     RewritePatternSet scf_patterns(context);
     mlir::populateLoopToStdConversionPatterns(scf_patterns);
@@ -4714,6 +4886,8 @@ protected:
                         TritonGPUToLLVMTypeConverter &typeConverter);
 
   Value smem;
+
+  int computeCapability{};
 };
 
 void ConvertTritonGPUToLLVM::initSharedMemory(
@@ -4722,8 +4896,8 @@ void ConvertTritonGPUToLLVM::initSharedMemory(
   OpBuilder b(mod.getBodyRegion());
   auto loc = mod.getLoc();
   auto elemTy = typeConverter.convertType(b.getIntegerType(8));
-  // Set array size 0 and external linkage indicates that we use dynamic shared
-  // allocation to allow a larger shared memory size for each kernel.
+  // Set array size 0 and external linkage indicates that we use dynamic
+  // shared allocation to allow a larger shared memory size for each kernel.
   auto arrayTy = LLVM::LLVMArrayType::get(elemTy, 0);
   auto global = b.create<LLVM::GlobalOp>(
       loc, arrayTy, /*isConstant=*/false, LLVM::Linkage::External,
@@ -4743,6 +4917,27 @@ void ConvertTritonGPUToLLVM::initSharedMemory(
 } // namespace
 
 namespace mlir {
+
+namespace LLVM {
+
+void vprintf(StringRef msg, ValueRange args,
+             ConversionPatternRewriter &rewriter) {
+  PrintfOpConversion::llPrintf(msg, args, rewriter);
+}
+
+void vprintf_array(Value thread, ArrayRef<Value> arr, std::string info,
+                   std::string elem_repr, ConversionPatternRewriter &builder) {
+  std::string fmt = info + " t-%d ";
+  std::vector<Value> new_arr({thread});
+  for (int i = 0; i < arr.size(); ++i) {
+    fmt += elem_repr + ((i == arr.size() - 1) ? "" : ", ");
+    new_arr.push_back(arr[i]);
+  }
+
+  vprintf(fmt, new_arr, builder);
+}
+
+} // namespace LLVM
 
 TritonLLVMConversionTarget::TritonLLVMConversionTarget(
     MLIRContext &ctx, mlir::LLVMTypeConverter &typeConverter)
@@ -4767,8 +4962,9 @@ TritonLLVMFunctionConversionTarget::TritonLLVMFunctionConversionTarget(
 
 namespace triton {
 
-std::unique_ptr<OperationPass<ModuleOp>> createConvertTritonGPUToLLVMPass() {
-  return std::make_unique<::ConvertTritonGPUToLLVM>();
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonGPUToLLVMPass(int computeCapability) {
+  return std::make_unique<::ConvertTritonGPUToLLVM>(computeCapability);
 }
 
 } // namespace triton

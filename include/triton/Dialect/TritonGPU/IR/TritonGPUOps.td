@@ -10,6 +10,8 @@ include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td" // NoSideEffect
 include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
 
+def ResultsAreSharedEncoding: NativeOpTrait<"ResultsAreSharedEncoding">;
+
 class TTG_Op<string mnemonic, list<Trait> traits = []> :
     Op<TritonGPU_Dialect, mnemonic, traits>;
 
@@ -30,12 +32,18 @@ def TTG_AsyncWaitOp : TTG_Op<"async_wait"> {
   let arguments = (ins I32Attr:$num);
 
   let assemblyFormat = "attr-dict";
+
+  let extraClassDeclaration = [{
+    static bool isSupported(int computeCapability) {
+      return computeCapability >= 80;
+    }
+  }];
 }
 
 // Port Arith_CmpIOp & Arith_CmpFOp & Std_SelectOp to TritonGPU.
 // This is needed because these ops don't
 // handle encodings
-// e.g., https://github.com/llvm/llvm-project/blob/main/mlir/include/mlir/Dialect/Arithmetic/IR/ArithmeticOps.td#L111
+// e.g., https://github.com/llvm/llvm-project/blob/main/mlir/include/mlir/Dialect/Arith/IR/ArithOps.td#L111
 def TTG_CmpIOp : TTG_Op<"cmpi", [NoSideEffect]> {
   let summary = "integer comparison operation";
 
@@ -75,9 +83,9 @@ def TTG_SelectOp : TTG_Op<"select", [NoSideEffect]> {
 
 
 def TTG_InsertSliceAsyncOp : TTG_Op<"insert_slice_async",
-                                    [SameVariadicOperandSize,
-                                     // MemoryEffects<[MemRead]>, doesn't work with CSE but seems like it should?
-                                     NoSideEffect,
+                                    [AttrSizedOperandSegments,
+                                     ResultsAreSharedEncoding,
+                                     MemoryEffects<[MemRead]>,
                                      TypesMatchWith<"infer mask type from src type",
                                                     "src", "mask", "getI1SameShape($_self)",
                                                     "($_op.getOperands().size() <= 3) || std::equal_to<>()">,
@@ -92,6 +100,10 @@ def TTG_InsertSliceAsyncOp : TTG_Op<"insert_slice_async",
 
       It returns a copy of `$dst` with the proper slice updated asynchronously with the value of `$src`.
       This operation is non-blocking, and `$results` will have the updated value after the corresponding async_wait.
+
+      When converting from `tt.load` to `triton_gpu.insert_slice_async`, the `$evict`, `$cache`, and `$isVolatile` fields
+      might be ignored on certain hardware. For example, on NVIDIA GPUs, the cache policy is determined by the backend,
+      and `$evict` and `$isVolatile` are ignored because they apply to L1 cache only.
 
       The insert_slice_async operation supports the following arguments:
 
@@ -145,52 +157,24 @@ def TTG_InsertSliceAsyncOp : TTG_Op<"insert_slice_async",
   //  attr-dict `:` type($src) `->` type($dst)
   //}];
 
+  let extraClassDeclaration = [{
+    static DenseSet<unsigned> getEligibleLoadByteWidth(int computeCapability) {
+      DenseSet<unsigned> validLoadBytes;
+      if (computeCapability >= 80) {
+        validLoadBytes = {4, 8, 16};
+      }
+      return validLoadBytes;
+    }
+  }];
+
   // The custom parser could be replaced with oilist in LLVM-16
   let parser = [{ return parseInsertSliceAsyncOp(parser, result); }];
 
   let printer = [{ return printInsertSliceAsyncOp(p, *this); }];
-
-  // result needs to be of shared layout
-  let verifier = [{ return ::verify(*this); }];
 }
 
-def TTG_ExtractSliceOp : TTG_Op<"extract_slice", [NoSideEffect, InferTypeOpInterface]> {
-  let summary = "extract slice";
-  let description = [{
-    The "extract_slice" operation extracts a `$result` tensor from a `$src` tensor as
-    specified by the operation's `$index` and `$axis` arguments.
-
-    The extract_slice operation supports the following arguments:
-
-    * src: the tensor that is extracted from.
-    * index: the index at the given `$axis` from which the `$src` tensor is extracted
-
-    Example:
-
-    ```
-    // Rank-reducing extract_slice.
-    %1 = tensor.extract_slice %0, %index {axis = 0} : tensor<8x16x4xf32> -> tensor<1x16x4xf32>
-    ```
-  }];
-
-  let arguments = (ins TT_Tensor:$src, I32:$index, I32Attr:$axis);
-
-  let results = (outs TT_Tensor:$result);
-
-  let assemblyFormat = [{$src `,` $index attr-dict `:` type($src) `->` type($result)}];
-
-  let extraClassDeclaration = [{
-    static ::mlir::LogicalResult inferReturnTypes(::mlir::MLIRContext *context,
-          ::llvm::Optional<::mlir::Location> location, ::mlir::ValueRange operands,
-          ::mlir::DictionaryAttr attributes, ::mlir::RegionRange regions,
-          ::llvm::SmallVectorImpl<::mlir::Type> &inferredReturnTypes);
-  }];
-
-  // result needs to be of shared layout
-  let verifier = [{ return ::verify(*this); }];
-}
-
-def TTG_AllocTensorOp : TTG_Op<"alloc_tensor", [NoSideEffect]> {
+def TTG_AllocTensorOp : TTG_Op<"alloc_tensor", [MemoryEffects<[MemAlloc]>,  // Allocate shared memory
+                                                ResultsAreSharedEncoding]> {
   let summary = "allocate tensor";
 
   let description = [{
@@ -203,9 +187,6 @@ def TTG_AllocTensorOp : TTG_Op<"alloc_tensor", [NoSideEffect]> {
   let assemblyFormat = [{attr-dict `:` type($result)}];
 
   let results = (outs TT_Tensor:$result);
-
-  // result needs to be of shared layout
-  let verifier = [{ return ::verify(*this); }];
 }
 
 #endif
