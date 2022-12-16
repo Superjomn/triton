@@ -204,10 +204,7 @@ mma_layout::mma_layout(size_t num_warps,
     bool is_b_row = ord_b[0] != 0;
     bool is_a_vec4 = !is_a_row && (layout_a->get_shape()[ord_a[0]] <= 16);
     bool is_b_vec4 =  is_b_row && (layout_b->get_shape()[ord_b[0]] <= 16);
-
-    // DEBUG
-    is_a_vec4 = true;
-    is_b_vec4 = true;
+    std::cout << "vec4 " << is_a_vec4 << " " << is_b_vec4 << std::endl;
 
     int pack_size_0 = (is_a_row ||  is_a_vec4) ? 1 : 2;
     int pack_size_1 = (is_b_row && !is_b_vec4) ? 2 : 1;

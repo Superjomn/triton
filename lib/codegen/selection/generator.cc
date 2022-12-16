@@ -118,17 +118,18 @@ void vprintf(std::string fmt, ArrayRef<Value*> Args, Builder* builder) {
   builder->CreateCall(funcType, opernds);
 }
 
-void vprintf_array(Value* thread, ArrayRef<Value*> arr, std::string info, std::string elem_repr, Builder* builder) {
+void vprintf_array(Value *thread, ArrayRef<Value*> arr, std::string info,
+                   std::string elem_repr, Builder *builder) {
   std::string fmt = info + " t-%d ";
   std::vector<Value*> new_arr({thread});
-  for (auto* v : arr) {
-    fmt += elem_repr + ", ";
-    new_arr.push_back(v);
+  for (int i = 0; i < arr.size(); ++i) {
+    fmt += elem_repr + ((i == arr.size() - 1) ? "" : ", ");
+    new_arr.push_back(arr[i]);
   }
-  fmt += "\n";
 
-  vprintf(fmt.c_str(), new_arr, builder);
+  vprintf(fmt, new_arr, builder);
 }
+
 
 Value* adder::operator()(Value *x, Value *y, const std::string& name) {
   // (x + cst) + y -> (x + y) + cst
@@ -1893,6 +1894,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   int vec_a = swizzle_->get_vec(layout_a);
   int vec_b = swizzle_->get_vec(layout_b);
   printf("vec_ab t-0 %d %d\n", vec_a, vec_b);
+  assert(vec_a <= 4);
+  assert(vec_b <= 4);
 
   // strides
   bool is_a_row = ord_a[0] != 0;
@@ -2059,7 +2062,9 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
   unsigned num_m = layout_c->rep(0) * shape_c[0] / layout_c->shape_per_cta(0);
   unsigned num_n = layout_c->rep(1) * shape_c[1] / layout_c->shape_per_cta(1);
+  printf("num_n t-0 numN:%d rep:%d shapec:%d spc:%d\n", num_n, layout_c->rep(1), shape_c[1], layout_c->shape_per_cta(1));
 
+  printf("num_mn t-0 %d %d\n", num_m, num_n);
   // create mma & unpack result
   auto call_mma = [&](unsigned m, unsigned n, unsigned K) {
     auto ha = has[{m, K}];
@@ -2079,8 +2084,10 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     // execute mma
     Value *nc = call(mma, args);
     // unpack
-    for(unsigned i = 0; i < 8; i++)
-      acc[idx[i]] = extract_val(nc, {i});
+    for(unsigned i = 0; i < 8; i++) {
+        printf("idx-id t-0 %lu\n", idx[i]);
+        acc[idx[i]] = extract_val(nc, { i });
+    }
 
 
 #define SHOW_MMA_V1 1
@@ -2097,13 +2104,9 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     for (int i = 0; i < 8; i++) {
       pargs.push_back(extract_val(nc, {i}));
     }
-    vprintf("working on mma!!!!", {}, rewriter);
 
     vprintf("mma t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)", pargs, builder_);
-      vprintf("mma.acc t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)", pargs, builder_);
-
 #endif
-
   };
 
   ir::phi_node* phiA = dynamic_cast<ir::phi_node*>(A);
@@ -2136,12 +2139,10 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     int step_ak = is_a_row ? K / (num_ptr_a*vec_a)*(num_ptr_a*vec_a) : K;
     auto offset = i32(step_am*stride_rep_m*stride_am + step_ak*stride_ak);
     vprintf("Aoffsets t-%d %d %d %d\n", {gThreadId, i32(offidx), off_a[offidx], offset}, rewriter);
-      vprintf("offA t-%d %d", {gThreadId, off_a[offidx]}, rewriter);
+    vprintf("offA t-%d %d", {gThreadId, off_a[offidx]}, rewriter);
 
-      Value* pa =  gep(ptra, offset);
+    Value* pa =  gep(ptra, offset);
     vprintf("pa t-%d %d %d", {gThreadId, ptra, offset}, rewriter);
-
-
 
     vprintf("offset_A t-%d %d %d\n", {gThreadId, pa, offset}, builder_);
     auto ptrTy = ptr_ty(vec_ty(i32_ty, vec_a/2), 3);
@@ -2298,6 +2299,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
         }
 
   }
+
+  printf("mma.mn t-0 %d %d\n", num_m, num_n);
 
   vprintf_array(gThreadId, acc, "acc", "%f", builder_);
 
