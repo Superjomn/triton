@@ -1894,8 +1894,6 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   int vec_a = swizzle_->get_vec(layout_a);
   int vec_b = swizzle_->get_vec(layout_b);
   printf("vec_ab t-0 %d %d\n", vec_a, vec_b);
-  assert(vec_a <= 4);
-  assert(vec_b <= 4);
 
   // strides
   bool is_a_row = ord_a[0] != 0;
@@ -2062,7 +2060,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
   unsigned num_m = layout_c->rep(0) * shape_c[0] / layout_c->shape_per_cta(0);
   unsigned num_n = layout_c->rep(1) * shape_c[1] / layout_c->shape_per_cta(1);
-  printf("num_n t-0 numN:%d rep:%d shapec:%d spc:%d\n", num_n, layout_c->rep(1), shape_c[1], layout_c->shape_per_cta(1));
+  printf("num_mn t-0 numM:%d rep:%d shapec:%d spc:%d\n", num_m, layout_c->rep(0), shape_c[0], layout_c->shape_per_cta(0));
+  printf("num_mn t-0 numN:%d rep:%d shapec:%d spc:%d\n", num_n, layout_c->rep(1), shape_c[1], layout_c->shape_per_cta(1));
 
   printf("num_mn t-0 %d %d\n", num_m, num_n);
   // create mma & unpack result
@@ -2097,6 +2096,9 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     };
 
     std::vector<Value*> pargs({gThreadId});
+    pargs.push_back(i32(m));
+    pargs.push_back(i32(n));
+    pargs.push_back(i32(K));
     for (int i = 0; i < 4; i++) {
       pargs.push_back(get_f16(args[i], 0));
       pargs.push_back(get_f16(args[i], 1));
@@ -2105,7 +2107,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       pargs.push_back(extract_val(nc, {i}));
     }
 
-    vprintf("mma t-%d A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)", pargs, builder_);
+    vprintf("mma t-%d [%d %d %d] A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)", pargs, builder_);
 #endif
   };
 
@@ -2120,8 +2122,9 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
         ir::basic_block* inc_block = phiA->get_incoming_block(inc);
         lazy_phi_incs_.push_back(std::make_tuple((PHINode*)vals[{m, K}].first, val0, inc_block));
         lazy_phi_incs_.push_back(std::make_tuple((PHINode*)vals[{m, K}].second, val1, inc_block));
-      } else
+      } else {
         vals[{m, K}] = {val0, val1};
+      }
 
   };
 
@@ -2291,6 +2294,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       }
     };
 #endif
+    printf("numMN t-0 %d %d\n", num_m, num_n);
+
 
     for(unsigned K = 0; K < NK; K += 4)
       for(unsigned m = 0; m < num_m/2; m++)
@@ -2298,7 +2303,12 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
           call_mma(m, n, K);
         }
 
+    printf("has.size t-0 %d\n", has.size());
+    printf("hbs.size t-0 %d\n", hbs.size());
+
   }
+
+  printf("acc.n t-0 %d\n", acc.size());
 
   printf("mma.mn t-0 %d %d\n", num_m, num_n);
 
@@ -2307,7 +2317,10 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
   // write back accumulators
   for(size_t i = 0; i < idxs_.at(C).size(); i++) {
-      vals_[C][idxs_[C][i]] = acc[i];
+    auto coord = idxs_[C][i];
+    vprintf("multiDimOffset t-%d %d %d", {gThreadId, coord[0], coord[1]}, rewriter);
+    vprintf("acci t-%d (%d,%d) %f", {gThreadId, coord[0], coord[1], acc[i]}, builder_);
+    vals_[C][idxs_[C][i]] = acc[i];
   }
 }
 
@@ -4111,11 +4124,15 @@ void generator::visit_layout_mma(analysis::mma_layout* layout) {
     offset_b_k_[layout] = and_(lane, _3);
     // i indices
     Value *offset_c_m = add(and_(lane, _1), offset_a_m_[layout]);
+    //vprintf("t-%d offset_c_m %d", {gThreadId, offset_c_m}, builder_);
+    printf("MN t-0 M shape:%d spc:%d rep:%d\n", shape[0], layout->shape_per_cta(0), layout->rep(0));
     for(unsigned m = 0; m < shape[0]; m+=layout->shape_per_cta(0))
     for(unsigned mm = 0; mm < layout->rep(0); mm++)
       idx_m.push_back(add(offset_c_m, i32(m + mm*2)));
     // j indices
     Value *offset_c_n = add(and_(lane, _2), add(off_warp_n, off_pair_n));
+    //vprintf("t-%d offset_c_n %d", {gThreadId, offset_c_n}, builder_);
+    printf("MN t-0 N shape:%d spc:%d rep:%d\n", shape[1], layout->shape_per_cta(1), layout->rep(1));
     for(unsigned n = 0; n < shape[1]; n+=layout->shape_per_cta(1))
     for(unsigned nn = 0; nn < layout->rep(1); nn++){
       idx_n.push_back(add(offset_c_n, i32(n + nn/2*4 + (nn%2)*2*layout->fpw(1)*layout->rep(1))));

@@ -145,7 +145,6 @@ namespace triton
       {
         throw std::runtime_error("Error in parsing version");
       }
-      printf("version: %d\n", version);
 
       return ptxas;
     }

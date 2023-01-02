@@ -204,12 +204,13 @@ mma_layout::mma_layout(size_t num_warps,
     bool is_b_row = ord_b[0] != 0;
     bool is_a_vec4 = !is_a_row && (layout_a->get_shape()[ord_a[0]] <= 16);
     bool is_b_vec4 =  is_b_row && (layout_b->get_shape()[ord_b[0]] <= 16);
-    std::cout << "vec4 " << is_a_vec4 << " " << is_b_vec4 << std::endl;
 
     int pack_size_0 = (is_a_row ||  is_a_vec4) ? 1 : 2;
     int pack_size_1 = (is_b_row && !is_b_vec4) ? 2 : 1;
     rep_ = {2*pack_size_0, 2*pack_size_1, 1};
     spw_ = {fpw_[0]*4*rep_[0], fpw_[1]*4*rep_[1], 1};
+    printf("spw t-0 M spw:%d fpw:%d rep:%d isarow:%d isavec4:%d\n", spw_[0], fpw_[0], rep_[0], is_a_row, is_a_vec4);
+    printf("spw t-0 N spw:%d fpw:%d rep:%d isarow:%d isavec4:%d\n", spw_[1], fpw_[1], rep_[1], is_b_row, is_b_vec4);
     contig_per_thread_ = {1, 1};
     order_ = {0, 1};
   }
@@ -230,6 +231,7 @@ mma_layout::mma_layout(size_t num_warps,
         wpt_[0] = clamp(wpt_[0]*2, 1, shape_[0] / spw_[0]);
       if(wpt_[0] * wpt_[1] * wpt_[2] < num_warps)
         wpt_[1] = clamp(wpt_[1]*2, 1, shape_[1] / spw_[1]);
+      printf("** finalwpt: %d %d\n", wpt_[0], wpt_[1]);
     }while(wpt_nm1 != wpt_);
   } else {
     bool changed = false;
@@ -273,6 +275,7 @@ mma_layout::mma_layout(size_t num_warps,
 
   /* shape per block */
   shape_per_cta_ = {spw_[0]*wpt_[0], spw_[1]*wpt_[1], 1};
+  printf("spc t-0 spw:%d,%d wpt:%d,%d %d-%d\n", spw_[0], spw_[1], wpt_[0], wpt_[1], shape_per_cta_[0], shape_per_cta_[1]);
 }
 
 
