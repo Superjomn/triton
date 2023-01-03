@@ -108,7 +108,7 @@ std::unique_ptr<llvm::Module> add_passes_to_emit_bin(
   dce.run(ir);
   peephole.run(ir);
   dce.run(ir);
-  pipeline.run(ir);
+  //pipeline.run(ir);
   dce.run(ir);
   // ir.print(std::cout);
   disassociate.run(ir);
@@ -143,10 +143,10 @@ std::unique_ptr<llvm::Module> add_passes_to_emit_bin(
   // ir.print(std::cout);
   liveness.run(ir);
   allocation.run(ir);
-  prefetch_s.run(ir);
+  //prefetch_s.run(ir);
   barriers.run(ir);
   // exit(1);
-  // ir.print(std::cout);
+  ir.print(std::cout);
   isel.visit(ir, *llvm);
   shared_static = allocation.allocated_size();
 

@@ -453,6 +453,7 @@ void init_triton_codegen(py::module &&m) {
             extern_lib_map.emplace(
                 name, triton::codegen::create_extern_lib(name, path));
           }
+
           // device properties
           if (cc == 0) {
             CUdevice dev = (CUdevice)device;
@@ -471,6 +472,7 @@ void init_triton_codegen(py::module &&m) {
           llvm::raw_string_ostream llir(tmp);
           llir << *llvm;
           llir.flush();
+          //llvm::outs() << "llvmir:\n" << tmp << "\n";
           asm_map["llir"] = py::cast(tmp);
           // LLVM-IR -> PTX
           std::string ptx = drv::llir_to_ptx(llvm.get(), cc, version);
