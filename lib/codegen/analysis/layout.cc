@@ -222,8 +222,6 @@ mma_layout::mma_layout(size_t num_warps,
   // try to make warp-level tiles as square as possible to maximize data re-use
   if (tgt->as_nvidia()->sm() < 80) {
     std::vector<int> wpt_nm1;
-    printf("hello\n");
-    assert(false);
     do{
       wpt_nm1 = wpt_;
       printf("spw: %d %d\n", spw_[0], spw_[1]);
