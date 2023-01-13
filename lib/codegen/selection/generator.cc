@@ -1632,7 +1632,6 @@ void generator::visit_atomic_rmw_inst(ir::atomic_rmw_inst *atom) {
  */
 //TODO: clean-up
 void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::value *D, unsigned NK) {
-  assert(false);
   auto rewriter = builder_;
   // shapes
   auto shape_c = C->get_type()->get_block_shapes();
@@ -1657,6 +1656,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   analysis::mma_layout*    layout_c = layouts_->get(C)->to_mma();
   analysis::shared_layout* layout_a = layouts_->get(A)->to_shared();
   analysis::shared_layout* layout_b = layouts_->get(B)->to_shared();
+
   // vectorization
   int vec_a = swizzle_->get_vec(layout_a);
   int vec_b = swizzle_->get_vec(layout_b);
@@ -1684,6 +1684,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   int step_b0   = is_b_row ? stride_rep_n : stride_rep_k;
   int num_ptr_b = std::max(2 * per_phase_b * max_phase_b / step_b0, 1);
 
+  printf("wpt t-0 %d %d\n", layout_c->wpt(0), layout_c->wpt(1));
 
   // max_phase_a = 4;
   // vec_a = 8;
@@ -1769,13 +1770,14 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       (m*2 + 1) + (n*4 + 2)*num_m, (m*2 + 1) + (n*4 + 3)*num_m
     };
     std::vector<Value*> args = {ha.first, ha.second, hb.first, hb.second};
+    // execute mma
     for(unsigned i = 0; i < 8; i++)
       args.push_back(acc[idx[i]]);
-    // execute mma
     Value *nc = call(mma, args);
     // unpack
     for(unsigned i = 0; i < 8; i++)
       acc[idx[i]] = extract_val(nc, {i});
+
 #define SHOW_MMA_V1 1
 #if SHOW_MMA_V1
     auto get_f16 = [&](Value* value, int idx) {
@@ -1791,10 +1793,13 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       pargs.push_back(get_f16(args[i], 1));
     }
     for (int i = 0; i < 8; i++) {
+      pargs.push_back(args[4+i]);
+    }
+    for (int i = 0; i < 8; i++) {
       pargs.push_back(extract_val(nc, {i}));
     }
 
-    vprintf("mma t-%d [%d %d %d] A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)", pargs, builder_);
+    vprintf("mma t-%d [%d %d %d] A:(%f,%f) (%f,%f) B:(%f,%f) (%f,%f) C:(%f,%f,%f,%f,%f,%f,%f,%f) D:(%f,%f,%f,%f,%f,%f,%f,%f)", pargs, builder_);
 #endif
   };
 
@@ -1878,49 +1883,8 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
 
   // update accumulators
   if (C->is_prefetched()) {
-    // create phis
-    builder_->SetInsertPoint(curr_bb->getFirstNonPHI());
-    for (unsigned m = 0; m < num_m/2; m += is_a_row?1:2) {
-      has[{m, 0}].first = phi(f16x2_ty, 2);
-      has[{m, 0}].second = phi(f16x2_ty, 2);
-      if (!is_a_row && vec_a>4) {
-        has[{m+1, 0}].first = phi(f16x2_ty, 2);
-        has[{m+1, 0}].second = phi(f16x2_ty, 2);
-      }
-    }
-    for (unsigned n = 0; n < num_n/2; n += is_b_row?2:1) {
-      hbs[{n, 0}].first = phi(f16x2_ty, 2);
-      hbs[{n, 0}].second = phi(f16x2_ty, 2);
-      if (is_b_row && vec_b>4) {
-        hbs[{n+1, 0}].first = phi(f16x2_ty, 2);
-        hbs[{n+1, 0}].second = phi(f16x2_ty, 2);
-      }
-    }
-
-    // insert prefetched lds at the end of loop header
-    builder_->SetInsertPoint(bbs_[phiA->get_incoming_block(0)]->getTerminator());
-    for (unsigned m = 0; m < num_m/2; m += is_a_row?1:2)
-      load_a(m, 0, 0, true);
-    for (unsigned n = 0; n < num_n/2; n += is_b_row?2:1)
-      load_b(n, 0, 0, true);
-
-    // update accumulators
-    builder_->SetInsertPoint(curr_bb);
-    for (unsigned K = 0; K < NK; K += 4) {
-      int NEXTK = (K + 4) % NK;
-      // prefetch A
-      for (unsigned m = 0; m < num_m/2; m+=is_a_row?1:2)
-        load_a(m, NEXTK, 1, true);
-      // prefetch B
-      for (unsigned n = 0; n < num_n/2; n+=is_b_row?2:1)
-        load_b(n, NEXTK, 1, true);
-      // tensor core ops
-      for(unsigned m = 0; m < num_m/2; m++)
-      for(unsigned n = 0; n < num_n/2; n++){
-        call_mma(m, n, K);
-      }
-    }
   } else { // not prefetched
+    //printf("mnk t-0 numM,numN,numK %d,%d,%d\n", num_m, num_n, NK);
     for(unsigned K = 0; K < NK; K += 4)
     for(unsigned m = 0; m < num_m/2; m++)
     for(unsigned n = 0; n < num_n/2; n++) {
@@ -1929,12 +1893,18 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
       if(hbs.find({n, K}) == hbs.end())
         load_b(n, K, /*inc*/0, /*is_prefetch*/false);
       call_mma(m, n, K);
+
+      printf("mnk t-0 %d %d %d\n", m, n, K);
     }
   }
 
   // write back accumulators
-  for(size_t i = 0; i < idxs_.at(C).size(); i++)
+  for(size_t i = 0; i < idxs_.at(C).size(); i++) {
     vals_[C][idxs_[C][i]] = acc[i];
+    auto coord = idxs_[C][i];
+    vprintf("acci t-%d (%d,%d) %f", {gThreadId, coord[0], coord[1], acc[i]}, builder_);
+  }
+
 }
 
 namespace {
@@ -2729,13 +2699,19 @@ void generator::visit_dot_inst(ir::dot_inst* dot) {
   unsigned NK = A_shapes[red_axis];
   bool is_outer = NK == 1;
   bool is_mma = layouts_->get(dot)->to_mma();
-  if(!is_outer && is_mma && tgt_->as_nvidia()->sm() < 80)
+  if(!is_outer && is_mma && tgt_->as_nvidia()->sm() < 80) {
+    printf("visit mma884\n");
     return visit_mma884(dot, A, B, D, NK);
-  if(!is_outer && is_mma && tgt_->as_nvidia()->sm() >= 80)
+  }
+  if(!is_outer && is_mma && tgt_->as_nvidia()->sm() >= 80) {
+    printf("visit mma16816\n");
     return visit_mma16816(dot, A, B, D, NK); // rename it as visit_mma_v2()?
+  }
   if (dot->get_type()->get_scalar_ty()->is_fp32_ty() && 
-      A->get_type()->get_scalar_ty()->is_fp32_ty())
+      A->get_type()->get_scalar_ty()->is_fp32_ty()) {
+    printf("visit fmadot\n");
     return visit_fmadot(dot, A, B, D, NK, c_ty, f_mul_add);
+  }
   throw std::runtime_error("dot has invalid operand type");
 }
 

@@ -82,6 +82,8 @@ def _sdd_kernel(
 
 
 def sdd_matmul(a, b, trans_a, trans_b, trans_c, spdims, block, lut, widths, out=None):
+    assert a.dtype == torch.float16
+    assert b.dtype == torch.float16
     if a.stride(2) != 1 and a.stride(3) != 1:
         a = a.contiguous()
     if b.stride(2) != 1 and b.stride(3) != 1:
