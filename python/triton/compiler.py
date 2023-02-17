@@ -27,6 +27,8 @@ import triton
 import triton._C.libtriton.triton as _triton
 from . import impl
 from .tools.disasm import extract
+from triton.haha import dic
+import time
 
 
 def str_to_ty(name):
@@ -178,18 +180,6 @@ class CodeGenerator(ast.NodeVisitor):
             if isinstance(stmt, ast.Return):
                 break
         return stmts and isinstance(stmt, ast.Return)
-
-    def contains_return_op(self, node):
-        if isinstance(node, ast.Return):
-            return True
-        elif isinstance(node, ast.If):
-            pred = lambda s: self.contains_return_op(s)
-            ret = any(pred(s) for s in node.body)
-            if node.orelse:
-                ret = ret or any(pred(s) for s in node.orelse)
-            return ret
-        else:
-            return False
 
     def visit_Module(self, node):
         ast.NodeVisitor.generic_visit(self, node)
@@ -487,7 +477,7 @@ class CodeGenerator(ast.NodeVisitor):
         cond = self.visit(node.test)
         if isinstance(cond, triton.language.tensor):
             cond = cond.to(triton.language.int1, _builder=self.builder)
-            if self.scf_stack or not self.contains_return_op(node):
+            if self.scf_stack:
                 self.visit_if_scf(cond, node)
             else:
                 self.visit_if_top_level(cond, node)
@@ -959,6 +949,8 @@ def build_triton_ir(fn, signature, specialization, constants):
 
 
 def optimize_triton_ir(mod):
+    start_time = time.time()
+
     pm = _triton.ir.pass_manager(mod.context)
     pm.enable_debug()
     pm.add_inliner_pass()
@@ -968,15 +960,29 @@ def optimize_triton_ir(mod):
     pm.add_licm_pass()
     pm.add_symbol_dce_pass()
     pm.run(mod)
+
+    elapsed_time = time.time() - start_time
+    dic["optimize_triton_ir"] += dic.get("optimize_triton_ir", 0) + (elapsed_time - start_time)
+
+
     return mod
 
 
 def ast_to_ttir(fn, signature, specialization, constants):
+    key = "ast_to_ttir"
+
+    start_time = time.time()
     mod, _ = build_triton_ir(fn, signature, specialization, constants)
+
+    elapsed_time = time.time() - start_time
+    dic[key] += dic.get(key, 0) + (elapsed_time - start_time)
     return optimize_triton_ir(mod)
 
 
 def ttir_to_ttgir(mod, num_warps, num_stages, compute_capability):
+    key = "ttir_to_ttgir"
+    start_time = time.time()
+
     pm = _triton.ir.pass_manager(mod.context)
     pm.add_convert_triton_to_tritongpu_pass(num_warps)
     pm.enable_debug()
@@ -1003,6 +1009,9 @@ def ttir_to_ttgir(mod, num_warps, num_stages, compute_capability):
     pm.add_symbol_dce_pass()
     pm.add_tritongpu_reorder_instructions_pass()
     pm.run(mod)
+
+    elapsed_time = time.time() - start_time
+    dic[key] += dic.get(key, 0) + (elapsed_time - start_time)
     return mod
 
 
@@ -1014,9 +1023,16 @@ def add_external_libs(mod, libs):
 
 
 def ttgir_to_llir(mod, extern_libs, compute_capability):
+    key = "ttgir_to_llir"
+    start_time = time.time()
+
     if extern_libs:
         add_external_libs(mod, extern_libs)
-    return _triton.translate_triton_gpu_to_llvmir(mod, compute_capability)
+    res = _triton.translate_triton_gpu_to_llvmir(mod, compute_capability)
+
+    elapsed_time = time.time() - start_time
+    dic[key] += dic.get(key, 0) + (elapsed_time - start_time)
+    return res
 
 
 def llir_to_ptx(mod: Any, compute_capability: int, ptx_version: int = None) -> Tuple[str, int]:
@@ -1027,10 +1043,18 @@ def llir_to_ptx(mod: Any, compute_capability: int, ptx_version: int = None) -> T
         - PTX code
         - shared memory allocation size
     '''
+    key = "llir_to_ptx"
+    start_time = time.time()
+
     if ptx_version is None:
         _, cuda_version = path_to_ptxas()
         ptx_version = ptx_get_version(cuda_version)
-    return _triton.translate_llvmir_to_ptx(mod, compute_capability, ptx_version)
+    res = _triton.translate_llvmir_to_ptx(mod, compute_capability, ptx_version)
+
+    elapsed_time = time.time() - start_time
+    dic[key] += dic.get(key, 0) + (elapsed_time - start_time)
+
+    return res
 
 
 def ptx_to_cubin(ptx: str, compute_capability: int):
@@ -1040,8 +1064,15 @@ def ptx_to_cubin(ptx: str, compute_capability: int):
     :param compute_capability: compute capability
     :return: str
     '''
+    key = "ptx_to_cubin"
+    start_time = time.time()
+
     ptxas, _ = path_to_ptxas()
-    return _triton.compile_ptx_to_cubin(ptx, ptxas, compute_capability)
+    res = _triton.compile_ptx_to_cubin(ptx, ptxas, compute_capability)
+
+    key = "ptx_to_cubin"
+    start_time = time.time()
+    return res
 
 
 def ptx_get_kernel_name(ptx: str) -> str:
@@ -1081,7 +1112,7 @@ def path_to_ptxas():
     ]
 
     for ptxas in paths:
-        if os.path.exists(ptxas) and os.path.isfile(ptxas):
+        if os.path.exists(ptxas):
             result = subprocess.check_output([ptxas, "--version"], stderr=subprocess.STDOUT)
             if result is not None:
                 version = re.search(r".*release (\d+\.\d+).*", result.decode("utf-8"), flags=re.MULTILINE)

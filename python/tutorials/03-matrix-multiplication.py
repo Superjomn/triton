@@ -144,6 +144,7 @@ import torch
 
 import triton
 import triton.language as tl
+import sys
 
 # %
 # :code:`triton.jit`'ed functions can be auto-tuned by using the `triton.autotune`
@@ -288,8 +289,18 @@ def matmul(a, b, activation=None):
 torch.manual_seed(0)
 a = torch.randn((512, 512), device='cuda', dtype=torch.float16)
 b = torch.randn((512, 512), device='cuda', dtype=torch.float16)
-triton_output = matmul(a, b, activation=None)
-torch_output = torch.matmul(a, b)
+
+from triton.haha import dic
+for i in range(1000):
+    triton_output = matmul(a, b, activation=None)
+
+
+
+#torch_output = torch.matmul(a, b)
+
+sys.exit(0)
+
+
 print(f"triton_output={triton_output}")
 print(f"torch_output={torch_output}")
 if triton.testing.allclose(triton_output, torch_output):
