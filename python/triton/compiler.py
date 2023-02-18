@@ -1,5 +1,6 @@
 from __future__ import annotations
 from triton.haha import dic
+from triton import haha
 import time
 
 import ast
@@ -1599,9 +1600,12 @@ arg_type_pattern = {
     "ptx": ptx_arg_type_pattern,
 }
 
+global_kwargs = None
 
 # def compile(fn, signature: str, device: int = -1, constants=dict(), num_warps: int = 4, num_stages: int = 3, extern_libs=None, configs=None):
 def compile(fn, **kwargs):
+    haha.compile_kwargs = kwargs
+
     start_time = time.time()
 
     capability = kwargs.get("cc", None)

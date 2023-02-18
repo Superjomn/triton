@@ -1,5 +1,6 @@
 import os
 import shutil
+from triton.compiler import global_kwargs
 """
 Matrix Multiplication
 ======================
@@ -305,25 +306,42 @@ torch.manual_seed(0)
 a = torch.randn((1024, 1024), device='cuda', dtype=torch.float16)
 b = torch.randn((1024, 1024), device='cuda', dtype=torch.float16)
 
-REPEAT = 1000
+# warmup
+triton_output = matmul(a, b, activation=None)
+torch.cuda.synchronize()
+
+REPEAT = 100
 for i in range(REPEAT):
     print(i)
-    #subprocess.Popen('rm -rf ~/.triton/cache', shell=True)
     shutil.rmtree('/home/chunwei/.triton/cache', ignore_errors=True)
 
     start_time = time.time()
-    triton_output = matmul(a, b, activation=None)
-    torch.cuda.synchronize()
+
+    #triton_output = matmul(a, b, activation=None)
+    triton.compile(matmul_kernel, **haha.compile_kwargs)
+
+    #torch.cuda.synchronize()
 
     key = "total"
     duration = time.time() - start_time
-    print('duration', duration)
     haha.dic[key] = haha.dic.get(key, 0) + duration
 
-    shutil.rmtree('/home/chunwei/.triton/cache', ignore_errors=True)
+
+# warmup
+triton_output = matmul(a, b, activation=None)
+
+REPEAT = 100
+start_time = time.time()
+for i in range(REPEAT):
+    triton.compile(matmul_kernel, **haha.compile_kwargs)
+    torch.cuda.synchronize()
+    key = "launch"
+    duration = time.time() - start_time
+    haha.dic[key] = haha.dic.get(key, 0) + duration
+
 
 for key,value in haha.dic.items():
-    print(key,value/REPEAT)
+    print(key,value/REPEAT * 1e3)
 
 import sys
 sys.exit(0)
