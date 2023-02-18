@@ -1,3 +1,5 @@
+import os
+import shutil
 """
 Matrix Multiplication
 ======================
@@ -10,6 +12,10 @@ You will specifically learn about:
 - Program re-ordering for improved L2 cache hit rate
 - Automatic performance tuning
 """
+from triton import haha
+import time
+import subprocess
+
 
 # %%
 # Motivations
@@ -154,12 +160,14 @@ import triton.language as tl
 #       provided configs
 
 
+'''
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=4),
     ],
     key=['M', 'N', 'K'],
 )
+'''
 @triton.jit
 def matmul_kernel(
     # Pointers to matrices
@@ -268,6 +276,8 @@ def matmul(a, b, activation=None):
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
     )
+
+    #triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=4),
     matmul_kernel[grid](
         a, b, c,
         M, N, K,
@@ -275,6 +285,10 @@ def matmul(a, b, activation=None):
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
         ACTIVATION=activation,
+        BLOCK_SIZE_M=32,
+        BLOCK_SIZE_N=32,
+        BLOCK_SIZE_K=32,
+        GROUP_SIZE_M=4,
     )
     return c
 
@@ -286,9 +300,33 @@ def matmul(a, b, activation=None):
 # We can test our custom matrix multiplication operation against a native torch implementation (i.e., cuBLAS)
 
 torch.manual_seed(0)
-a = torch.randn((512, 512), device='cuda', dtype=torch.float16)
-b = torch.randn((512, 512), device='cuda', dtype=torch.float16)
-triton_output = matmul(a, b, activation=None)
+#a = torch.randn((512, 512), device='cuda', dtype=torch.float16)
+#b = torch.randn((512, 512), device='cuda', dtype=torch.float16)
+a = torch.randn((1024, 1024), device='cuda', dtype=torch.float16)
+b = torch.randn((1024, 1024), device='cuda', dtype=torch.float16)
+
+REPEAT = 1000
+for i in range(REPEAT):
+    print(i)
+    #subprocess.Popen('rm -rf ~/.triton/cache', shell=True)
+    shutil.rmtree('/home/chunwei/.triton/cache', ignore_errors=True)
+
+    start_time = time.time()
+    triton_output = matmul(a, b, activation=None)
+
+    key = "total"
+    duration = time.time() - start_time
+    haha.dic[key] = haha.dic.get(key, 0) + duration
+
+    shutil.rmtree('/home/chunwei/.triton/cache', ignore_errors=True)
+    #shutil.rmtree('~/.triton/cache', ignore_errors=True)
+
+for key,value in haha.dic.items():
+    print(key,value/REPEAT * 1e6)
+
+import sys
+sys.exit(0)
+
 torch_output = torch.matmul(a, b)
 print(f"triton_output={triton_output}")
 print(f"torch_output={torch_output}")
@@ -296,6 +334,8 @@ if triton.testing.allclose(triton_output, torch_output):
     print("✅ Triton and Torch match")
 else:
     print("❌ Triton and Torch differ")
+
+
 
 # %%
 # Benchmark
