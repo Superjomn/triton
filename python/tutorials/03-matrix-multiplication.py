@@ -319,10 +319,9 @@ for i in range(REPEAT):
     haha.dic[key] = haha.dic.get(key, 0) + duration
 
     shutil.rmtree('/home/chunwei/.triton/cache', ignore_errors=True)
-    #shutil.rmtree('~/.triton/cache', ignore_errors=True)
 
 for key,value in haha.dic.items():
-    print(key,value/REPEAT * 1e6)
+    print(key,value/REPEAT)
 
 import sys
 sys.exit(0)
