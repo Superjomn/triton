@@ -313,9 +313,11 @@ for i in range(REPEAT):
 
     start_time = time.time()
     triton_output = matmul(a, b, activation=None)
+    torch.cuda.synchronize()
 
     key = "total"
     duration = time.time() - start_time
+    print('duration', duration)
     haha.dic[key] = haha.dic.get(key, 0) + duration
 
     shutil.rmtree('/home/chunwei/.triton/cache', ignore_errors=True)
