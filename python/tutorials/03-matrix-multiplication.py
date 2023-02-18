@@ -10,6 +10,8 @@ You will specifically learn about:
 - Program re-ordering for improved L2 cache hit rate
 - Automatic performance tuning
 """
+import sys
+import time
 
 # %%
 # Motivations
@@ -156,7 +158,7 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
     ],
     key=['M', 'N', 'K'],
 )
@@ -288,7 +290,19 @@ def matmul(a, b, activation=None):
 torch.manual_seed(0)
 a = torch.randn((512, 512), device='cuda', dtype=torch.float16)
 b = torch.randn((512, 512), device='cuda', dtype=torch.float16)
-triton_output = matmul(a, b, activation=None)
+
+REPEAT = 100
+start_time = time.time()
+for i in range(REPEAT):
+    triton_output = matmul(a, b, activation=None)
+    torch.cuda.synchronize()
+duration = time.time() - start_time
+
+print("time", duration / REPEAT)
+
+sys.exit(0)
+
+
 torch_output = torch.matmul(a, b)
 print(f"triton_output={triton_output}")
 print(f"torch_output={torch_output}")
