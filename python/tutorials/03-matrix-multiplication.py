@@ -288,65 +288,18 @@ def matmul(a, b, activation=None):
 # We can test our custom matrix multiplication operation against a native torch implementation (i.e., cuBLAS)
 
 torch.manual_seed(0)
-a = torch.randn((512, 512), device='cuda', dtype=torch.float16)
-b = torch.randn((512, 512), device='cuda', dtype=torch.float16)
+a = torch.randn((1024, 1024), device='cuda', dtype=torch.float16)
+b = torch.randn((1024, 1024), device='cuda', dtype=torch.float16)
+
+# warm up
+triton_output = matmul(a, b, activation=None)
 
 REPEAT = 100
 start_time = time.time()
 for i in range(REPEAT):
     triton_output = matmul(a, b, activation=None)
-    torch.cuda.synchronize()
+torch.cuda.synchronize()
 duration = time.time() - start_time
 
-print("time", duration / REPEAT)
+print("time", duration / REPEAT * 1e3)
 
-sys.exit(0)
-
-
-torch_output = torch.matmul(a, b)
-print(f"triton_output={triton_output}")
-print(f"torch_output={torch_output}")
-if triton.testing.allclose(triton_output, torch_output):
-    print("✅ Triton and Torch match")
-else:
-    print("❌ Triton and Torch differ")
-
-# %%
-# Benchmark
-# --------------
-#
-# Square Matrix Performance
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~
-# We can now compare the performance of our kernel against that of cuBLAS. Here we focus on square matrices, but feel free to arrange this script as you wish to benchmark any other matrix shape.
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['M', 'N', 'K'],  # argument names to use as an x-axis for the plot
-        x_vals=[
-            8192
-        ],  # different possible values for `x_name`
-        line_arg='provider',  # argument name whose value corresponds to a different line in the plot
-        # possible values for `line_arg``
-        line_vals=['cublas', 'triton'],
-        # label name for the lines
-        line_names=["cuBLAS", "Triton"],
-        # line styles
-        styles=[('green', '-'), ('green', '--'), ('blue', '-'), ('blue', '--')],
-        ylabel="TFLOPS",  # label name for the y-axis
-        plot_name="matmul-performance",  # name for the plot. Used also as a file name for saving the plot.
-        args={},
-    )
-)
-def benchmark(M, N, K, provider):
-    a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-    b = torch.randn((K, N), device='cuda', dtype=torch.float16)
-    if provider == 'cublas':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), rep=100)
-    if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), rep=100)
-    perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-    return perf(ms), perf(max_ms), perf(min_ms)
-
-
-benchmark.run(show_plots=True, print_data=True)
