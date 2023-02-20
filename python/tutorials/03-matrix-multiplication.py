@@ -161,12 +161,14 @@ import triton.language as tl
 #       provided configs
 
 
+'''
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=4),
     ],
     key=['M', 'N', 'K'],
 )
+'''
 @triton.jit
 def matmul_kernel(
     # Pointers to matrices
@@ -284,10 +286,10 @@ def matmul(a, b, activation=None):
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
         ACTIVATION=activation,
-        #BLOCK_SIZE_M=32,
-        #BLOCK_SIZE_N=32,
-        #BLOCK_SIZE_K=32,
-        #GROUP_SIZE_M=4,
+        BLOCK_SIZE_M=32,
+        BLOCK_SIZE_N=32,
+        BLOCK_SIZE_K=32,
+        GROUP_SIZE_M=4,
     )
     return c
 
@@ -308,24 +310,24 @@ b = torch.randn((1024, 1024), device='cuda', dtype=torch.float16)
 triton_output = matmul(a, b, activation=None)
 torch.cuda.synchronize()
 
-test_compile = False
+test_compile = True
 REPEAT = 100
 
-if test_compile:
-    for i in range(REPEAT):
-        print(i)
-        shutil.rmtree('/home/chunwei/.triton/cache', ignore_errors=True)
+for i in range(REPEAT):
+    print(i)
+    shutil.rmtree('/home/chunwei/.triton/cache', ignore_errors=True)
 
-        start_time = time.time()
+    start_time = time.time()
 
-        #triton_output = matmul(a, b, activation=None)
-        triton.compile(matmul_kernel, **haha.compile_kwargs)
+    #triton_output = matmul(a, b, activation=None)
+    triton.compile(matmul_kernel, **haha.compile_kwargs, )
+            #BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=32, GROUP_SIZE_M=4)
 
-        #torch.cuda.synchronize()
+    #torch.cuda.synchronize()
 
-        key = "total"
-        duration = time.time() - start_time
-        haha.dic[key] = haha.dic.get(key, 0) + duration
+    key = "total"
+    duration = time.time() - start_time
+    haha.dic[key] = haha.dic.get(key, 0) + duration
 
 
 # warmup
