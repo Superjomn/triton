@@ -1,6 +1,7 @@
 from __future__ import annotations
 from triton.haha import dic
 from triton import haha
+import inspect
 import time
 
 import ast
@@ -30,6 +31,18 @@ import triton
 import triton._C.libtriton.triton as _triton
 from . import impl
 from .tools.disasm import extract
+
+def timeit(f):
+    @functools.wraps(f)
+    def wrap(*args, **kw):
+        key = "build_launcher" if f.__name__ == "make_stub" else f.__name__
+        ts = time.time()
+        result = f(*args, **kw)
+        te = time.time()
+        duration = te - ts
+        haha.dic[key] = haha.dic.get(key, 0) + duration
+        return result
+    return wrap
 
 
 def str_to_ty(name):
@@ -961,9 +974,8 @@ def build_triton_ir(fn, signature, specialization, constants):
     return ret, generator
 
 
+@timeit
 def optimize_triton_ir(mod):
-    start_time = time.time()
-
     pm = _triton.ir.pass_manager(mod.context)
     pm.enable_debug()
     pm.add_inliner_pass()
@@ -973,29 +985,17 @@ def optimize_triton_ir(mod):
     pm.add_licm_pass()
     pm.add_symbol_dce_pass()
     pm.run(mod)
-
-    duration = time.time() - start_time
-    key = "optimize_triton_ir"
-    dic[key] = dic.get(key, 0) + duration
-
     return mod
 
 
+@timeit
 def ast_to_ttir(fn, signature, specialization, constants):
-    start_time = time.time()
-
     mod, _ = build_triton_ir(fn, signature, specialization, constants)
-    res = optimize_triton_ir(mod)
-
-    duration = time.time() - start_time
-    key = "ast_to_ttir"
-    dic[key] = dic.get(key, 0) + duration
-    return res
+    return optimize_triton_ir(mod)
 
 
+@timeit
 def ttir_to_ttgir(mod, num_warps, num_stages, compute_capability):
-    start_time = time.time()
-
     pm = _triton.ir.pass_manager(mod.context)
     pm.add_convert_triton_to_tritongpu_pass(num_warps)
     pm.enable_debug()
@@ -1022,10 +1022,6 @@ def ttir_to_ttgir(mod, num_warps, num_stages, compute_capability):
     pm.add_symbol_dce_pass()
     pm.add_tritongpu_reorder_instructions_pass()
     pm.run(mod)
-
-    duration = time.time() - start_time
-    key = "ttir_to_ttgir"
-    dic[key] = dic.get(key, 0) + duration
     return mod
 
 
@@ -1036,20 +1032,14 @@ def add_external_libs(mod, libs):
     _triton.add_external_libs(mod, list(libs.keys()), list(libs.values()))
 
 
+@timeit
 def ttgir_to_llir(mod, extern_libs, compute_capability):
-    start_time = time.time()
-
     if extern_libs:
         add_external_libs(mod, extern_libs)
-    res = _triton.translate_triton_gpu_to_llvmir(mod, compute_capability)
-
-    duration = time.time() - start_time
-    key = "ttgir_to_llir"
-    dic[key] = dic.get(key, 0) + duration
-
-    return res
+    return _triton.translate_triton_gpu_to_llvmir(mod, compute_capability)
 
 
+@timeit
 def llir_to_ptx(mod: Any, compute_capability: int, ptx_version: int = None) -> Tuple[str, int]:
     '''
     Translate TritonGPU module to PTX code.
@@ -1058,20 +1048,13 @@ def llir_to_ptx(mod: Any, compute_capability: int, ptx_version: int = None) -> T
         - PTX code
         - shared memory allocation size
     '''
-    start_time = time.time()
-
     if ptx_version is None:
         _, cuda_version = path_to_ptxas()
         ptx_version = ptx_get_version(cuda_version)
-    res = _triton.translate_llvmir_to_ptx(mod, compute_capability, ptx_version)
-
-    duration = time.time() - start_time
-    key = "llir_to_ptx"
-    dic[key] = dic.get(key, 0) + duration
-
-    return res
+    return _triton.translate_llvmir_to_ptx(mod, compute_capability, ptx_version)
 
 
+@timeit
 def ptx_to_cubin(ptx: str, compute_capability: int):
     '''
     Compile TritonGPU module to cubin.
@@ -1079,17 +1062,8 @@ def ptx_to_cubin(ptx: str, compute_capability: int):
     :param compute_capability: compute capability
     :return: str
     '''
-    start_time = time.time()
-
     ptxas, _ = path_to_ptxas()
-    res = _triton.compile_ptx_to_cubin(ptx, ptxas, compute_capability)
-
-    duration = time.time() - start_time
-    key = "ptx_to_cubin"
-    dic[key] = dic.get(key, 0) + duration
-
-
-    return res
+    return _triton.compile_ptx_to_cubin(ptx, ptxas, compute_capability)
 
 
 def ptx_get_kernel_name(ptx: str) -> str:
@@ -1521,37 +1495,23 @@ def read_or_execute(cache_manager, force_compile, file_name, metadata,
 #
 
 
+@timeit
 def make_stub(name, signature, constants):
     # name of files that are cached
     so_cache_key = make_so_cache_key(triton.runtime.jit.version_key(), signature, constants)
     so_cache_manager = CacheManager(so_cache_key)
     so_name = f"{name}.so"
     # retrieve stub from cache if it exists
-
-    overall_start_time = time.time()
-
     if not so_cache_manager.has_file(so_name):
         with tempfile.TemporaryDirectory() as tmpdir:
             src = generate_launcher(constants, signature)
             src_path = os.path.join(tmpdir, "main.c")
             with open(src_path, "w") as f:
                 f.write(src)
-
-            build_start = time.time()
             so = _build(name, src_path, tmpdir)
-            key = "build_main.c"
-            duration = time.time() - build_start
-            dic[key] = dic.get(key, 0) + duration
-
             with open(so, "rb") as f:
                 so_cache_manager.put(f.read(), so_name, binary=True)
-
-    res = so_cache_manager._make_path(so_name)
-
-    duration = time.time() - overall_start_time
-    key = "build_launcher"
-    dic[key] = dic.get(key, 0) + duration
-    return res
+    return so_cache_manager._make_path(so_name)
 
 
 def convert_type_repr(x):
@@ -1600,13 +1560,11 @@ arg_type_pattern = {
     "ptx": ptx_arg_type_pattern,
 }
 
-global_kwargs = None
 
 # def compile(fn, signature: str, device: int = -1, constants=dict(), num_warps: int = 4, num_stages: int = 3, extern_libs=None, configs=None):
+@timeit
 def compile(fn, **kwargs):
     haha.compile_kwargs = kwargs
-
-    start_time = time.time()
 
     capability = kwargs.get("cc", None)
     if capability is None:
@@ -1710,14 +1668,7 @@ def compile(fn, **kwargs):
     # write-back metadata
     fn_cache_manager.put(json.dumps(metadata), f"{name}.json", binary=False)
     # return handle to compiled kernel
-    res = CompiledKernel(so_path, metadata, asm)
-
-
-    duration = time.time() - start_time
-    key = "compile"
-    dic[key] = dic.get(key, 0) + duration
-
-    return res
+    return CompiledKernel(so_path, metadata, asm)
 
 
 class CompiledKernel:

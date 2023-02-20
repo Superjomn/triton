@@ -1,6 +1,5 @@
 import os
 import shutil
-from triton.compiler import global_kwargs
 """
 Matrix Multiplication
 ======================
@@ -343,5 +342,5 @@ haha.dic[key] = duration
 
 
 for key,value in haha.dic.items():
-    print(key,value/REPEAT * 1e3)
+    print(key,value/REPEAT * 1e3) # ms
 
