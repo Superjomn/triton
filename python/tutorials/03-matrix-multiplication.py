@@ -1,5 +1,6 @@
 import os
 import shutil
+import sys
 """
 Matrix Multiplication
 ======================
@@ -310,13 +311,13 @@ triton_output = matmul(a, b, activation=None)
 torch.cuda.synchronize()
 
 test_compile = True
-REPEAT = 100
+REPEAT = 1
 
 for i in range(REPEAT):
     print(i)
     shutil.rmtree('/home/chunwei/.triton/cache', ignore_errors=True)
 
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     #triton_output = matmul(a, b, activation=None)
     triton.compile(matmul_kernel, **haha.compile_kwargs, )
@@ -324,23 +325,23 @@ for i in range(REPEAT):
 
     #torch.cuda.synchronize()
 
-    key = "total"
-    duration = time.time() - start_time
-    haha.dic[key] = haha.dic.get(key, 0) + duration
+    duration = time.perf_counter() - start_time
+    haha.record_timer("total", duration)
 
+if False:
 
-# warmup
-triton_output = matmul(a, b, activation=None)
-
-start_time = time.time()
-for i in range(REPEAT):
+    # warmup
     triton_output = matmul(a, b, activation=None)
-torch.cuda.synchronize()
-key = "launch"
-duration = time.time() - start_time
-haha.dic[key] = duration
+
+    start_time = time.perf_counter()
+    for i in range(REPEAT):
+        triton_output = matmul(a, b, activation=None)
+
+    torch.cuda.synchronize()
+    key = "launch"
+    duration = time.perf_counter() - start_time
+    haha.dic[key] = duration
 
 
-for key,value in haha.dic.items():
-    print(key,value/REPEAT * 1e3) # ms
-
+for key,value in haha.times.items():
+    print(key,value/haha.counter[key] * 1e3) # ms

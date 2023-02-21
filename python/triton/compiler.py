@@ -1,5 +1,4 @@
 from __future__ import annotations
-from triton.haha import dic
 from triton import haha
 import inspect
 import time
@@ -32,15 +31,18 @@ import triton._C.libtriton.triton as _triton
 from . import impl
 from .tools.disasm import extract
 
+
 def timeit(f):
     @functools.wraps(f)
     def wrap(*args, **kw):
         key = "build_launcher" if f.__name__ == "make_stub" else f.__name__
-        ts = time.time()
+        ts = time.perf_counter()
         result = f(*args, **kw)
-        te = time.time()
+        te = time.perf_counter()
         duration = te - ts
-        haha.dic[key] = haha.dic.get(key, 0) + duration
+        haha.record_timer(key, duration)
+        # haha.times[key] = haha.times.get(key, 0.) + duration
+        # haha.counter[key] = haha.counter.get(key, 0) + 1
         return result
     return wrap
 
@@ -1034,6 +1036,7 @@ def add_external_libs(mod, libs):
 
 @timeit
 def ttgir_to_llir(mod, extern_libs, compute_capability):
+    #print('call ttgir_to_llir ...')
     if extern_libs:
         add_external_libs(mod, extern_libs)
     return _triton.translate_triton_gpu_to_llvmir(mod, compute_capability)
@@ -1048,6 +1051,7 @@ def llir_to_ptx(mod: Any, compute_capability: int, ptx_version: int = None) -> T
         - PTX code
         - shared memory allocation size
     '''
+    #print('call llir_to_ptx ...')
     if ptx_version is None:
         _, cuda_version = path_to_ptxas()
         ptx_version = ptx_get_version(cuda_version)
@@ -1062,6 +1066,7 @@ def ptx_to_cubin(ptx: str, compute_capability: int):
     :param compute_capability: compute capability
     :return: str
     '''
+    #print('call ptx_to_cubin ...')
     ptxas, _ = path_to_ptxas()
     return _triton.compile_ptx_to_cubin(ptx, ptxas, compute_capability)
 
@@ -1565,6 +1570,7 @@ arg_type_pattern = {
 @timeit
 def compile(fn, **kwargs):
     haha.compile_kwargs = kwargs
+    #print('kwargs', kwargs)
 
     capability = kwargs.get("cc", None)
     if capability is None:
@@ -1608,6 +1614,7 @@ def compile(fn, **kwargs):
             signature = {k: v.strip() for k, v in enumerate(signature.split(","))}
         kwargs["signature"] = signature
     else:
+        assert False
         assert isinstance(fn, str)
         _, ir = os.path.basename(fn).split(".")
         src = Path(fn).read_text()
@@ -1633,7 +1640,9 @@ def compile(fn, **kwargs):
 
     # load metadata if any
     metadata = None
+    assert "shared" not in kwargs
     if fn_cache_manager.has_file(f'{name}.json'):
+        assert False
         with open(fn_cache_manager._make_path(f"{name}.json")) as f:
             metadata = json.load(f)
     else:
@@ -1648,11 +1657,14 @@ def compile(fn, **kwargs):
     # run compilation pipeline  and populate metadata
     for ir, (parse, compile) in list(stages.items())[first_stage:]:
         path = fn_cache_manager._make_path(f"{name}.{ir}")
+        #print('path', path)
+        assert not os.path.exists(path), f"{path} is cached"
         if ir == ext:
             next_module = parse(fn)
         elif os.path.exists(path) and\
                 ir in metadata["ctime"] and\
                 os.path.getctime(path) == metadata["ctime"][ir]:
+            assert(False)
             next_module = parse(path)
         else:
             next_module = compile(module)
