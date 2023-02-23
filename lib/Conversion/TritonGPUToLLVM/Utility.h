@@ -367,6 +367,38 @@ static Value shflSync(Location loc, ConversionPatternRewriter &rewriter,
   return builder.launch(rewriter, loc, val.getType(), false);
 }
 
+struct RewriteEnvGuard {
+  PatternRewriter *oldPatternRewriter{};
+  Location *oldLoc{};
+
+  RewriteEnvGuard(PatternRewriter &rewriter, Location &loc) {
+    oldPatternRewriter = kPatternRewriter;
+    oldLoc = kLoc;
+
+    kPatternRewriter = &rewriter;
+    kLoc = &loc;
+  }
+
+  ~RewriteEnvGuard() {
+    kPatternRewriter = oldPatternRewriter;
+    kLoc = oldLoc;
+  }
+
+  static PatternRewriter *kPatternRewriter;
+  static Location *kLoc;
+};
+
+Value operator+(const Value &a, const Value &b);
+Value operator+(const Value &a, int32_t x);
+Value operator-(const Value &a, const Value &b);
+Value operator-(const Value &a, int32_t x);
+Value operator*(const Value &a, const Value &b);
+Value operator*(const Value &a, int32_t x);
+Value operator/(const Value &a, const Value &b);
+Value operator/(const Value &a, int32_t);
+Value operator%(const Value &a, const Value &b);
+Value operator%(const Value &a, int32_t b);
+
 } // namespace LLVM
 } // namespace mlir
 

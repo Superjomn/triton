@@ -1,6 +1,7 @@
 #ifndef TRITON_CONVERSION_TRITONGPU_TO_LLVM_DOT_OP_HELPERS_H
 #define TRITON_CONVERSION_TRITONGPU_TO_LLVM_DOT_OP_HELPERS_H
 
+#include "Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Conversion/ArithmeticToLLVM/ArithmeticToLLVM.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
@@ -828,13 +829,13 @@ public:
   SmallVector<Value> computeLdmatrixMatOffs(Value warpId, Value lane,
                                             Value cSwizzleOffset) {
     // 4x4 matrices
-    Value c = urem(lane, i32_val(8));
-    Value s = udiv(lane, i32_val(8)); // sub-warp-id
+    Value c = lane % 8;
+    Value s = lane / 8;
 
     // Decompose s => s_0, s_1, that is the coordinate in 2x2 matrices in a
     // warp
-    Value s0 = urem(s, i32_val(2));
-    Value s1 = udiv(s, i32_val(2));
+    Value s0 = s % 2;
+    Value s1 = s / 2;
 
     // We use different orders for a and b for better performance.
     Value kMatArr = kOrder == 1 ? s1 : s0;
@@ -856,25 +857,24 @@ public:
     // address (s0,s1) annotates.
 
     Value matOff[2];
-    matOff[kOrder ^ 1] = add(
-        mul(warpId, i32_val(warpOffStride)),   // warp offset
-        mul(nkMatArr, i32_val(matArrStride))); // matrix offset inside a warp
+    matOff[kOrder ^ 1] = warpId * warpOffStride + nkMatArr * matArrStride;
     matOff[kOrder] = kMatArr;
 
     // Physical offset (before swizzling)
     Value cMatOff = matOff[order[0]];
     Value sMatOff = matOff[order[1]];
-    Value cSwizzleMatOff = udiv(cSwizzleOffset, i32_val(cMatShape));
-    cMatOff = add(cMatOff, cSwizzleMatOff);
+    Value cSwizzleMatOff = cSwizzleOffset / cMatShape;
+    cMatOff = cMatOff + cSwizzleOffset;
 
     // row offset inside a matrix, each matrix has 8 rows.
     Value sOffInMat = c;
 
     SmallVector<Value> offs(numPtrs);
-    Value phase = urem(udiv(sOffInMat, i32_val(perPhase)), i32_val(maxPhase));
-    Value sOff = add(sOffInMat, mul(sMatOff, i32_val(sMatShape)));
+    Value phase = sOffInMat / perPhase % maxPhase;
+
+    Value sOff = sOffInMat + sMatOff * sMatShape;
     for (int i = 0; i < numPtrs; ++i) {
-      Value cMatOffI = add(cMatOff, i32_val(i * pLoadStrideInMat));
+      Value cMatOffI = cMatOff + i * pLoadStrideInMat;
       cMatOffI = xor_(cMatOffI, phase);
       offs[i] = add(mul(cMatOffI, i32_val(cMatShape)), mul(sOff, sStride));
     }
