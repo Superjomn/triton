@@ -154,6 +154,7 @@ import torch
 
 import triton
 import triton.language as tl
+import sys
 
 
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
@@ -239,8 +240,8 @@ def matmul_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
     # You can fuse arbitrary activation functions here
     # while the accumulator is still in FP32!
-    if ACTIVATION == "leaky_relu":
-        accumulator = leaky_relu(accumulator)
+    #if ACTIVATION == "leaky_relu":
+    accumulator = ACTIVATION(accumulator)
     c = accumulator.to(tl.float16)
 
     # -----------------------------------------------------------
@@ -253,7 +254,7 @@ def matmul_kernel(
 
 
 # We can fuse `leaky_relu` by providing it as an `ACTIVATION` meta-parameter in `_matmul`.
-@triton.jit
+#@triton.jit
 def leaky_relu(x):
     x = x + 1
     return tl.where(x >= 0, x, 0.01 * x)
@@ -283,7 +284,7 @@ def matmul(a, b, activation=""):
         a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
-        ACTIVATION=activation
+        ACTIVATION=leaky_relu,
     )
     return c
 
@@ -305,6 +306,8 @@ if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
     print("✅ Triton and Torch match")
 else:
     print("❌ Triton and Torch differ")
+
+sys.exit(0)
 
 # %%
 # Benchmark

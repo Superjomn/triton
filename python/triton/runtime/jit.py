@@ -306,6 +306,7 @@ class JITFunction(KernelInterface[T]):
         pinned_memory_flags = '[' + ', '.join([f'_pinned_memory_of({arg})' for arg in regular_args]) + ']'
         # cache key for constexpr argument values
         constexpr_keys = ', '.join(constexpr_args)
+        print(f'constexpr_keys: {constexpr_keys}')
         # cache key for argument specialization
         specializations = []
         for i, arg in enumerate(regular_args):
@@ -323,6 +324,10 @@ def {self.fn.__name__}({', '.join(self.arg_names)}, grid, num_warps=4, num_stage
     constexpr_key = {f'{constexpr_keys},' if len(constexpr_keys) > 0 else ()}
     spec_key = {f'{spec_keys},' if len(spec_keys) > 0 else ()}
     key = (version_key, sig_key, constexpr_key, spec_key, num_warps, num_stages, self.debug)
+    print('version_key', version_key)
+    print('sig_key', sig_key)
+    print('constexpr_key', constexpr_key)
+    print('spec_key', spec_key)
     if not extern_libs is None:
       key = (key, tuple(extern_libs.items()))
     assert num_warps > 0 and (num_warps & (num_warps - 1)) == 0, "num_warps must be a power of 2"
@@ -357,6 +362,7 @@ def {self.fn.__name__}({', '.join(self.arg_names)}, grid, num_warps=4, num_stage
             stream = device_backend.get_stream()
 
     bin = cache[device].get(key, None)
+    print('key', key)
     if bin is not None:
       if not warmup:
           bin.c_wrapper(grid_0, grid_1, grid_2, bin.num_warps, bin.shared, stream, bin.cu_function, CompiledKernel.launch_enter_hook, CompiledKernel.launch_exit_hook, bin, {args})
@@ -374,8 +380,9 @@ def {self.fn.__name__}({', '.join(self.arg_names)}, grid, num_warps=4, num_stage
       signature = {{ i: self._type_of(_key_of(arg)) for i, arg in enumerate(all_args) if i not in self.constexprs }}
       # build stub signature -- includes arguments that are specialized
       for i, arg in constants.items():
-        if callable(arg):
-          raise TypeError(f"Callable constexpr at index {{i}} is not supported")
+        #if callable(arg):
+          #raise TypeError(f"Callable constexpr at index {{i}} is not supported")
+        pass
       if not self._call_hook(key, signature, device, constants, num_warps, num_stages, extern_libs, configs):
         bin = compile(self, signature=signature, device=device, constants=constants, num_warps=num_warps, num_stages=num_stages, extern_libs=extern_libs, configs=configs, debug=self.debug, device_type=device_type)
         if not warmup:

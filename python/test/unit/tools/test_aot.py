@@ -132,6 +132,7 @@ def test_compile_link_matmul():
     np.random.seed(3)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir = "/home/chunwei/project/triton/python/test/unit/tools/out"
         kernel_path = os.path.join(tmp_dir, "kernel.py")
         with open(kernel_path, "w") as file:
             file.write(kernel_src)
@@ -154,10 +155,13 @@ def test_compile_link_matmul():
                 sig = f'*fp32:16, *{dtype}:16, *{dtype}:16, i32{ha}, 1, i32{hb}, 1, i32:16, 1, {BM}, {BN}, {BK}'
                 name = f"matmul_{dtype}x{dtype}_{BM}x{BN}x{BK}"
                 subprocess.run([sys.executable, compiler_path, "-n", "kernel", "--signature", sig, "--out-name", name, "-o", name, kernel_path], check=True, cwd=tmp_dir)
+                print(' '.join([sys.executable, compiler_path, "-n", "kernel", "--signature", sig, "--out-name", name, "-o", name, kernel_path]))
 
         # link all desired configs
         h_files = glob.glob(os.path.join(tmp_dir, "*.h"))
         subprocess.run([sys.executable, linker_path] + h_files + ["-o", "kernel"], check=True, cwd=tmp_dir)
+
+        print(f"tmp_dir: {tmp_dir}")
 
         # compile test case
         with open(os.path.join(tmp_dir, "test.c"), "w") as file:
@@ -203,3 +207,6 @@ module attributes {"triton_gpu.num-warps" = 4 : i32, "triton_gpu.threads-per-war
         ptx = k.asm["ptx"]
         assert ".target sm_80" in ptx
         assert ".address_size 64" in ptx
+
+
+test_compile_link_matmul()
