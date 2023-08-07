@@ -788,39 +788,11 @@ def CvtDtype : TT_Op<"cvt_dtype", [Pure]> {
     The operation takes a dtype and produces a dtype.
   }];
 
-  let arguments = (ins AnyTypeOf<[TT_AnyType, TT_Type, TensorOf<[TT_AnyType]>]>:$input);
+  let arguments = (ins AnyTypeOf<[TT_AnyType, TT_ConstExpr, TT_Type, TensorOf<[TT_AnyType]>]>:$input);
 
-  let results = (outs AnyTypeOf<[TT_AnyType, TT_Type, TensorOf<[TT_AnyType]>]>:$result);
+  let results = (outs AnyTypeOf<[TT_AnyType, TT_ConstExpr, TT_Type, TensorOf<[TT_AnyType]>]>:$result);
 
   let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
-}
-
-def CvtConstExprToIntOp : TT_Op<"cvt_constexpr_to_int", [Pure]> {
-  let summary = "Convert a constant expression to an integer";
-  let description = [{
-    The `tt.cvt_constexpr_to_int` operation represents a conversion from a constant expression to an integer.
-    The operation takes a constant expression and produces an integer.
-  }];
-
-  let arguments = (ins TT_ConstExpr:$const_expr);
-
-  let results = (outs TT_I64Like:$result);
-
-  let assemblyFormat = "$const_expr attr-dict `:` type($result)";
-}
-
-def CvtToAnyOp : TT_Op<"cvt_to_any", [Pure]> {
-  let summary = "Convert a value to any type";
-  let description = [{
-    The `tt.cvt_to_any` operation represents a conversion from a value to any type.
-    The operation takes a value and produces a value of any type.
-  }];
-
-  let arguments = (ins TT_Type:$value);
-
-  let results = (outs TT_AnyType:$result);
-
-  let assemblyFormat = "$value attr-dict `:` type($value) `->` type($result)";
 }
 
 def CompareStrWithConstExprOp : TT_Op<"compare_str_with_constexpr", [Pure]> {

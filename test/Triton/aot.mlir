@@ -13,7 +13,7 @@ tt.func @aot_with_constexpr_as_int(%buf: !tt.ptr<!tt.any>, %BLOCK: !tt.constexpr
       %pt = tt.broadcast %buf : (!tt.ptr<!tt.any>) -> tensor<256x!tt.ptr<!tt.any>>
 
       // !tt.constexpr acts like an "Any" type, and there are some ops to convert it to real types
-      %block = "tt.cvt_constexpr_to_int" (%BLOCK) {} : (!tt.constexpr) -> i64
+      %block = tt.cvt_dtype %BLOCK : !tt.constexpr -> i64
 
       %blocks = tt.broadcast %block : (i64) -> tensor<256xi64>
       %27 = tt.addptr %pt, %blocks : tensor<256x!tt.ptr<!tt.any>>, tensor<256xi64>
