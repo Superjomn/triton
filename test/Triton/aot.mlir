@@ -56,6 +56,9 @@ tt.func @aot_with_constexpr_as_int(%buf: !tt.ptr<!tt.any>, %BLOCK: !tt.constexpr
     %acc_s = arith.constant 0.000000e+00 : f32
     %acc = tt.broadcast %acc_s : (f32) -> tensor<256xf32>
 
+    // deal with the following python code:
+    // if ACTIVATION == "relu":
+    //   acc = relu(acc)
     %acc_up = scf.if %cond -> (tensor<256x!tt.any>) {
       %0 = tt.cvt_dtype %acc : tensor<256xf32> -> !tt.any
       %v = tt.call @faked_tanh(%0) : (!tt.any) -> !tt.any
