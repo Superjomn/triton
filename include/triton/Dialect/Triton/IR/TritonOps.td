@@ -778,4 +778,80 @@ def ReturnOp : TT_Op<"return", [Pure, HasParent<"FuncOp">, /*MemRefsNormalizable
   let hasVerifier = 1;
 }
 
+// =============================== For triton lang dialect ================================
+// --
+
+def CvtDtype : TT_Op<"cvt_dtype", [Pure]> {
+  let summary = "Convert a dtype to another dtype";
+  let description = [{
+    The `tt.cvt_dtype` operation represents a conversion from a dtype to another dtype.
+    The operation takes a dtype and produces a dtype.
+  }];
+
+  let arguments = (ins AnyTypeOf<[TT_AnyType, TT_Type, TensorOf<[TT_AnyType]>]>:$input);
+
+  let results = (outs AnyTypeOf<[TT_AnyType, TT_Type, TensorOf<[TT_AnyType]>]>:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+}
+
+def CvtConstExprToIntOp : TT_Op<"cvt_constexpr_to_int", [Pure]> {
+  let summary = "Convert a constant expression to an integer";
+  let description = [{
+    The `tt.cvt_constexpr_to_int` operation represents a conversion from a constant expression to an integer.
+    The operation takes a constant expression and produces an integer.
+  }];
+
+  let arguments = (ins TT_ConstExpr:$const_expr);
+
+  let results = (outs TT_I64Like:$result);
+
+  let assemblyFormat = "$const_expr attr-dict `:` type($result)";
+}
+
+def CvtToAnyOp : TT_Op<"cvt_to_any", [Pure]> {
+  let summary = "Convert a value to any type";
+  let description = [{
+    The `tt.cvt_to_any` operation represents a conversion from a value to any type.
+    The operation takes a value and produces a value of any type.
+  }];
+
+  let arguments = (ins TT_Type:$value);
+
+  let results = (outs TT_AnyType:$result);
+
+  let assemblyFormat = "$value attr-dict `:` type($value) `->` type($result)";
+}
+
+def CompareStrWithConstExprOp : TT_Op<"compare_str_with_constexpr", [Pure]> {
+  let summary = "Compare a string with a constant expression";
+  let description = [{
+    The `tt.compare_str_with_constexpr` operation represents a comparison between a string and a constant expression.
+  }];
+
+  let arguments = (ins StrAttr:$str, TT_ConstExpr:$const_expr);
+
+  let results = (outs TT_BoolLike:$result);
+
+  let assemblyFormat = "$str `,` $const_expr attr-dict `:` type($result)";
+}
+
+def FuncCallOp : TT_Op<"func_call"> {
+  let summary = "Calls a function represented by a constant expression";
+  let description = [{
+    The `tt.func_call` operation represents calling a function, which is described
+    by a `!tl.constexpr`. It takes this constant expression as its first argument
+    (representing the function), followed by a set of variadic arguments which are
+    passed to the function when called.
+  }];
+
+  // The first operand is the function to be called, followed by a variadic list of
+  // arguments to pass to the function.
+  let arguments = (ins TT_ConstExpr:$called_function, Variadic<AnyType>:$args);
+
+  // For simplicity, let's assume the result is a generic type. You can specify this
+  // further based on your requirements.
+  let results = (outs AnyType:$result);
+}
+
 #endif // Triton_OPS

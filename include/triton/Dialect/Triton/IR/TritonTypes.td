@@ -90,4 +90,28 @@ def TT_TensorPtr : TT_PtrOf<[TT_Tensor]>;
 // Any Type in Triton IR
 def TT_Type : AnyTypeOf<[TT_FloatLike, TT_IntLike, TT_PtrLike, TT_TensorPtr]>;
 
+
+
+// ----------------- The lang dialect ---------------------
+def TT_AnyType : TritonTypeDef<"Any", "any"> {
+    let summary = "Any type";
+
+    let description = [{
+        Any type.
+    }];
+}
+
+def TT_ConstExpr : TritonTypeDef<"ConstExpr", "constexpr"> {
+    let summary = "ConstExpr type";
+
+    let description = [{
+        ConstExpr type.
+    }];
+}
+
+// TODO
+
+// ConvertToString ?
+// Equal (a, b)
+
 #endif
