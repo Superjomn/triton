@@ -71,26 +71,6 @@ def TT_PtrType : TritonTypeDef<"Pointer", "ptr"> {
     let skipDefaultBuilders = 1;
 }
 
-// Scalar Pointer Type: `ptr<>`
-def TT_Ptr : TT_PtrOf<[AnyType]>;
-
-// Tensor of Pointer Type
-def TT_PtrTensor : TensorOf<[TT_Ptr]>;
-
-// Tensor of Pointer Type or Pointer type: `tensor<ptr<>>` or `ptr<>`
-def TT_PtrLike : AnyTypeOf<[TT_Ptr, TT_PtrTensor]>;
-
-// Tensor Type
-def TT_FpIntTensor : AnyTypeOf<[TT_FloatTensor, TT_IntTensor]>;
-def TT_Tensor : AnyTypeOf<[TT_FpIntTensor, TT_PtrTensor]>;
-
-// Pointer Type to Tensor Type: `ptr<tensor<>>`
-def TT_TensorPtr : TT_PtrOf<[TT_Tensor]>;
-
-// Any Type in Triton IR
-def TT_Type : AnyTypeOf<[TT_FloatLike, TT_IntLike, TT_PtrLike, TT_TensorPtr]>;
-
-
 
 // ----------------- The lang dialect ---------------------
 def TT_AnyType : TritonTypeDef<"Any", "any"> {
@@ -109,9 +89,27 @@ def TT_ConstExpr : TritonTypeDef<"ConstExpr", "constexpr"> {
     }];
 }
 
-// TODO
+def TT_AnyTensor : TensorOf<[TT_AnyType]>;
+def TT_AnyLike : AnyTypeOf<[TT_AnyType, TT_AnyTensor]>;
+// ------------------- The lang dialect end -------------------
 
-// ConvertToString ?
-// Equal (a, b)
+// Scalar Pointer Type: `ptr<>`
+def TT_Ptr : TT_PtrOf<[AnyType]>;
+
+// Tensor of Pointer Type
+def TT_PtrTensor : TensorOf<[TT_Ptr]>;
+
+// Tensor of Pointer Type or Pointer type: `tensor<ptr<>>` or `ptr<>`
+def TT_PtrLike : AnyTypeOf<[TT_Ptr, TT_PtrTensor]>;
+
+// Tensor Type
+def TT_FpIntTensor : AnyTypeOf<[TT_FloatTensor, TT_IntTensor]>;
+def TT_Tensor : AnyTypeOf<[TT_FpIntTensor, TT_PtrTensor, TT_AnyTensor]>;
+
+// Pointer Type to Tensor Type: `ptr<tensor<>>`
+def TT_TensorPtr : TT_PtrOf<[TT_Tensor]>;
+
+// Any Type in Triton IR
+def TT_Type : AnyTypeOf<[TT_FloatLike, TT_IntLike, TT_PtrLike, TT_TensorPtr, TT_AnyLike]>;
 
 #endif

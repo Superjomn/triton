@@ -826,4 +826,17 @@ def FuncCallOp : TT_Op<"func_call"> {
   let results = (outs AnyType:$result);
 }
 
+// The definition for the TT_BinOp operation.
+def TT_BinOp : TT_Op<"binary"> {
+  let arguments = (ins
+    TT_AnyLike:$lhs,
+    TT_AnyLike:$rhs,
+    StrAttr:$op
+  );
+
+  let results = (outs TT_AnyLike:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs `,` $op attr-dict `:` type($lhs) `,` type($rhs) `->` type($result)";
+}
+
 #endif // Triton_OPS
