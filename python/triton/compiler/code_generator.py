@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Type, Union
 
 from .. import language
 from .._C.libtriton.triton import ir
-from ..language import constexpr, tensor
+from ..language import constexpr, constexpr_placeholder, dtype, tensor
 # ideally we wouldn't need any runtime component
 from ..runtime import JITFunction
 from .errors import (CompilationError, CompileTimeAssertionFailure,
@@ -206,6 +206,7 @@ class CodeGenerator(ast.NodeVisitor):
     def __init__(self, context, prototype, gscope, attributes, constants, function_name, arch,
                  module=None, is_kernel=False, function_types: Optional[Dict] = None,
                  debug=False, noinline=False, file_name: Optional[str] = None, begin_line=0):
+        print('constants', constants)
         self.context = context
         self.builder = ir.builder(context)
         self.file_name = file_name
@@ -336,6 +337,7 @@ class CodeGenerator(ast.NodeVisitor):
             self.visit(init_node)
         # initialize function
         visibility = "public" if self.is_kernel else "private"
+        print('prototype', self.prototype)
         fn = self.builder.get_or_insert_function(self.module, self.function_name, self.prototype.to_ir(self.builder), visibility, self.noinline)
         self.module.push_back(fn)
         entry = fn.add_entry_block()
@@ -344,7 +346,11 @@ class CodeGenerator(ast.NodeVisitor):
         for i, arg_name in enumerate(arg_names):
             if i in self.constants:
                 cst = self.constants[i]
-                if not _is_constexpr(cst):
+                # for cppjit, expose constexpr as function arguments
+                if isinstance(cst, dtype):
+                    print('prototype', self.prototype.param_types)
+                    cst = constexpr_placeholder(fn.args(idx), self.prototype.param_types[idx])
+                elif not _is_constexpr(cst):
                     cst = constexpr(self.constants[i])
                 arg_values.append(cst)
                 continue
@@ -355,8 +361,11 @@ class CodeGenerator(ast.NodeVisitor):
                 arg_values.append(tensor(fn.args(idx), self.prototype.param_types[idx]))
                 idx += 1
 
+        print('arg_values', arg_values)
+
         insert_pt = self.builder.get_insertion_block()
         for arg_name, arg_value in zip(arg_names, arg_values):
+            print('set arg', arg_name, arg_value)
             self.set_value(arg_name, arg_value)
         self.builder.set_insertion_point_to_start(entry)
         # visit function body
@@ -1120,9 +1129,10 @@ def ast_to_ttir(fn, signature, specialization, constants, debug, arch):
 
     all_constants = constants.copy()
     all_constants.update(new_constants)
-    arg_types = [str_to_ty(v) for k, v in signature.items() if k not in constants]
+    arg_types = [str_to_ty(v) for k, v in signature.items() if k not in constants or isinstance(constants[k], dtype)]
     file_name, begin_line = _get_fn_file_line(fn)
 
+    print('arg_types', arg_types)
     prototype = language.function_type([], arg_types)
     generator = CodeGenerator(context, prototype, gscope=gscope, constants=all_constants,
                               function_name=function_name, attributes=new_attrs,
@@ -1140,6 +1150,8 @@ def ast_to_ttir(fn, signature, specialization, constants, debug, arch):
             raise
         raise CompilationError(fn.src, node, repr(e)) from e
     ret = generator.module
+
+    print('mlir', ret)
     # module takes ownership of the context
     ret.context = context
     return ret

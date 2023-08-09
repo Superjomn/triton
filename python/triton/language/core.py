@@ -752,9 +752,19 @@ class tensor:
         return semantic.cast(self, dtype, _builder)
 
 
+class constexpr_placeholder(tensor):
+    '''
+    This class is a placeholder for constexpr, it acts like normal tensors, but we mark it as constexpr.
+    '''
+
+    def __init__(self, handle, type: dtype):
+        super().__init__(handle, type)
+
 # -----------------------
 # SPMD Programming Model
 # -----------------------
+
+
 def _constexpr_to_value(v):
     if isinstance(v, constexpr):
         return v.value

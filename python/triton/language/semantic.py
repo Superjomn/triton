@@ -481,16 +481,25 @@ def not_equal(input: tl.tensor,
 
 
 def arange(start: int, end: int, builder: ir.builder) -> tl.tensor:
-    if not isinstance(start, int) or not isinstance(end, int):
-        raise ValueError("arange's arguments must be of type tl.constexpr")
-    is_start_int64 = bool(start >> 32)
-    is_end_int64 = bool(end >> 32)
-    if is_start_int64 or is_end_int64:
-        raise ValueError("arange must fit in int32")
-    if end <= start:
-        raise ValueError("arange's end argument must be greater than the start argument")
+    if not isinstance(start, (int, tl.constexpr_placeholder)) or not isinstance(end, (int, tl.constexpr_placeholder)):
+        raise ValueError(f"arange's arguments must be of type tl.constexpr, get {type(start)} and {type(end)}")
+    if isinstance(start, int):
+        is_start_int64 = bool(start >> 32)
+        if is_start_int64:
+            raise ValueError("arange must fit in int32")
+    if isinstance(end, int):
+        is_end_int64 = bool(end >> 32)
+        if is_end_int64:
+            raise ValueError("arange must fit in int32")
+        if end <= start:
+            raise ValueError("arange's end argument must be greater than the start argument")
 
-    shape = [end - start]
+    if isinstance(start, tl.constexpr_placeholder) or isinstance(end, tl.constexpr_placeholder):
+        shape = [-1]
+        ret_ty = tl.block_type(tl.int32, shape)
+        return tl.tensor(builder.create_tl_make_range(tl._to_tensor(start, builder).handle, tl._to_tensor(end, builder).handle), ret_ty)
+    else:
+        shape = [end - start]
     ret_ty = tl.block_type(tl.int32, shape)
     return tl.tensor(builder.create_make_range(start, end), ret_ty)
 
@@ -1244,13 +1253,14 @@ def dot(lhs: tl.tensor,
         allow_tf32: bool,
         out_dtype: tl.dtype,
         builder: ir.builder) -> tl.tensor:
+    def dim_valid(dim):
+        return dim.value >= 16 or dim.value == -1
     assert lhs.type.is_block() and rhs.type.is_block()
     assert lhs.dtype == rhs.dtype, f"First input ({lhs.dtype}) and second input ({rhs.dtype}) must have the same dtype!"
     assert len(lhs.shape) == 2, f"First input shape ({lhs.shape}) is not two dimensional!"
     assert len(rhs.shape) == 2, f"Second input shape ({rhs.shape}) is not two dimensional!"
     assert lhs.shape[1].value == rhs.shape[0].value, f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[1].value}) must be equal to first index of second shape ({rhs.shape[0].value})"
-    assert lhs.shape[0].value >= 16 and lhs.shape[1].value >= 16 \
-        and rhs.shape[1].value >= 16, \
+    assert dim_valid(lhs.shape[0]) and dim_valid(lhs.shape[1]) and dim_valid(rhs.shape[1]), \
         f"All values in both first input shape ({lhs.shape}) and second input shape ({rhs.shape}) must be >= 16!"
     if lhs.type.scalar.is_int():
         assert lhs.type.scalar == tl.int8, "only int8 supported!"

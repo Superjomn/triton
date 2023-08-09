@@ -30,6 +30,7 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonLang/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Target/HSACO/HSACOTranslation.h"
@@ -223,6 +224,7 @@ void init_triton_ir(py::module &&m) {
         self.getOrLoadDialect<mlir::index::IndexDialect>();
         self.getOrLoadDialect<mlir::triton::TritonDialect>();
         self.getOrLoadDialect<mlir::gpu::GPUDialect>();
+        self.getOrLoadDialect<mlir::triton_lang::TritonLangDialect>();
         // we load LLVM because the frontend uses LLVM.undef for
         // some placeholders
         self.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
@@ -911,6 +913,15 @@ void init_triton_ir(py::module &&m) {
              auto retType = mlir::RankedTensorType::get(
                  {end - start}, self.getBuilder().getI32Type());
              return self.create<mlir::triton::MakeRangeOp>(retType, start, end);
+           })
+
+      .def("create_tl_make_range",
+           [](TritonOpBuilder &self, mlir::Value &start,
+              mlir::Value &end) -> mlir::Value {
+             auto retType = mlir::RankedTensorType::get(
+                 {-1}, self.getBuilder().getI32Type());
+             return self.create<mlir::triton_lang::MakeRangeOp>(retType, start,
+                                                                end);
            })
 
       // Cast instructions

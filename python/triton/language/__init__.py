@@ -34,6 +34,7 @@ from .core import (
     broadcast_to,
     cat,
     constexpr,
+    constexpr_placeholder,
     cos,
     cumprod,
     cumsum,
