@@ -919,7 +919,7 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, mlir::Value &start,
               mlir::Value &end) -> mlir::Value {
              auto retType = mlir::RankedTensorType::get(
-                 {-1}, self.getBuilder().getI32Type());
+                 {mlir::ShapedType::kDynamic}, self.getBuilder().getI32Type());
              return self.create<mlir::triton_lang::MakeRangeOp>(retType, start,
                                                                 end);
            })

@@ -1,6 +1,7 @@
 #pragma once
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonLang/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #include "triton/Dialect/Triton/Transforms/Passes.h"
@@ -8,6 +9,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
+#include "triton/Conversion/TritonLangToTriton/Passes.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 
 #include "mlir/InitAllPasses.h"
@@ -32,6 +34,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::test::registerTestMembarPass();
   mlir::triton::registerConvertTritonToTritonGPUPass();
   mlir::triton::registerConvertTritonGPUToLLVMPass();
+  mlir::triton_lang::registerConvertTritonLangToTriton();
 
   // TODO: register Triton & TritonGPU passes
   registry.insert<mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
