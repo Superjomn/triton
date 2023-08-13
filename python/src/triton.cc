@@ -167,6 +167,15 @@ private:
   bool lineInfoEnabled = !triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO");
 };
 
+void amend_shape_dynamic_dim(std::vector<int64_t> &shape) {
+
+  for (int64_t &dim : shape) {
+    if (dim == -1) {
+      dim = mlir::ShapedType::kDynamic;
+    }
+  }
+}
+
 /*****************************************************************************/
 /* Python bindings for triton::ir                                            */
 /*****************************************************************************/
@@ -794,6 +803,7 @@ void init_triton_ir(py::module &&m) {
       .def("get_block_ty",
            [](TritonOpBuilder &self, mlir::Type &elementType,
               std::vector<int64_t> &shape) -> mlir::Type {
+             amend_shape_dynamic_dim(shape);
              return mlir::RankedTensorType::get(shape, elementType);
            })
       .def("get_function_ty",
@@ -1331,6 +1341,7 @@ void init_triton_ir(py::module &&m) {
       .def("create_broadcast",
            [](TritonOpBuilder &self, mlir::Value &arg,
               std::vector<int64_t> &shape) -> mlir::Value {
+             amend_shape_dynamic_dim(shape);
              if (auto argType =
                      arg.getType().dyn_cast<mlir::RankedTensorType>())
                return self.createOrFold<mlir::triton::BroadcastOp>(
@@ -1342,7 +1353,10 @@ void init_triton_ir(py::module &&m) {
       .def("create_splat",
            [](TritonOpBuilder &self, mlir::Value &arg,
               std::vector<int64_t> &shape) -> mlir::Value {
+             amend_shape_dynamic_dim(shape);
+
              auto argType = arg.getType();
+
              auto ret = self.createOrFold<mlir::triton::SplatOp>(
                  mlir::RankedTensorType::get(shape, argType), arg);
              return ret;
@@ -1423,6 +1437,13 @@ void init_triton_ir(py::module &&m) {
              return self.create<mlir::triton::DotOp>(c.getType(), a, b, c,
                                                      allowTF32);
            })
+      // .def("create_tl_dot",
+      //      [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
+      //         mlir::Value &c, bool allowTF32) -> mlir::Value {
+      //        return self.create<mlir::triton_lang::DotOp>(c.getType(), a, b,
+      //        c,
+      //                                                     allowTF32);
+      //      })
       .def("create_exp",
            [](TritonOpBuilder &self, mlir::Value &val) -> mlir::Value {
              return self.create<mlir::math::ExpOp>(val);

@@ -34,11 +34,12 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::test::registerTestMembarPass();
   mlir::triton::registerConvertTritonToTritonGPUPass();
   mlir::triton::registerConvertTritonGPUToLLVMPass();
-  mlir::triton_lang::registerConvertTritonLangToTriton();
+  mlir::triton_lang::registerConvertTritonLangToTritonPass();
 
   // TODO: register Triton & TritonGPU passes
   registry.insert<mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
                   mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
+                  mlir::triton_lang::TritonLangDialect,
                   mlir::triton::gpu::TritonGPUDialect, mlir::math::MathDialect,
                   mlir::arith::ArithDialect, mlir::scf::SCFDialect,
                   mlir::gpu::GPUDialect>();

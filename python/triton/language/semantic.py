@@ -495,6 +495,8 @@ def arange(start: int, end: int, builder: ir.builder) -> tl.tensor:
             raise ValueError("arange's end argument must be greater than the start argument")
 
     if isinstance(start, tl.constexpr_placeholder) or isinstance(end, tl.constexpr_placeholder):
+        # the mlir kDynamic cannot introduced to block type directly since it exceeds the shape limit
+        # -1 marks the dynamic dimension
         shape = [-1]
         ret_ty = tl.block_type(tl.int32, shape)
         return tl.tensor(builder.create_tl_make_range(tl._to_tensor(start, builder).handle, tl._to_tensor(end, builder).handle), ret_ty)
@@ -1279,6 +1281,7 @@ def dot(lhs: tl.tensor,
     N = rhs.type.shape[1]
     _0 = builder.create_splat(_0, [M, N])
     ret_ty = tl.block_type(ret_scalar_ty, [M, N])
+
     return tl.tensor(builder.create_dot(lhs.handle, rhs.handle, _0, allow_tf32),
                      ret_ty)
 
