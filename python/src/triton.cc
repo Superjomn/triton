@@ -1357,9 +1357,18 @@ void init_triton_ir(py::module &&m) {
 
              auto argType = arg.getType();
 
-             auto ret = self.createOrFold<mlir::triton::SplatOp>(
+             // for dynamic splat, we cannot fold it to arith const since static
+             // shape is not available
+             bool isDynamicSplat =
+                 std::any_of(shape.begin(), shape.end(), [](int64_t dim) {
+                   return dim == mlir::ShapedType::kDynamic;
+                 });
+             if (!isDynamicSplat)
+               return self.createOrFold<mlir::triton::SplatOp>(
+                   mlir::RankedTensorType::get(shape, argType), arg);
+
+             return self.create<mlir::triton::SplatOp>(
                  mlir::RankedTensorType::get(shape, argType), arg);
-             return ret;
            })
       // // atomic
       .def("create_atomic_cas",

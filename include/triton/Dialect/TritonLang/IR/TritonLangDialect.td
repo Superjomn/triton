@@ -19,7 +19,8 @@ def TritonLang_Dialect : Dialect {
     "math::MathDialect",
     "scf::SCFDialect",
     "cf::ControlFlowDialect",
-    "triton::TritonDialect"
+    "triton::TritonDialect",
+    "tensor::TensorDialect"
   ];
 
   let extraClassDeclaration = [{

@@ -32,4 +32,20 @@ def TL_MakeRangeOp : TL_Op<"make_range", []> {
     let assemblyFormat = "$start `,` $end attr-dict `:` type($result)";
 }
 
+def TL_CvtShapeOp : TL_Op<"cvt_shape", []> {
+    let summary = "convert shape";
+
+    let description = [{
+        Returns an 1D int32 tensor.
+
+        Values span from $start to $end (exclusive), with step = 1
+    }];
+
+    let arguments = (ins TT_Tensor:$src);
+
+    let results = (outs TT_Tensor:$result);
+
+    let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+}
+
 #endif // TRITO_LANG_OPS
