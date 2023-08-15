@@ -298,7 +298,7 @@ class pointer_type(dtype):
 
 
 class block_type(dtype):
-    def __init__(self, element_ty: dtype, shape: List):
+    def __init__(self, element_ty: dtype, shape: List, symbol_shape: List):
         self.element_ty = element_ty
 
         # Note that block_type's shape is a list of int
@@ -311,6 +311,7 @@ class block_type(dtype):
             shape = [s.value for s in shape]
 
         self.shape = shape
+        self.symbol_shape = symbol_shape
         self.numel = 1
         for s in self.shape:
             self.numel *= s

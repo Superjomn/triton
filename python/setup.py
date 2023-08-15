@@ -263,6 +263,8 @@ class CMakeBuild(build_ext):
                            "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld",
                            "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld",
                            "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld"]
+        print(' '.join(cmake_args))
+        #assert False
 
         env = os.environ.copy()
         cmake_dir = self.get_cmake_dir()

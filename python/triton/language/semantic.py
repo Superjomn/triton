@@ -498,7 +498,8 @@ def arange(start: int, end: int, builder: ir.builder) -> tl.tensor:
         # the mlir kDynamic cannot introduced to block type directly since it exceeds the shape limit
         # -1 marks the dynamic dimension
         shape = [-1]
-        ret_ty = tl.block_type(tl.int32, shape)
+        symbolic_shape = [end - start]
+        ret_ty = tl.block_type(tl.int32, shape, symbol_shape=symbolic_shape)
         return tl.tensor(builder.create_tl_make_range(tl._to_tensor(start, builder).handle, tl._to_tensor(end, builder).handle), ret_ty)
     else:
         shape = [end - start]

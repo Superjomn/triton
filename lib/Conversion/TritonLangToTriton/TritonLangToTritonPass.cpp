@@ -37,91 +37,6 @@ template <typename T> void printVec(llvm::ArrayRef<T> vec) {
   llvm::outs() << "]\n";
 }
 
-class TritonLangTypeConverter : public TypeConverter {
-  using TypeConverter::convertType;
-
-public:
-  TritonLangTypeConverter(MLIRContext *ctx) {
-    addConversion([](Type type) { return type; });
-    // If the origValue still has live user(s), use this to
-    // convert origValue to newValue
-    addSourceMaterialization([&](OpBuilder &builder,
-                                 RankedTensorType tensorType, ValueRange inputs,
-                                 Location loc) -> std::optional<Value> {
-      llvm::outs() << "TritonLangTypeConverter to convert back to "
-                   << tensorType << "\n";
-      return builder.create<tensor::CastOp>(loc, tensorType, inputs[0]);
-    });
-
-    addTargetMaterialization([&](OpBuilder &builder, Type type,
-                                 ValueRange inputs,
-                                 Location loc) -> std::optional<Value> {
-      llvm::outs() << "TritonLangTypeConverter to convert to " << type << "\n";
-      return builder.create<tensor::CastOp>(loc, type, inputs[0]);
-    });
-  }
-};
-
-class TritonConversionTarget : public ConversionTarget {
-
-public:
-  explicit TritonConversionTarget(MLIRContext &ctx,
-                                  TritonLangTypeConverter &typeConverter)
-      : ConversionTarget(ctx) {
-    addLegalDialect<arith::ArithDialect, scf::SCFDialect,
-                    triton::TritonDialect>();
-    // addIllegalDialect<triton_lang::TritonLangDialect>();
-  }
-};
-
-struct TritonMakeRangePattern
-    : public OpConversionPattern<triton_lang::MakeRangeOp> {
-  using OpConversionPattern<triton_lang::MakeRangeOp>::OpConversionPattern;
-
-  TritonMakeRangePattern(MLIRContext *ctx)
-      : OpConversionPattern<triton_lang::MakeRangeOp>(ctx) {}
-
-  LogicalResult
-  matchAndRewrite(triton_lang::MakeRangeOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Type retType = op.getType();
-
-    auto tensorTy = retType.cast<RankedTensorType>();
-    auto shape = tensorTy.getShape();
-
-    // check if it is dynamic shape
-
-    llvm::outs() << "TritonMakeRangePattern\n";
-    bool isDynamic = tensorTy.isDynamicDim(0);
-    if (!isDynamic)
-      return failure();
-
-    int64_t start = op.getStart().getDefiningOp<arith::ConstantIntOp>().value();
-    int64_t end = op.getEnd().getDefiningOp<arith::ConstantIntOp>().value();
-
-    auto newTensorTy =
-        RankedTensorType::get({end - start}, tensorTy.getElementType());
-    auto newOp = rewriter.create<triton::MakeRangeOp>(op.getLoc(), newTensorTy,
-                                                      start, end);
-    rewriter.replaceOpWithNewOp<triton_lang::CvtShapeOp>(op, retType,
-                                                         newOp.getResult());
-    // rewriter.replaceOpWithNewOp<triton::MakeRangeOp>(op, newTensorTy, start,
-    // end);
-    /*
-    auto newOp = rewriter.create<triton::MakeRangeOp>(op.getLoc(), newTensorTy,
-                                                      start, end);
-    auto cast = rewriter.create<tensor::CastOp>(op.getLoc(), retType,
-                                                newOp.getResult());
-
-    llvm::outs() << "replace " << op << " with " << cast << "\n";
-
-    rewriter.replaceOp(op, {newOp.getResult()});
-    */
-
-    return success();
-  }
-};
-
 bool isDynamicShape(RankedTensorType tensorTy) {
   auto shape = tensorTy.getShape();
   for (auto dim : shape) {
@@ -130,46 +45,6 @@ bool isDynamicShape(RankedTensorType tensorTy) {
   }
   return false;
 }
-
-class ExpandDimsPattern : public OpConversionPattern<triton::ExpandDimsOp> {
-  using OpConversionPattern<triton::ExpandDimsOp>::OpConversionPattern;
-
-public:
-  ExpandDimsPattern(MLIRContext *ctx)
-      : OpConversionPattern<triton::ExpandDimsOp>(ctx) {}
-
-  LogicalResult
-  matchAndRewrite(triton::ExpandDimsOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto tensorTy = op.getOperand().getType().cast<RankedTensorType>();
-    auto resTy = op.getResult().getType().cast<RankedTensorType>();
-    llvm::outs() << "ExpandDimsPattern\n";
-
-    // TODO[Superjomn]: Consider the case where axis is dyanmic
-    if (isDynamicShape(tensorTy)) // cannot deduce
-      return failure();
-    if (!isDynamicShape(resTy)) // no need to deduce
-      return failure();
-
-    llvm::outs() << "materialize ExpandDimsPattern\n";
-
-    auto operandShape = tensorTy.getShape();
-    auto retShape = resTy.getShape();
-    llvm::SmallVector<int64_t> resShape(retShape.begin(), retShape.end());
-    for (int dim = 0; dim < tensorTy.getRank(); ++dim) {
-      if (tensorTy.isDynamicDim(dim))
-        resShape[dim] = operandShape[dim];
-    }
-
-    auto newTensorTy =
-        RankedTensorType::get(resShape, tensorTy.getElementType());
-    auto newOp = rewriter.create<triton::ExpandDimsOp>(op.getLoc(), newTensorTy,
-                                                       op.getOperand());
-    rewriter.replaceOp(op, {newOp.getResult()});
-
-    return success();
-  }
-};
 
 // Deducing the shape and data type
 class TypeInference {
@@ -225,12 +100,21 @@ private:
 
     if (numUsers == 1) {
       Operation *op = *output.getUsers().begin();
+
       if (auto nextCast = dyn_cast<CastOp>(op)) {
         foldAdjacentCasts(cast, nextCast);
       } else if (auto expandDims = dyn_cast<triton::ExpandDimsOp>(op)) {
         processExpandDimsOp(expandDims, shape);
+      } // else if (auto mul = dyn_cast<arith::MulIOp>(op)) {
+        // processMulOp(mul, shape);
+      //}
+      else if (isElementwiseOp(op)) {
+        processElementwise(op, shape);
+      } else if (auto splat = dyn_cast<triton::SplatOp>(op)) {
+        processSplat(splat, shape);
       } else {
-        llvm_unreachable("unknown op");
+        // llvm_unreachable("unknown op");
+        llvm::errs() << "unknown op: " << *op << "\n";
       }
     }
 
@@ -250,13 +134,18 @@ private:
     if (numUsers == 1) {
       Type outTy = output.getType();
       Operation *op = input.getDefiningOp();
+      auto shape = outTy.cast<RankedTensorType>().getShape();
+
       if (op == nullptr) {
         assert(outTy.isa<RankedTensorType>());
         processBlockArgBackward(input.cast<BlockArgument>(), cast);
       } else if (auto prevCast = dyn_cast<CastOp>(op)) {
         foldAdjacentCasts(prevCast, cast);
+      } else if (auto splat = dyn_cast<triton::SplatOp>(op)) {
+        processSplat(splat, shape);
       } else {
-        llvm_unreachable("unknown op");
+        llvm::errs() << "unknown op: " << *op << "\n";
+        // llvm_unreachable("unknown op");
       }
     }
 
@@ -273,29 +162,34 @@ private:
     int axis = op.getAxis();
     newResShape.insert(newResShape.begin() + axis, 1);
 
-    llvm::outs() << "inputShape: ";
     printVec<int64_t>(shape);
 
-    llvm::outs() << "newResShape: ";
     printVec<int64_t>(newResShape);
 
     amendTypeWithCasts(op, {shape}, {newResShape});
   }
 
+  void processSplat(triton::SplatOp op, ShapeT shape) {
+    amendTypeWithCasts(op, {{}}, {shape});
+  }
+
   void amendTypeWithCasts(Operation *op, llvm::ArrayRef<ShapeT> inShapes,
                           llvm::ArrayRef<ShapeT> outShapes) {
+
     assert(op->getNumOperands() == inShapes.size());
     assert(op->getNumResults() == outShapes.size());
 
     Location loc = op->getLoc();
-    OpBuilder builder(op);
+    OpBuilder builder(op->getContext());
 
     builder.setInsertionPoint(op);
     for (unsigned i = 0; i < op->getNumOperands(); ++i) {
       auto operand = op->getOperand(i);
-      if (triton::isTensorOrTensorPointerType(operand.getType())) {
-        auto newType = replaceShape(operand.getType().cast<RankedTensorType>(),
-                                    inShapes[i]);
+      Type operandTy = operand.getType();
+      if (triton::isTensorOrTensorPointerType(operandTy)) {
+        auto newType =
+            replaceShape(operandTy.cast<RankedTensorType>(), inShapes[i]);
+
         auto newCast = builder.create<CastOp>(loc, newType, operand);
         newCast = markBackward(newCast);
         op->setOperand(i, newCast.getResult());
@@ -307,9 +201,11 @@ private:
     for (unsigned i = 0; i < op->getNumResults(); ++i) {
       auto result = op->getResult(i);
       if (triton::isTensorOrTensorPointerType(result.getType())) {
+        auto oldResTy = result.getType().cast<RankedTensorType>();
         auto newResTy = replaceShape(result.getType().cast<RankedTensorType>(),
                                      outShapes[i]);
-        auto newCast = builder.create<CastOp>(loc, newResTy, result);
+
+        auto newCast = builder.create<CastOp>(loc, oldResTy, result);
         newCast = markForward(newCast);
 
         result.setType(newResTy);
@@ -328,6 +224,10 @@ private:
   // cast0 -> cast1 => cast1
   void foldAdjacentCasts(CastOp cast0, CastOp cast1) {
     assert(cast0.getResult() == cast1.getOperand());
+    if (getNumUsers(cast0.getResult()) != 1)
+      return;
+
+    // input => cast0 => cast1 => output
     Value input = cast0.getSrc();
     Value output = cast1.getResult();
 
@@ -341,8 +241,8 @@ private:
     }
 
     eraseCastOpFromQueue({cast0, cast1});
+    cast1.erase(); // erase cast1 first since cast0 still consumes it
     cast0.erase();
-    cast1.erase();
   }
 
   void eraseCastOpFromQueue(llvm::ArrayRef<CastOp> ops) {
@@ -392,6 +292,13 @@ private:
     });
   }
 
+  void processElementwise(Operation *op, ShapeT shape) {
+    printVec<int64_t>(shape);
+    llvm::SmallVector<ShapeT> inShapes(op->getNumOperands(), shape);
+    llvm::SmallVector<ShapeT> outShapes(op->getNumResults(), shape);
+    amendTypeWithCasts(op, inShapes, outShapes);
+  }
+
   LogicalResult materializeMarkRange(triton_lang::MakeRangeOp op) {
     auto tensorTy = op.getType().cast<RankedTensorType>();
     auto shape = tensorTy.getShape();
@@ -419,14 +326,37 @@ private:
     op.erase();
     return success();
   }
+
+  // Borrowed from PlanCTA.cpp
+  // TODO[Superjomn]: Make it a common utility function
+  bool isElementwiseOp(Operation *op) const {
+    if (llvm::isa<arith::AddFOp, arith::AddIOp, arith::AndIOp,
+                  arith::CeilDivSIOp, arith::CeilDivUIOp, arith::DivFOp,
+                  arith::DivSIOp, arith::DivUIOp, arith::ExtFOp, arith::ExtSIOp,
+                  arith::ExtUIOp, arith::FloorDivSIOp, arith::FPToSIOp,
+                  arith::FPToUIOp, arith::MaxFOp, arith::MaxSIOp,
+                  arith::MaxUIOp, arith::MinFOp, arith::MinSIOp, arith::MinUIOp,
+                  arith::MulFOp, arith::MulIOp, arith::NegFOp, arith::OrIOp,
+                  arith::RemFOp, arith::RemSIOp, arith::RemUIOp, arith::ShLIOp,
+                  arith::ShRSIOp, arith::ShRUIOp, arith::SIToFPOp,
+                  arith::SubFOp, arith::SubIOp, arith::TruncFOp,
+                  arith::TruncIOp, arith::UIToFPOp, arith::XOrIOp>(op))
+      return true;
+    if (llvm::isa<math::AbsFOp, math::AbsIOp, math::AtanOp, math::Atan2Op,
+                  math::CeilOp, math::CopySignOp, math::CosOp, math::SinOp,
+                  math::CountLeadingZerosOp, math::CountTrailingZerosOp,
+                  math::CtPopOp, math::ErfOp, math::ExpOp, math::Exp2Op,
+                  math::ExpM1Op, math::FloorOp, math::FmaOp, math::LogOp,
+                  math::Log10Op, math::Log1pOp, math::Log2Op, math::PowFOp,
+                  math::RsqrtOp, math::SqrtOp, math::TanhOp>(op))
+      return true;
+    if (llvm::isa<triton::IntToPtrOp, triton::PtrToIntOp, triton::BitcastOp,
+                  triton::FpToFpOp, triton::AddPtrOp,
+                  triton::PureExternElementwiseOp>(op))
+      return true;
+    return false;
+  }
 };
-
-void populateTritonPatterns(RewritePatternSet &patterns) {
-  MLIRContext *context = patterns.getContext();
-  TritonLangTypeConverter typeConverter(context);
-
-  patterns.insert<TritonMakeRangePattern, ExpandDimsPattern>(context);
-}
 
 class ConvertTritonLangToTriton
     : public ConvertTritonLangToTritonBase<ConvertTritonLangToTriton> {
@@ -441,21 +371,7 @@ public:
     auto &context = getContext();
     auto mod = getOperation();
 
-    // TritonLangTypeConverter typeConverter(&context);
-    // TritonConversionTarget target(context, typeConverter);
-    // target.addDynamicallyLegalDialect<arith::ArithDialect>(
-    //     [&](mlir::Operation *op) {
-    //       return true;
-    //       return typeConverter.isLegal(op);
-    //     });
     materializeConstExprs();
-
-    // RewritePatternSet patterns(&context);
-    // populateTritonPatterns(patterns);
-
-    // // if (failed(applyPatternsAndFoldGreedily(mod, std::move(patterns))))
-    // if (failed(applyPartialConversion(mod, target, std::move(patterns))))
-    //   return signalPassFailure();
 
     TypeInference typeInference;
     typeInference.run(mod);
