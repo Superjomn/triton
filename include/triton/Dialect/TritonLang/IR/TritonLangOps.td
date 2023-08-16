@@ -64,36 +64,39 @@ def TL_CvtShapeOp : TL_Op<"cvt_shape", []> {
 //     let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 // }
 
-// def TL_SplatOp : TL_Op<"splat", []> {
-//     let summary = "splat";
+def TL_SplatOp : TL_Op<"splat", []> {
+    let summary = "splat";
 
-//     let description = [{
-//         Returns an 1D int32 tensor.
+    let description = [{
+        Returns an 1D int32 tensor.
 
-//         Values span from $start to $end (exclusive), with step = 1
-//     }];
+        Values span from $start to $end (exclusive), with step = 1
+    }];
 
-//     let arguments = (ins I32:$value, TT_Tensor:$shape);
+    let arguments = (ins TT_Type:$value, Variadic<I32>:$symbol_dims);
 
-//     let results = (outs TT_Tensor:$result);
+    let results = (outs TT_Tensor:$result);
 
-//     let assemblyFormat = "$value attr-dict `:` type($result)";
-// }
+    let assemblyFormat = "$value $symbol_dims attr-dict `:` functional-type(operands, results)";
+}
 
-// def TL_BroadcastOp : TL_Op<"broadcast", []> {
-//     let summary = "broadcast";
+def TL_BroadcastOp : TL_Op<"broadcast", []> {
+    let summary = "broadcast";
 
-//     let description = [{
-//         Returns an 1D int32 tensor.
+    let description = [{
+        Returns an 1D int32 tensor.
 
-//         Values span from $start to $end (exclusive), with step = 1
-//     }];
+        Values span from $start to $end (exclusive), with step = 1
+    }];
 
-//     let arguments = (ins TT_Tensor:$src, TT_Tensor:$shape);
+    let arguments = (ins TT_Tensor:$src, Variadic<I32>:$symbol_dims);
 
-//     let results = (outs TT_Tensor:$result);
+    let results = (outs TT_Tensor:$result);
 
-//     let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
-// }
+    let assemblyFormat = "$src $symbol_dims attr-dict `:` type($src) `->` type($result)";
+}
+
+
+// TODO View
 
 #endif // TRITO_LANG_OPS

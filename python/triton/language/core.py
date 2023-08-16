@@ -298,7 +298,7 @@ class pointer_type(dtype):
 
 
 class block_type(dtype):
-    def __init__(self, element_ty: dtype, shape: List, symbol_shape: List):
+    def __init__(self, element_ty: dtype, shape: List):
         self.element_ty = element_ty
 
         # Note that block_type's shape is a list of int
@@ -311,17 +311,18 @@ class block_type(dtype):
             shape = [s.value for s in shape]
 
         self.shape = shape
-        self.symbol_shape = symbol_shape
         self.numel = 1
-        for s in self.shape:
-            self.numel *= s
-        if self.numel > TRITON_MAX_TENSOR_NUMEL:
-            raise ValueError(f"numel ({self.numel}) exceeds triton maximum tensor numel ({TRITON_MAX_TENSOR_NUMEL})")
+        print('shape', shape)
+        if semantic._is_static_shape(shape):
+            for s in self.shape:
+                self.numel *= s
+            if self.numel > TRITON_MAX_TENSOR_NUMEL:
+                raise ValueError(f"numel ({self.numel}) exceeds triton maximum tensor numel ({TRITON_MAX_TENSOR_NUMEL})")
 
         self.name = self.__str__()
 
     def to_ir(self, builder: ir.builder) -> ir.block_type:
-        return builder.get_block_ty(self.element_ty.to_ir(builder), self.shape)
+        return builder.get_block_ty(self.element_ty.to_ir(builder), semantic._to_static_shape(self.shape))
 
     def __str__(self):
         return f'<{self.shape}, {self.element_ty}>'
@@ -519,9 +520,8 @@ class tensor:
         self.shape = (1, )
         if type.is_block():
             self.shape = type.shape
-        self.numel = 1
-        for s in self.shape:
-            self.numel *= s
+        print('self.shape', self.shape)
+        self.numel = semantic._shape_get_numel(self.shape)
         self.numel = constexpr(self.numel)
         self.type = type  # Tensor type (can be block_type)
         # Following the practice in pytorch, dtype is scalar type
@@ -821,6 +821,7 @@ def arange(start, end, _builder=None):
     """
     start = _constexpr_to_value(start)
     end = _constexpr_to_value(end)
+    print(f'arange: {start}, {end}')
     return semantic.arange(start, end, _builder)
 
 

@@ -1350,6 +1350,19 @@ void init_triton_ir(py::module &&m) {
              throw std::runtime_error(
                  "arg is not of RankedTensorType, use create_splat");
            })
+      .def("create_tl_broadcast",
+           [](TritonOpBuilder &self, mlir::Value &arg,
+              std::vector<int64_t> &shape,
+              std::vector<mlir::Value> &symbol_shape) -> mlir::Value {
+             amend_shape_dynamic_dim(shape);
+             if (auto argType =
+                     arg.getType().dyn_cast<mlir::RankedTensorType>())
+               return self.createOrFold<mlir::triton_lang::BroadcastOp>(
+                   mlir::RankedTensorType::get(shape, argType.getElementType()),
+                   arg, symbol_shape);
+             throw std::runtime_error(
+                 "arg is not of RankedTensorType, use create_splat");
+           })
       .def("create_splat",
            [](TritonOpBuilder &self, mlir::Value &arg,
               std::vector<int64_t> &shape) -> mlir::Value {
@@ -1369,6 +1382,18 @@ void init_triton_ir(py::module &&m) {
 
              return self.create<mlir::triton::SplatOp>(
                  mlir::RankedTensorType::get(shape, argType), arg);
+           })
+
+      .def("create_tl_splat",
+           [](TritonOpBuilder &self, mlir::Value &arg,
+              std::vector<int64_t> &shape,
+              std::vector<mlir::Value> &symbol_shape) -> mlir::Value {
+             amend_shape_dynamic_dim(shape);
+             auto argType = arg.getType();
+
+             return self.create<mlir::triton_lang::SplatOp>(
+                 mlir::RankedTensorType::get(shape, argType), arg,
+                 symbol_shape);
            })
       // // atomic
       .def("create_atomic_cas",

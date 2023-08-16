@@ -1,8 +1,8 @@
 from __future__ import annotations  # remove after python 3.11
 
 import warnings
-from functools import wraps
-from typing import List, Optional, Sequence, Tuple, TypeVar
+from functools import reduce, wraps
+from typing import List, Optional, Sequence, Tuple, TypeVar, Union
 
 from .._C.libtriton.triton import ir
 from . import core as tl
@@ -497,9 +497,9 @@ def arange(start: int, end: int, builder: ir.builder) -> tl.tensor:
     if isinstance(start, tl.constexpr_placeholder) or isinstance(end, tl.constexpr_placeholder):
         # the mlir kDynamic cannot introduced to block type directly since it exceeds the shape limit
         # -1 marks the dynamic dimension
-        shape = [-1]
-        symbolic_shape = [end - start]
-        ret_ty = tl.block_type(tl.int32, shape, symbol_shape=symbolic_shape)
+        assert start == 0
+        shape = [end]
+        ret_ty = tl.block_type(tl.int32, shape)
         return tl.tensor(builder.create_tl_make_range(tl._to_tensor(start, builder).handle, tl._to_tensor(end, builder).handle), ret_ty)
     else:
         shape = [end - start]
@@ -512,7 +512,7 @@ def full(shape: List[int], value, dtype: tl.dtype, builder: ir.builder) -> tl.te
         assert value.numel.value == 1, "only accepts size-1 tensor"
         value = cast(value, dtype, builder)
         ret_ty = tl.block_type(value.dtype, shape)
-        return tl.tensor(builder.create_splat(value.handle, shape), ret_ty)
+        return _create_splat(builder, value, shape)
     else:
         # scalar
         if value == 0:
@@ -603,11 +603,11 @@ def broadcast_impl_value(lhs: tl.tensor,
     # make_shape_compatible(block, scalar)
     if lhs_ty.is_block() and not rhs_ty.is_block():
         rhs_ty = tl.block_type(rhs_ty.scalar, lhs_ty.shape)
-        rhs = tl.tensor(builder.create_splat(rhs.handle, lhs_ty.get_block_shapes()), rhs_ty)
+        rhs = _create_splat(builder, rhs, lhs_ty.get_block_shapes())
     # make_shape_compatible(scalar, block)
     elif not lhs_ty.is_block() and rhs_ty.is_block():
         lhs_ty = tl.block_type(lhs_ty.scalar, rhs_ty.shape)
-        lhs = tl.tensor(builder.create_splat(lhs.handle, rhs_ty.get_block_shapes()), lhs_ty)
+        lhs = _create_splat(builder, lhs, rhs_ty.get_block_shapes())
     # make_shape_compatible(block, block)
     elif lhs_ty.is_block() and rhs_ty.is_block():
         lhs_shape = lhs_ty.get_block_shapes()
@@ -630,21 +630,22 @@ def broadcast_impl_value(lhs: tl.tensor,
         ret_shape = []
         for i, left in enumerate(lhs_shape):
             right = rhs_shape[i]
-            if left == 1:
+            if _dim_eq(left, 1):
                 ret_shape.append(right)
-            elif right == 1:
+            elif _dim_eq(right, 1):
                 ret_shape.append(left)
-            elif left == right:
+            elif _dim_eq(left, right):
                 ret_shape.append(left)
             else:
                 raise ValueError("Cannot make_shape_compatible: incompatible dimensions "
                                  "at index " + str(i) + ": " + str(left) + " and " + str(right))
-        if lhs_shape != ret_shape:
-            ret_ty = tl.block_type(lhs_ty.scalar, ret_shape)
-            lhs = tl.tensor(builder.create_broadcast(lhs.handle, ret_shape), ret_ty)
-        if rhs_shape != ret_shape:
-            ret_ty = tl.block_type(rhs_ty.scalar, ret_shape)
-            rhs = tl.tensor(builder.create_broadcast(rhs.handle, ret_shape), ret_ty)
+        lhs_static_shape = _to_static_shape(lhs_shape)
+        rhs_static_shape = _to_static_shape(rhs_shape)
+        ret_static_shape = _to_static_shape(ret_shape)
+        if lhs_static_shape != rhs_static_shape:
+            lhs = _create_broadcast(builder, lhs, ret_shape)
+        if rhs_static_shape != ret_static_shape:
+            rhs = _create_broadcast(builder, rhs, ret_shape)
     # (scalar, scalar) => returns original blocks
     return lhs, rhs
 
@@ -1107,7 +1108,7 @@ def atom_red_typechecking_impl(ptr: tl.tensor,
         mask_ir = builder.get_int1(True)
         mask_ty = tl.int1
         if ptr.type.is_block():
-            mask_ir = builder.create_splat(mask_ir, ptr.type.get_block_shapes())
+            mask_ir = _create_splat(builder, mask_ir, ptr.type.get_block_shapes()).handle
             mask_ty = tl.block_type(tl.int1, ptr.type.get_block_shapes())
         mask = tl.tensor(mask_ir, mask_ty)
     return ptr, val, mask
@@ -1257,12 +1258,17 @@ def dot(lhs: tl.tensor,
         out_dtype: tl.dtype,
         builder: ir.builder) -> tl.tensor:
     def dim_valid(dim):
+        # TODO[Superjomn]: consider add assert op and check it after constexpr materialization
+        if _is_dynamic_dim(dim.value): return True  # dynamic dim cannot be checked in compile time
         return dim.value >= 16 or dim.value == -1
     assert lhs.type.is_block() and rhs.type.is_block()
     assert lhs.dtype == rhs.dtype, f"First input ({lhs.dtype}) and second input ({rhs.dtype}) must have the same dtype!"
     assert len(lhs.shape) == 2, f"First input shape ({lhs.shape}) is not two dimensional!"
     assert len(rhs.shape) == 2, f"Second input shape ({rhs.shape}) is not two dimensional!"
-    assert lhs.shape[1].value == rhs.shape[0].value, f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[1].value}) must be equal to first index of second shape ({rhs.shape[0].value})"
+    #assert lhs.shape[1].value == rhs.shape[0].value, f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[1].value}) must be equal to first index of second shape ({rhs.shape[0].value})"
+    print('lhs.shape[1]', lhs.shape[1].value, type(lhs.shape[1].value))
+    print('rhs.shape[0]', rhs.shape[0].value)
+    assert _dim_eq(lhs.shape[1].value, rhs.shape[0].value), f"First input shape ({lhs.shape}) and second input shape {rhs.shape} are not compatible for matmul (second index of first shape ({lhs.shape[1].value}) must be equal to first index of second shape ({rhs.shape[0].value})"
     assert dim_valid(lhs.shape[0]) and dim_valid(lhs.shape[1]) and dim_valid(rhs.shape[1]), \
         f"All values in both first input shape ({lhs.shape}) and second input shape ({rhs.shape}) must be >= 16!"
     if lhs.type.scalar.is_int():
@@ -1280,7 +1286,7 @@ def dot(lhs: tl.tensor,
 
     M = lhs.type.shape[0]
     N = rhs.type.shape[1]
-    _0 = builder.create_splat(_0, [M, N])
+    _0 = _create_splat(builder, tl.tensor(_0, ret_scalar_ty), [M, N]).handle
     ret_ty = tl.block_type(ret_scalar_ty, [M, N])
 
     return tl.tensor(builder.create_dot(lhs.handle, rhs.handle, _0, allow_tf32),
@@ -1488,7 +1494,7 @@ def device_assert(cond: tl.tensor, msg: str, file_name: str, func_name, lineno: 
     cond_ty = cond.type
     if not cond_ty.is_block():
         cond_ty = tl.block_type(cond_ty.scalar, (1,))
-        cond = tl.tensor(builder.create_splat(cond.handle, (1,)), cond_ty)
+        cond = _create_splat(builder, cond, (1,))
     return tl.tensor(builder.create_assert(cond.handle, msg, file_name, func_name, lineno), tl.void)
 
 
@@ -1557,3 +1563,71 @@ def advance(base: tl.tensor, offsets, builder: ir.builder) -> tl.tensor:
 
     # Advanced block pointer type is the same as before
     return tl.tensor(builder.create_advance(base.handle, offsets), base.type)
+
+# ===----------------------------------------------------------------------===##
+# Utilities for symbolic shape propagation
+# ===----------------------------------------------------------------------===##
+
+
+_DimT = Union[int, "tl.constexpr_placeholder", "tl.tensor"]
+
+
+def _shape_get_numel(shape: List[_DimT]) -> int:
+    return reduce(lambda x, y: x * y, _to_static_shape(shape), 1)
+
+
+def _to_static_shape(shape: List[_DimT]) -> List[int]:
+    return [v if not _is_dynamic_dim(v) else -1 for v in shape]
+
+
+def _is_dynamic_dim(dim: _DimT) -> bool:
+    # tl.tensor comes from tl.constexpr_placeholder expressions
+    print('dim', dim)
+    if isinstance(dim, int):
+        assert dim != -1, "-1 is not a valid dimension"
+    return isinstance(dim, (tl.constexpr_placeholder, tl.tensor))
+
+
+def _is_dynamic_shape(shape: List[_DimT]) -> bool:
+    return any(_is_dynamic_dim(dim) for dim in shape)
+
+
+def _is_static_shape(shape: List[_DimT]) -> bool:
+    return not _is_dynamic_shape(shape)
+
+
+def _shape_get_symbolic_dims(shape: List[_DimT]) -> List[ir.Value]:
+    return [dim.handle for dim in filter(_is_dynamic_dim, shape)]
+
+
+def _create_splat(builder: ir.builder, value: tl.tensor, shape: List[_DimT]) -> tl.tensor:
+    if _is_static_shape(shape):
+        return tl.tensor(builder.create_splat(value.handle, shape), tl.block_type(value.type.scalar, shape))
+
+    # dynamic shape
+    static_shape = _to_static_shape(shape)
+    symbolic_dims = _shape_get_symbolic_dims(shape)
+    return tl.tensor(builder.create_tl_splat(value.handle, static_shape, symbolic_dims), tl.block_type(value.type.scalar, shape))
+
+
+def _create_broadcast(builder: ir.builder, value: tl.tensor, shape: List[_DimT]) -> tl.tensor:
+    if _is_static_shape(shape):
+        return tl.tensor(builder.create_broadcast(value.handle, shape), tl.block_type(value.type.scalar, shape))
+
+    # dynamic shape
+    static_shape = _to_static_shape(shape)
+    symbolic_dims = _shape_get_symbolic_dims(shape)
+    print('static_shape', static_shape)
+    print('symbolic_dims', symbolic_dims)
+    return tl.tensor(builder.create_tl_broadcast(value.handle, static_shape, symbolic_dims), tl.block_type(value.type.scalar, shape))
+
+
+def _dim_eq(dim1: _DimT, dim2: _DimT) -> bool:
+    if isinstance(dim1, int) and isinstance(dim2, int):
+        return dim1 == dim2
+    if _is_dynamic_dim(dim1) and _is_dynamic_dim(dim2):
+        print(f'dim1.handle', dim1.handle)
+        print(f'dim2.handle', dim2.handle)
+        return dim1.handle == dim2.handle
+    # We always sees the two symbolic dims as different, since when they are materialized in JIT, simplication could be conducted
+    return False

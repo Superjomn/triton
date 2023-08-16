@@ -64,8 +64,6 @@ if __name__ == "__main__":
 
     # treat constexpr as normal argument
     signature = {i: s.split(":")[0] for i, s in enumerate(signature)}
-    print('signature', signature)
-    print('constants', constexprs)
 
     # compile ast into cubin
     config = triton.compiler.instance_descriptor(divisible_by_16=set(), equal_to_1=set())
