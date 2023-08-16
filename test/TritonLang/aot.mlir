@@ -1,5 +1,5 @@
-mlir module {
-  tt.func public @kernel_01234567891011(%arg0: !tt.ptr<f32, 1>, %arg1: !tt.ptr<f32, 1>, %arg2: !tt.ptr<f32, 1>, %arg3: i32, %arg4: i32, %arg5: i32, %arg6: i32, %arg7: i32, %arg8: i32, %arg9: i32, %arg10: i32, %arg11: i32) attributes {noinline = false} {
+module {
+  tt.func public @kernel0(%arg0: !tt.ptr<f32, 1>, %arg1: !tt.ptr<f32, 1>, %arg2: !tt.ptr<f32, 1>, %arg3: i32, %arg4: i32, %arg5: i32, %arg6: i32, %arg7: i32, %arg8: i32, %arg9: i32, %arg10: i32, %arg11: i32) attributes {noinline = false} {
     %c0_i32 = arith.constant 0 : i32
     %0 = tl.make_range %c0_i32, %arg9 : tensor<?xi32>
     %c0_i32_0 = arith.constant 0 : i32

@@ -29,6 +29,8 @@ using namespace mlir::triton_lang;
 #define GEN_PASS_CLASSES
 #include "triton/Conversion/TritonLangToTriton/Passes.h.inc"
 
+using ShapeT = llvm::ArrayRef<int64_t>;
+
 template <typename T> void printVec(llvm::ArrayRef<T> vec) {
   llvm::outs() << "[";
   for (auto item : vec) {
@@ -37,13 +39,17 @@ template <typename T> void printVec(llvm::ArrayRef<T> vec) {
   llvm::outs() << "]\n";
 }
 
-bool isDynamicShape(RankedTensorType tensorTy) {
-  auto shape = tensorTy.getShape();
+bool isDynamicShape(ShapeT shape) {
   for (auto dim : shape) {
-    if (tensorTy.isDynamicDim(dim))
+    if (dim == ShapedType::kDynamic)
       return true;
   }
   return false;
+}
+
+bool isDynamicShape(RankedTensorType tensorTy) {
+  auto shape = tensorTy.getShape();
+  return isDynamicShape(shape);
 }
 
 // Deducing the shape and data type
@@ -51,12 +57,15 @@ class TypeInference {
   std::deque<triton_lang::CvtShapeOp> queue;
 
   using CastOp = triton_lang::CvtShapeOp;
-  using ShapeT = llvm::ArrayRef<int64_t>;
 
 public:
   void run(ModuleOp op) {
     // materialize all the tl.make_range
-    op.walk([&](triton::FuncOp func) { processAllMakeRange(func); });
+    op.walk([&](triton::FuncOp func) {
+      processAllMakeRange(func);
+      processAllSplat(func);
+      processAllBroadcast(func);
+    });
 
     // graph traversal
     while (!queue.empty()) {
@@ -105,16 +114,21 @@ private:
         foldAdjacentCasts(cast, nextCast);
       } else if (auto expandDims = dyn_cast<triton::ExpandDimsOp>(op)) {
         processExpandDimsOp(expandDims, shape);
-      } // else if (auto mul = dyn_cast<arith::MulIOp>(op)) {
-        // processMulOp(mul, shape);
-      //}
-      else if (isElementwiseOp(op)) {
+      } else if (auto dot = dyn_cast<triton::DotOp>(op)) {
+        if (output == dot.getOperand(0))
+          processDot(dot, 0, shape);
+        else if (output == dot.getOperand(1))
+          processDot(dot, 1, shape);
+        else
+          ; // C is not needed
+      } else if (isElementwiseOp(op)) {
         processElementwise(op, shape);
-      } else if (auto splat = dyn_cast<triton::SplatOp>(op)) {
-        processSplat(splat, shape);
+      } else if (dyn_cast<triton::LoadOp>(op) ||
+                 dyn_cast<triton::StoreOp>(op)) {
+        processLoadStore(op, shape);
       } else {
         // llvm_unreachable("unknown op");
-        llvm::errs() << "unknown op: " << *op << "\n";
+        llvm::errs() << "forward unknown op: " << *op << "\n";
       }
     }
 
@@ -141,10 +155,12 @@ private:
         processBlockArgBackward(input.cast<BlockArgument>(), cast);
       } else if (auto prevCast = dyn_cast<CastOp>(op)) {
         foldAdjacentCasts(prevCast, cast);
-      } else if (auto splat = dyn_cast<triton::SplatOp>(op)) {
-        processSplat(splat, shape);
+      } else if (auto expandDims = dyn_cast<triton::ExpandDimsOp>(op)) {
+        processExpandDimsOp(expandDims, shape);
+      } else if (isElementwiseOp(op)) {
+        processElementwise(op, shape);
       } else {
-        llvm::errs() << "unknown op: " << *op << "\n";
+        llvm::errs() << "backward unknown op: " << *op << "\n";
         // llvm_unreachable("unknown op");
       }
     }
@@ -169,50 +185,67 @@ private:
     amendTypeWithCasts(op, {shape}, {newResShape});
   }
 
-  void processSplat(triton::SplatOp op, ShapeT shape) {
-    amendTypeWithCasts(op, {{}}, {shape});
+  void processLoadStore(Operation *op, ShapeT shape) {
+    printVec<int64_t>(shape);
+    llvm::SmallVector<ShapeT> inShapes(op->getNumOperands(), shape);
+    llvm::SmallVector<ShapeT> outShapes(op->getNumResults(), shape);
+    amendTypeWithCasts(op, inShapes, outShapes);
+  }
+
+  void amendOperandTypeWithCast(Operation *op, int index, ShapeT shape) {
+    Location loc = op->getLoc();
+    OpBuilder builder(op->getContext());
+    builder.setInsertionPoint(op);
+
+    auto operand = op->getOperand(index);
+    Type operandTy = operand.getType();
+    if (triton::isTensorOrTensorPointerType(operandTy)) {
+      auto newType = replaceShape(operandTy.cast<RankedTensorType>(), shape);
+
+      auto newCast = builder.create<CastOp>(loc, newType, operand);
+      newCast = markBackward(newCast);
+      op->setOperand(index, newCast.getResult());
+      pushQueue(newCast);
+    }
+  }
+
+  void amendResultTypeWithCast(Operation *op, int index, ShapeT shape) {
+    Location loc = op->getLoc();
+    OpBuilder builder(op->getContext());
+    builder.setInsertionPointAfter(op);
+
+    auto result = op->getResult(index);
+    Type resultTy = result.getType();
+    if (triton::isTensorOrTensorPointerType(resultTy)) {
+      auto newType = replaceShape(resultTy.cast<RankedTensorType>(), shape);
+
+      auto newCast = builder.create<CastOp>(loc, newType, result);
+      newCast = markForward(newCast);
+      result.setType(newType);
+      result.replaceAllUsesExcept(newCast.getResult(), newCast.getOperation());
+      pushQueue(newCast);
+    }
   }
 
   void amendTypeWithCasts(Operation *op, llvm::ArrayRef<ShapeT> inShapes,
                           llvm::ArrayRef<ShapeT> outShapes) {
 
-    assert(op->getNumOperands() == inShapes.size());
-    assert(op->getNumResults() == outShapes.size());
-
     Location loc = op->getLoc();
     OpBuilder builder(op->getContext());
 
-    builder.setInsertionPoint(op);
-    for (unsigned i = 0; i < op->getNumOperands(); ++i) {
-      auto operand = op->getOperand(i);
-      Type operandTy = operand.getType();
-      if (triton::isTensorOrTensorPointerType(operandTy)) {
-        auto newType =
-            replaceShape(operandTy.cast<RankedTensorType>(), inShapes[i]);
-
-        auto newCast = builder.create<CastOp>(loc, newType, operand);
-        newCast = markBackward(newCast);
-        op->setOperand(i, newCast.getResult());
-        pushQueue(newCast);
+    if (!inShapes.empty()) {
+      assert(op->getNumOperands() == inShapes.size());
+      builder.setInsertionPoint(op);
+      for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+        amendOperandTypeWithCast(op, i, inShapes[i]);
       }
     }
 
-    builder.setInsertionPointAfter(op);
-    for (unsigned i = 0; i < op->getNumResults(); ++i) {
-      auto result = op->getResult(i);
-      if (triton::isTensorOrTensorPointerType(result.getType())) {
-        auto oldResTy = result.getType().cast<RankedTensorType>();
-        auto newResTy = replaceShape(result.getType().cast<RankedTensorType>(),
-                                     outShapes[i]);
-
-        auto newCast = builder.create<CastOp>(loc, oldResTy, result);
-        newCast = markForward(newCast);
-
-        result.setType(newResTy);
-        result.replaceAllUsesExcept(newCast.getResult(),
-                                    newCast.getOperation());
-
-        pushQueue(newCast);
+    if (!outShapes.empty()) {
+      assert(op->getNumResults() == outShapes.size());
+      builder.setInsertionPointAfter(op);
+      for (unsigned i = 0; i < op->getNumResults(); ++i) {
+        amendResultTypeWithCast(op, i, outShapes[i]);
       }
     }
   }
@@ -286,9 +319,20 @@ private:
     return op->getAttr("backward").cast<BoolAttr>().getValue();
   }
 
+  void processAllSplat(triton::FuncOp func) {
+    func.walk(
+        [&](triton_lang::SplatOp op) { assert(succeeded(processSplat(op))); });
+  }
+
   void processAllMakeRange(triton::FuncOp func) {
     func.walk([&](triton_lang::MakeRangeOp op) {
-      assert(succeeded(materializeMarkRange(op)));
+      assert(succeeded(processMarkRange(op)));
+    });
+  }
+
+  void processAllBroadcast(triton::FuncOp func) {
+    func.walk([&](triton_lang::BroadcastOp op) {
+      assert(succeeded(processBroadcast(op)));
     });
   }
 
@@ -296,10 +340,40 @@ private:
     printVec<int64_t>(shape);
     llvm::SmallVector<ShapeT> inShapes(op->getNumOperands(), shape);
     llvm::SmallVector<ShapeT> outShapes(op->getNumResults(), shape);
+    llvm::outs() << "process " << *op << "\n";
     amendTypeWithCasts(op, inShapes, outShapes);
   }
 
-  LogicalResult materializeMarkRange(triton_lang::MakeRangeOp op) {
+  void processDot(triton::DotOp op, int operandOffset, ShapeT shape) {
+    assert(!isDynamicShape(shape));
+
+    amendOperandTypeWithCast(op, operandOffset, shape);
+    auto ATy = op.getA().getType().cast<RankedTensorType>();
+    auto BTy = op.getB().getType().cast<RankedTensorType>();
+    auto CTy = op.getC().getType().cast<RankedTensorType>();
+
+    llvm::outs() << "ATy: " << ATy << "\n";
+    llvm::outs() << "BTy: " << BTy << "\n";
+    llvm::outs() << "CTy: " << CTy << "\n";
+
+    if (!isDynamicShape(ATy) && !isDynamicShape(BTy)) {
+      auto AShape = ATy.getShape();
+      auto BShape = BTy.getShape();
+      SmallVector<int64_t> retShape({AShape[0], BShape[1]});
+      amendResultTypeWithCast(op, 0, retShape);
+
+      if (op.getC() && isDynamicShape(CTy)) {
+        amendResultTypeWithCast(op, 2, retShape);
+      }
+    }
+
+    printVec<int64_t>(shape);
+    llvm::SmallVector<ShapeT> inShapes(op->getNumOperands(), shape);
+    llvm::SmallVector<ShapeT> outShapes(op->getNumResults(), shape);
+    amendTypeWithCasts(op, inShapes, outShapes);
+  }
+
+  LogicalResult processMarkRange(triton_lang::MakeRangeOp op) {
     auto tensorTy = op.getType().cast<RankedTensorType>();
     auto shape = tensorTy.getShape();
 
@@ -324,6 +398,55 @@ private:
 
     op.replaceAllUsesWith(cvt.getResult());
     op.erase();
+    return success();
+  }
+
+  LogicalResult processSplat(triton_lang::SplatOp op) {
+    auto retShape = op.getType().cast<RankedTensorType>().getShape();
+    SmallVector<int64_t> resShape(retShape.begin(), retShape.end());
+
+    // symbolDims should all be constant
+    auto symbolDims = op.getSymbolDims();
+    int symbolOffest{0};
+
+    for (int64_t &dim : resShape) {
+      if (dim == ShapedType::kDynamic) {
+        dim = symbolDims[symbolOffest++]
+                  .getDefiningOp<arith::ConstantIntOp>()
+                  .value();
+      }
+    }
+
+    amendTypeWithCasts(op, {}, {resShape});
+    return success();
+  }
+
+  LogicalResult processBroadcast(triton_lang::BroadcastOp op) {
+    auto retShape = op.getType().cast<RankedTensorType>().getShape();
+    auto inShape = op.getSrc().getType().cast<RankedTensorType>().getShape();
+    SmallVector<int64_t> resShape(retShape.begin(), retShape.end());
+    SmallVector<int64_t> newInShape(inShape.begin(), inShape.end());
+
+    // symbolDims should all be constant
+    auto symbolDims = op.getSymbolDims();
+    int symbolOffest{0};
+
+    for (int i = 0; i < resShape.size(); ++i) {
+      if (resShape[i] == ShapedType::kDynamic) {
+        resShape[i] = symbolDims[symbolOffest++]
+                          .getDefiningOp<arith::ConstantIntOp>()
+                          .value();
+
+        if (inShape[i] == ShapedType::kDynamic) {
+          newInShape[i] = resShape[i];
+        }
+      }
+    }
+
+    SmallVector<ShapeT> inShapes{newInShape};
+    inShapes.resize(1 + op.getSymbolDims().size(), {});
+
+    amendTypeWithCasts(op, inShapes, {resShape});
     return success();
   }
 
@@ -373,6 +496,8 @@ public:
 
     materializeConstExprs();
 
+    llvm::outs() << "after constexpr materialization:\n" << mod << "\n";
+
     TypeInference typeInference;
     typeInference.run(mod);
 
@@ -380,7 +505,6 @@ public:
   }
 
   void materializeConstExprs() {
-    auto &context = getContext();
     auto mod = getOperation();
 
     mod.walk([&](triton::FuncOp op) {
