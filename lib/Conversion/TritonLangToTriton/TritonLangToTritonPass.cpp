@@ -79,6 +79,8 @@ public:
         llvm_unreachable("unknown op");
       }
     }
+
+    op.walk([&](triton::FuncOp func) { cleanUpCastOp(func); });
   }
 
 private:
@@ -113,7 +115,7 @@ private:
       if (auto nextCast = dyn_cast<CastOp>(op)) {
         foldAdjacentCasts(cast, nextCast);
       } else if (auto expandDims = dyn_cast<triton::ExpandDimsOp>(op)) {
-        processExpandDimsOp(expandDims, shape);
+        // assert(false && "expand_dims should be backward");
       } else if (auto dot = dyn_cast<triton::DotOp>(op)) {
         if (output == dot.getOperand(0))
           processDot(dot, 0, shape);
@@ -130,6 +132,8 @@ private:
         // llvm_unreachable("unknown op");
         llvm::errs() << "forward unknown op: " << *op << "\n";
       }
+    } else {
+      processMultiUsersForward(output, cast);
     }
 
     return true;
@@ -141,11 +145,8 @@ private:
     unsigned numUsers = getNumUsers(input);
 
     if (numUsers == 0) {
-      cast.erase();
-      return true;
-    }
-
-    if (numUsers == 1) {
+      assert(false && "unreachable");
+    } else if (numUsers == 1) {
       Type outTy = output.getType();
       Operation *op = input.getDefiningOp();
       auto shape = outTy.cast<RankedTensorType>().getShape();
@@ -156,7 +157,7 @@ private:
       } else if (auto prevCast = dyn_cast<CastOp>(op)) {
         foldAdjacentCasts(prevCast, cast);
       } else if (auto expandDims = dyn_cast<triton::ExpandDimsOp>(op)) {
-        processExpandDimsOp(expandDims, shape);
+        processExpandDimsBackward(expandDims, shape);
       } else if (isElementwiseOp(op)) {
         processElementwise(op, shape);
       } else {
@@ -168,31 +169,67 @@ private:
     return false;
   }
 
+  void processMultiUsersForward(Value castRes, CastOp cast) {
+    Value input = cast.getOperand();
+    Location loc = cast.getLoc();
+    OpBuilder builder(cast);
+
+    while (!castRes.use_empty()) {
+      auto newCast =
+          markForward(builder.create<CastOp>(loc, castRes.getType(), input));
+      castRes.use_begin()->set(newCast.getResult());
+      pushQueue(newCast);
+    }
+
+    cast.erase();
+  }
+
+  // TODO[Superjomn]: support block arg
   void processBlockArgBackward(BlockArgument arg, CastOp cast) {}
 
-  void processExpandDimsOp(triton::ExpandDimsOp op, ArrayRef<int64_t> shape) {
+  // A trick
+  // TODO[Superjomn]: find nicer way
+  void cleanUpCastOp(triton::FuncOp op) {
+    op.walk([&](CastOp cast) {
+      // T -> T
+      auto inTy = cast.getOperand().getType();
+      auto outTy = cast.getResult().getType();
+      if (inTy == outTy) {
+        cast.getResult().replaceAllUsesWith(cast.getOperand());
+        cast.erase();
+        return;
+      }
+
+      if (cast.getResult().getUsers().empty()) {
+        cast.erase();
+      }
+    });
+  }
+
+  // propagate from the output to the input
+  void processExpandDimsBackward(triton::ExpandDimsOp op,
+                                 ArrayRef<int64_t> shape,
+                                 llvm::StringRef annotation = "") {
     auto type = op.getResult().getType().cast<RankedTensorType>();
     auto inShape =
         op.getOperand().getType().cast<RankedTensorType>().getShape();
-    llvm::SmallVector<int64_t> newResShape(shape.begin(), shape.end());
+    assert(!isDynamicShape(shape) && "Unvalid propagate shape");
+
+    llvm::SmallVector<int64_t> newInputShape(shape.begin(), shape.end());
     int axis = op.getAxis();
-    newResShape.insert(newResShape.begin() + axis, 1);
+    newInputShape.erase(newInputShape.begin() + axis);
 
-    printVec<int64_t>(shape);
-
-    printVec<int64_t>(newResShape);
-
-    amendTypeWithCasts(op, {shape}, {newResShape});
+    amendTypeWithCasts(op, {newInputShape}, {shape}, "expand_dims");
   }
 
   void processLoadStore(Operation *op, ShapeT shape) {
-    printVec<int64_t>(shape);
     llvm::SmallVector<ShapeT> inShapes(op->getNumOperands(), shape);
     llvm::SmallVector<ShapeT> outShapes(op->getNumResults(), shape);
-    amendTypeWithCasts(op, inShapes, outShapes);
+    amendTypeWithCasts(op, inShapes, outShapes, "load/store");
   }
 
-  void amendOperandTypeWithCast(Operation *op, int index, ShapeT shape) {
+  void amendOperandTypeWithCast(Operation *op, int index, ShapeT shape,
+                                llvm::StringRef annotation = "") {
     Location loc = op->getLoc();
     OpBuilder builder(op->getContext());
     builder.setInsertionPoint(op);
@@ -203,13 +240,16 @@ private:
       auto newType = replaceShape(operandTy.cast<RankedTensorType>(), shape);
 
       auto newCast = builder.create<CastOp>(loc, newType, operand);
+      if (!annotation.empty())
+        newCast->setAttr("annotation", builder.getStringAttr(annotation));
       newCast = markBackward(newCast);
       op->setOperand(index, newCast.getResult());
       pushQueue(newCast);
     }
   }
 
-  void amendResultTypeWithCast(Operation *op, int index, ShapeT shape) {
+  void amendResultTypeWithCast(Operation *op, int index, ShapeT shape,
+                               llvm::StringRef annotation = "") {
     Location loc = op->getLoc();
     OpBuilder builder(op->getContext());
     builder.setInsertionPointAfter(op);
@@ -220,6 +260,8 @@ private:
       auto newType = replaceShape(resultTy.cast<RankedTensorType>(), shape);
 
       auto newCast = builder.create<CastOp>(loc, newType, result);
+      if (!annotation.empty())
+        newCast->setAttr("annotation", builder.getStringAttr(annotation));
       newCast = markForward(newCast);
       result.setType(newType);
       result.replaceAllUsesExcept(newCast.getResult(), newCast.getOperation());
@@ -228,8 +270,8 @@ private:
   }
 
   void amendTypeWithCasts(Operation *op, llvm::ArrayRef<ShapeT> inShapes,
-                          llvm::ArrayRef<ShapeT> outShapes) {
-
+                          llvm::ArrayRef<ShapeT> outShapes,
+                          llvm::StringRef annotation = "") {
     Location loc = op->getLoc();
     OpBuilder builder(op->getContext());
 
@@ -237,7 +279,7 @@ private:
       assert(op->getNumOperands() == inShapes.size());
       builder.setInsertionPoint(op);
       for (unsigned i = 0; i < op->getNumOperands(); ++i) {
-        amendOperandTypeWithCast(op, i, inShapes[i]);
+        amendOperandTypeWithCast(op, i, inShapes[i], annotation);
       }
     }
 
@@ -245,20 +287,19 @@ private:
       assert(op->getNumResults() == outShapes.size());
       builder.setInsertionPointAfter(op);
       for (unsigned i = 0; i < op->getNumResults(); ++i) {
-        amendResultTypeWithCast(op, i, outShapes[i]);
+        amendResultTypeWithCast(op, i, outShapes[i], annotation);
       }
     }
   }
 
-  RankedTensorType replaceShape(RankedTensorType type, ShapeT shape) {
+  static RankedTensorType replaceShape(RankedTensorType type, ShapeT shape) {
     return RankedTensorType::get(shape, type.getElementType());
   }
 
   // cast0 -> cast1 => cast1
   void foldAdjacentCasts(CastOp cast0, CastOp cast1) {
     assert(cast0.getResult() == cast1.getOperand());
-    if (getNumUsers(cast0.getResult()) != 1)
-      return;
+    assert(isForward(cast0) && isBackward(cast1));
 
     // input => cast0 => cast1 => output
     Value input = cast0.getSrc();
@@ -270,12 +311,19 @@ private:
       OpBuilder builder(cast1);
       auto newCast =
           builder.create<CastOp>(cast1.getLoc(), output.getType(), input);
+      newCast->setAttr("annotation", builder.getStringAttr("fold"));
       output.replaceAllUsesWith(newCast.getResult());
     }
 
-    eraseCastOpFromQueue({cast0, cast1});
-    cast1.erase(); // erase cast1 first since cast0 still consumes it
-    cast0.erase();
+    // erase cast1 first since cast0 still consumes it
+    if (cast1.getResult().getUsers().empty()) {
+      eraseCastOpFromQueue({cast1});
+      cast1.erase();
+    }
+    if (cast0.getResult().getUsers().empty()) {
+      eraseCastOpFromQueue({cast0});
+      cast0.erase();
+    }
   }
 
   void eraseCastOpFromQueue(llvm::ArrayRef<CastOp> ops) {
@@ -288,32 +336,25 @@ private:
     }
   }
 
-  triton_lang::CvtShapeOp createCvtShape(Type retType, Value input,
-                                         Location loc) {
-    OpBuilder builder(loc->getContext());
-    builder.setInsertionPointAfterValue(input);
-    return builder.create<triton_lang::CvtShapeOp>(loc, retType, input);
-  }
-
-  triton_lang::CvtShapeOp markForward(triton_lang::CvtShapeOp op) {
+  static triton_lang::CvtShapeOp markForward(triton_lang::CvtShapeOp op) {
     OpBuilder builder(op);
     op->setAttr("forward", builder.getBoolAttr(true));
     return op;
   }
 
-  triton_lang::CvtShapeOp markBackward(triton_lang::CvtShapeOp op) {
+  static triton_lang::CvtShapeOp markBackward(triton_lang::CvtShapeOp op) {
     OpBuilder builder(op);
     op->setAttr("backward", builder.getBoolAttr(true));
     return op;
   }
 
-  bool isForward(triton_lang::CvtShapeOp op) {
+  static bool isForward(triton_lang::CvtShapeOp op) {
     if (!op->hasAttr("forward"))
       return false;
     return op->getAttr("forward").cast<BoolAttr>().getValue();
   }
 
-  bool isBackward(triton_lang::CvtShapeOp op) {
+  static bool isBackward(triton_lang::CvtShapeOp op) {
     if (!op->hasAttr("backward"))
       return false;
     return op->getAttr("backward").cast<BoolAttr>().getValue();
@@ -337,40 +378,34 @@ private:
   }
 
   void processElementwise(Operation *op, ShapeT shape) {
-    printVec<int64_t>(shape);
     llvm::SmallVector<ShapeT> inShapes(op->getNumOperands(), shape);
     llvm::SmallVector<ShapeT> outShapes(op->getNumResults(), shape);
-    llvm::outs() << "process " << *op << "\n";
-    amendTypeWithCasts(op, inShapes, outShapes);
+    amendTypeWithCasts(op, inShapes, outShapes, "elementwise");
   }
 
   void processDot(triton::DotOp op, int operandOffset, ShapeT shape) {
+    assert((operandOffset == 0 || operandOffset == 1) &&
+           "Only operand A and B are needed in shape inference");
     assert(!isDynamicShape(shape));
 
     amendOperandTypeWithCast(op, operandOffset, shape);
     auto ATy = op.getA().getType().cast<RankedTensorType>();
     auto BTy = op.getB().getType().cast<RankedTensorType>();
     auto CTy = op.getC().getType().cast<RankedTensorType>();
-
-    llvm::outs() << "ATy: " << ATy << "\n";
-    llvm::outs() << "BTy: " << BTy << "\n";
-    llvm::outs() << "CTy: " << CTy << "\n";
+    auto DTy = op.getResult().getType().cast<RankedTensorType>();
 
     if (!isDynamicShape(ATy) && !isDynamicShape(BTy)) {
       auto AShape = ATy.getShape();
       auto BShape = BTy.getShape();
       SmallVector<int64_t> retShape({AShape[0], BShape[1]});
-      amendResultTypeWithCast(op, 0, retShape);
+      if (isDynamicShape(DTy)) {
+        amendResultTypeWithCast(op, 0, retShape, "dot");
+      }
 
       if (op.getC() && isDynamicShape(CTy)) {
-        amendResultTypeWithCast(op, 2, retShape);
+        amendOperandTypeWithCast(op, 2, retShape, "dot C");
       }
     }
-
-    printVec<int64_t>(shape);
-    llvm::SmallVector<ShapeT> inShapes(op->getNumOperands(), shape);
-    llvm::SmallVector<ShapeT> outShapes(op->getNumResults(), shape);
-    amendTypeWithCasts(op, inShapes, outShapes);
   }
 
   LogicalResult processMarkRange(triton_lang::MakeRangeOp op) {
@@ -387,16 +422,15 @@ private:
     int64_t start = op.getStart().getDefiningOp<arith::ConstantIntOp>().value();
     int64_t end = op.getEnd().getDefiningOp<arith::ConstantIntOp>().value();
 
+    amendTypeWithCasts(op, {}, {shape}, "make_range");
+
     auto newTensorTy =
         RankedTensorType::get({end - start}, tensorTy.getElementType());
+
     auto newOp = builder.create<triton::MakeRangeOp>(op.getLoc(), newTensorTy,
                                                      start, end);
 
-    auto cvt = createCvtShape(tensorTy, newOp.getResult(), op.getLoc());
-    cvt = markForward(cvt);
-    pushQueue(cvt);
-
-    op.replaceAllUsesWith(cvt.getResult());
+    op.replaceAllUsesWith(newOp.getResult());
     op.erase();
     return success();
   }
@@ -417,7 +451,14 @@ private:
       }
     }
 
-    amendTypeWithCasts(op, {}, {resShape});
+    amendTypeWithCasts(op, {}, {resShape}, "splat");
+
+    OpBuilder builder(op);
+    auto newSplat = builder.create<triton::SplatOp>(op.getLoc(), op.getType(),
+                                                    op.getValue());
+    op.getResult().replaceAllUsesWith(newSplat.getResult());
+    op.erase();
+
     return success();
   }
 
@@ -446,13 +487,20 @@ private:
     SmallVector<ShapeT> inShapes{newInShape};
     inShapes.resize(1 + op.getSymbolDims().size(), {});
 
-    amendTypeWithCasts(op, inShapes, {resShape});
+    amendTypeWithCasts(op, inShapes, {resShape}, "broadcast");
+
+    OpBuilder builder(op);
+    auto newBroadcast = builder.create<triton::BroadcastOp>(
+        op.getLoc(), op.getType(), op.getSrc());
+    op.getResult().replaceAllUsesWith(newBroadcast.getResult());
+    op.erase();
+
     return success();
   }
 
   // Borrowed from PlanCTA.cpp
   // TODO[Superjomn]: Make it a common utility function
-  bool isElementwiseOp(Operation *op) const {
+  static bool isElementwiseOp(Operation *op) {
     if (llvm::isa<arith::AddFOp, arith::AddIOp, arith::AndIOp,
                   arith::CeilDivSIOp, arith::CeilDivUIOp, arith::DivFOp,
                   arith::DivSIOp, arith::DivUIOp, arith::ExtFOp, arith::ExtSIOp,
@@ -496,12 +544,8 @@ public:
 
     materializeConstExprs();
 
-    llvm::outs() << "after constexpr materialization:\n" << mod << "\n";
-
     TypeInference typeInference;
     typeInference.run(mod);
-
-    llvm::outs() << "after conversion:\n" << mod << "\n";
   }
 
   void materializeConstExprs() {
@@ -540,7 +584,6 @@ public:
       }
       auto newType = FunctionType::get(op.getContext(), newInputTypes,
                                        op.getResultTypes());
-      llvm::outs() << "newType: " << newType << "\n";
       op.setType(newType);
 
       // update entry block's type
